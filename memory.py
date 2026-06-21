@@ -25,7 +25,7 @@ PREFERENCE_MEMORY_TEMPLATE = (
 )
 
 class MemoryStore:
-    def __init__(self, memory_dir=None, debug=False):
+    def __init__(self, memory_dir=None, debug=False, history_path=None):
         self.memory_dir = Path(memory_dir) if memory_dir is not None else MEMORY_DIR
         self.debug = bool(debug)
         self.core_path = self.memory_dir / CORE_MEMORY_FILE
@@ -33,7 +33,11 @@ class MemoryStore:
         self.episodic_dir = self.memory_dir / EPISODIC_DIR_NAME
         self.legacy_episodic_path = self.memory_dir / LEGACY_EPISODIC_FILE
         self.legacy_episodic_migrated_path = self.memory_dir / LEGACY_EPISODIC_MIGRATED_FILE
-        self.history_path = self.memory_dir / HISTORY_FILE
+        self.history_path = (
+            Path(history_path)
+            if history_path is not None
+            else self.memory_dir / HISTORY_FILE
+        )
         self.update_diagnostics_path = self.memory_dir / MEMORY_UPDATE_DIAGNOSTICS_FILE
         self.ensure_files()
 

@@ -132,7 +132,7 @@ _BUILTIN_TEAMMATES: dict[str, dict[str, Any]] = {
             "- Handle CI/CD, Docker, deployment, and infrastructure tasks.\n"
             "- Read existing configuration before making changes.\n"
             "- Follow security best practices for credentials and secrets.\n"
-            "- Write operations require approval unless auto mode is enabled.\n"
+            "- Write operations require approval unless approve or full mode is enabled.\n"
             "- Do not dispatch subagents or spawn teammates.\n"
             "- Reply concisely with: actions taken, evidence, risks, and next steps."
         ),

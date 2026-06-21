@@ -1,0 +1,31 @@
+from __future__ import annotations
+
+from string import Template
+
+PAGE_BACKGROUND = "#181818"
+SURFACE_BACKGROUND = "#2a2a2a"
+TEXT_PRIMARY = "#ffffff"
+TEXT_MUTED = "#8b8b8b"
+
+PLAN_MODE = TEXT_MUTED
+BUILD_MODE = TEXT_PRIMARY
+APPROVE_FOR_ME = "#7bbefd"
+FULL_ACCESS = "#fe8549"
+
+INFO_BAR_BACKGROUND = "#1e1e1e"
+OVERLAY_BACKGROUND = "rgba(0, 0, 0, 0.6)"
+
+
+def render_css(template: str) -> str:
+    return Template(template).substitute(
+        PAGE_BACKGROUND=PAGE_BACKGROUND,
+        SURFACE_BACKGROUND=SURFACE_BACKGROUND,
+        TEXT_PRIMARY=TEXT_PRIMARY,
+        TEXT_MUTED=TEXT_MUTED,
+        PLAN_MODE=PLAN_MODE,
+        BUILD_MODE=BUILD_MODE,
+        APPROVE_FOR_ME=APPROVE_FOR_ME,
+        FULL_ACCESS=FULL_ACCESS,
+        INFO_BAR_BACKGROUND=INFO_BAR_BACKGROUND,
+        OVERLAY_BACKGROUND=OVERLAY_BACKGROUND,
+    )

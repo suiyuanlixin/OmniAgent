@@ -156,13 +156,9 @@ def _apply_config(chat, config):
             config.web_search_topic,
         )
 
-        if config.agent_mode and not chat.get_agent_status().get("workspace_dir"):
-            chat.set_agent_mode(False)
-            print_warn(
-                "Agent mode requires a startup workspace directory and has been turned off."
-            )
-        else:
-            chat.set_agent_mode(config.agent_mode)
+        chat.set_agent_mode(
+            config.agent_mode and bool(chat.get_agent_status().get("workspace_dir"))
+        )
     except Exception as error:
         print_error(f"Failed to apply configuration: {error}")
         return False
@@ -1177,7 +1173,7 @@ def handle_agent(chat, args):
             f"app={'on' if skill_sources.get('app') else 'off'}, "
             f"workspace={'on' if skill_sources.get('workspace') else 'off'}).\n"
             f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
-            f"/agent approve confirm|auto | /agent show-thinking summary|full|off | "
+            f"/agent approve confirm|approve|full | /agent show-thinking summary|full|off | "
             f"/agent plan on|off | /skills"
         )
         return True
@@ -1187,9 +1183,7 @@ def handle_agent(chat, args):
     if mode == "on" and len(parts) == 1:
         if not status["workspace_dir"]:
             chat.set_agent_mode(False)
-            print_error(
-                "Agent mode requires a startup workspace directory. Example: python main.py <workspace>"
-            )
+            print_error("Agent mode requires selecting a project in the TUI first.")
             return True
         chat.set_agent_mode(True)
         save_config_field("agent_mode", True)
@@ -1233,11 +1227,11 @@ def handle_agent(chat, args):
         if len(parts) == 1:
             print_info(
                 f"Current agent approval mode: {status.get('approval_mode', 'confirm')}. "
-                "Usage: /agent approve confirm|auto"
+                "Usage: /agent approve confirm|approve|full"
             )
             return True
         if len(parts) != 2:
-            print_error("Usage: /agent approve confirm|auto")
+            print_error("Usage: /agent approve confirm|approve|full")
             return True
         try:
             approval_mode = parse_agent_approval_mode(parts[1])
@@ -1271,9 +1265,7 @@ def handle_agent(chat, args):
     elif mode == "plan":
         if len(parts) == 1:
             current = "on" if status.get("plan_enabled", True) else "off"
-            print_info(
-                f"Current agent plan: {current}. Usage: /agent plan on|off"
-            )
+            print_info(f"Current agent plan: {current}. Usage: /agent plan on|off")
             return True
         if len(parts) != 2 or parts[1].lower() not in {"on", "off"}:
             print_error("Usage: /agent plan on|off")
@@ -1287,7 +1279,7 @@ def handle_agent(chat, args):
     else:
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
-            f"/agent budget <rounds> <tool-calls>, /agent approve confirm|auto, "
+            f"/agent budget <rounds> <tool-calls>, /agent approve confirm|approve|full, "
             f"/agent show-thinking summary|full|off, /agent plan on|off, or /agent skills ..."
         )
         return True
@@ -1302,7 +1294,7 @@ def handle_team(chat, args):
         teammates = status.get("teammates", [])
         lines = [
             f"Agent team: {current}.",
-            f"Active teammates: {status['active_count']}."
+            f"Active teammates: {status['active_count']}.",
         ]
         if teammates:
             lines.append("Teammates:")
@@ -1357,9 +1349,7 @@ def handle_team(chat, args):
         else:
             print_warn(f"No active teammate found with name '{name}'.")
     else:
-        print_error(
-            "Usage: /team on | /team off | /team list | /team shutdown <name>"
-        )
+        print_error("Usage: /team on | /team off | /team list | /team shutdown <name>")
     return True
 
 

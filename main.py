@@ -395,39 +395,10 @@ def run_chat_loop(
 
 
 def main():
-    config = load_config()
-    workspace_dir, workspace_error = get_startup_workspace(sys.argv)
-    agent_auto_disabled = False
-    if config.agent_mode and not workspace_dir:
-        config.agent_mode = False
-        agent_auto_disabled = True
+    from tui.app import AgentTUIApp
 
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        start_tui(
-            config.model,
-            workspace_dir,
-            config.api_type,
-            config.thinking_mode,
-            config.reasoning_effort,
-        )
-        run_tui(
-            lambda: run_chat_loop(
-                config,
-                workspace_dir,
-                workspace_error,
-                agent_auto_disabled,
-            )
-        )
-        return
-
-    show_dashboard(
-        config.model,
-        workspace_dir,
-        config.api_type,
-        config.thinking_mode,
-        config.reasoning_effort,
-    )
-    run_chat_loop(config, workspace_dir, workspace_error, agent_auto_disabled)
+    app = AgentTUIApp()
+    app.run()
 
 
 if __name__ == "__main__":

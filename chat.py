@@ -244,10 +244,11 @@ class OmniAgent:
         web_search_topic="general",
         agent_plan_enabled=True,
         agent_team_enable=False,
+        history_path=None,
     ):
         _ensure_user_prompt_file()
         self.debug = bool(debug)
-        self.memory_store = MemoryStore(debug=self.debug)
+        self.memory_store = MemoryStore(debug=self.debug, history_path=history_path)
         self.memory_lock = threading.Lock()
         self.session_memory_lock = threading.Lock()
         self.session_episodic_heading = ""

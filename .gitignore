@@ -2,6 +2,7 @@ __pycache__/
 .venv/
 record/
 memory/
+sessions/
 config.json
 prompt.md
 skills/

@@ -37,6 +37,8 @@ from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
+from tui.runtime import get_bridge, render_console_text
+
 
 _console_override = threading.local()
 _dashboard_capture = threading.local()
@@ -59,6 +61,10 @@ class _ConsoleProxy:
         override = getattr(_console_override, "console", None)
         if override is not None:
             return override.print(*objects, **kwargs)
+        bridge = get_bridge()
+        if bridge is not None:
+            bridge.append_console_print(*objects, **kwargs)
+            return None
         if _tui_session is not None:
             _tui_session.append_console_print(*objects, **kwargs)
             return None
@@ -68,6 +74,9 @@ class _ConsoleProxy:
         override = getattr(_console_override, "console", None)
         if override is not None:
             return override.input(prompt, *args, **kwargs)
+        bridge = get_bridge()
+        if bridge is not None:
+            return bridge.request_console_input(prompt)
         if _tui_session is not None:
             return _tui_session.request_console_input(prompt)
         return self._console.input(prompt, *args, **kwargs)
@@ -331,6 +340,16 @@ def clean_display_text(text):
     return "\n".join(line for line in text.strip().split("\n") if line.strip())
 
 
+def clean_display_text_preserve_newlines(text):
+    if isinstance(text, list):
+        text = "\n".join(_display_content_block(block) for block in text)
+    elif isinstance(text, dict):
+        text = json.dumps(text, ensure_ascii=False)
+    else:
+        text = str(text or "")
+    return text.strip()
+
+
 def _display_content_block(block):
     if not isinstance(block, dict):
         return str(block)
@@ -348,6 +367,10 @@ def _display_content_block(block):
 
 
 def print_message(symbol, content, color):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_status_message(symbol, content)
+        return
     _discard_deferred_stream_thinking_header()
     console.print(
         Text.assemble(
@@ -375,6 +398,10 @@ def print_info(content):
 
 
 def print_thinking(content):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_thinking_message(content)
+        return
     _discard_deferred_stream_thinking_header()
     console.print(
         Text.assemble(
@@ -398,6 +425,10 @@ def _discard_deferred_stream_thinking_header():
 
 
 def _render_stream_thinking_header(leading_newline=True):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.start_stream_thinking()
+        return
     prefix = "\n" if leading_newline else ""
     console.print(
         Text.assemble(
@@ -418,6 +449,10 @@ def _flush_deferred_stream_thinking_header():
 
 
 def _append_stream_thinking_text(content):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.append_stream_thinking(content)
+        return
     if _tui_session is not None:
         _tui_session.append_stream_text(content, f"bold {STREAM_THINK_COLOR}")
         return
@@ -426,6 +461,12 @@ def _append_stream_thinking_text(content):
 
 
 def print_stream_thinking(content, leading_newline=True):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.start_stream_thinking()
+        if content:
+            bridge.append_stream_thinking(content)
+        return
     if not content:
         _defer_stream_thinking_header(leading_newline)
         return
@@ -446,6 +487,10 @@ def print_stream_thinking_continue(content):
 
 
 def clear_current_line():
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.clear_current_lines(1)
+        return
     if _tui_session is not None:
         _tui_session.clear_current_lines(1)
         return
@@ -456,6 +501,10 @@ def clear_current_line():
 
 
 def clear_current_lines(line_count):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.clear_current_lines(line_count)
+        return
     if _tui_session is not None:
         _tui_session.clear_current_lines(line_count)
         return
@@ -469,6 +518,10 @@ def clear_current_lines(line_count):
 
 
 def print_stream_response_start(model_name):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.start_stream_response(model_name)
+        return
     _discard_deferred_stream_thinking_header()
     console.print(
         Text.assemble(
@@ -481,6 +534,14 @@ def print_stream_response_start(model_name):
 
 
 def clean_and_print_stream_response(content):
+    bridge = get_bridge()
+    if bridge is not None:
+        while "\n\n" in content:
+            content = content.replace("\n\n", "\n")
+        if content.startswith("\n"):
+            content = content[1:]
+        bridge.append_stream_response(content)
+        return
     # Collapse multiple \n into single \n
     while "\n\n" in content:
         content = content.replace("\n\n", "\n")
@@ -494,6 +555,10 @@ def clean_and_print_stream_response(content):
 
 
 def print_stream_response_continue(content):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.append_stream_response(content)
+        return
     if _tui_session is not None:
         _tui_session.append_stream_text(content, f"bold {STREAM_RESPONSE_COLOR}")
         return
@@ -532,9 +597,7 @@ def _dashboard_centered_left_text(*segments, bias_right=False):
     available_width = max(console.width - 2, 0)
     content_length = sum(len(content) for content, _ in segments)
     total_padding = max(available_width - content_length, 0)
-    left_padding = (
-        (total_padding + 1) // 2 if bias_right else total_padding // 2
-    )
+    left_padding = (total_padding + 1) // 2 if bias_right else total_padding // 2
 
     return Text.assemble(
         " " * left_padding,
@@ -545,9 +608,7 @@ def _dashboard_centered_left_text(*segments, bias_right=False):
 def _dashboard_left_text(width, *segments, bias_right=False):
     content_length = sum(len(content) for content, _ in segments)
     total_padding = max(width - content_length, 0)
-    left_padding = (
-        (total_padding + 1) // 2 if bias_right else total_padding // 2
-    )
+    left_padding = (total_padding + 1) // 2 if bias_right else total_padding // 2
     right_padding = total_padding - left_padding
     return Text.assemble(
         " " * left_padding,
@@ -1263,9 +1324,7 @@ class ChatTUISession:
             filter=Condition(lambda: not self.confirmation_active),
         )
         self.selection_window = Window(
-            content=FormattedTextControl(
-                lambda: self._selection_formatted_text()
-            ),
+            content=FormattedTextControl(lambda: self._selection_formatted_text()),
             height=lambda: self._selection_height(),
             always_hide_cursor=True,
         )
@@ -1321,9 +1380,7 @@ class ChatTUISession:
             always_hide_cursor=True,
         )
         self.context_window = Window(
-            content=FormattedTextControl(
-                lambda: self._context_formatted_text()
-            ),
+            content=FormattedTextControl(lambda: self._context_formatted_text()),
             height=1,
             always_hide_cursor=True,
             style="class:context",
@@ -1397,7 +1454,7 @@ class ChatTUISession:
                 window_tokens = self.context_window_tokens or 1
                 pct = (input_tokens / window_tokens) * 100
                 if input_tokens >= 1000:
-                    formatted = f"{input_tokens/1000:.1f}k"
+                    formatted = f"{input_tokens / 1000:.1f}k"
                 else:
                     formatted = str(input_tokens)
                 self.context_cache_text = f"{formatted} ({pct:.0f}%)"
@@ -1827,6 +1884,7 @@ class ChatTUISession:
             self._submit_confirmation()
 
         for digit in "12345678":
+
             @bindings.add(digit, eager=True, filter=confirm_filter)
             def _(event, digit=digit):
                 if not self._choice_active():
@@ -2389,6 +2447,10 @@ def start_tui(
 
 
 def set_plan_panel(items):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.set_plan_items(items)
+        return
     if _tui_session is not None:
         _tui_session.set_todos(items)
 
@@ -2406,6 +2468,10 @@ def set_on_esc(callback):
 
 
 def set_context_usage(input_tokens, context_window_tokens):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.set_context_usage(input_tokens, context_window_tokens)
+        return
     if _tui_session is not None:
         _tui_session.set_context_usage(input_tokens, context_window_tokens)
 
@@ -2909,6 +2975,9 @@ def _read_windows_multiline_input(prompt):
 
 
 def get_user_input(prompt_text, multiline=False):
+    bridge = get_bridge()
+    if bridge is not None:
+        return bridge.request_input(prompt_text, multiline=multiline).strip()
     if _tui_session is not None:
         prompt_renderable = (
             None if str(prompt_text or "") == "You: " else _input_prompt(prompt_text)
@@ -2926,6 +2995,9 @@ def get_user_input(prompt_text, multiline=False):
 
 
 def get_continue_confirmation():
+    bridge = get_bridge()
+    if bridge is not None:
+        return bridge.request_confirmation("Continue?", "")
     if _tui_session is not None:
         return _tui_session.request_confirmation(default=False)
 
@@ -2938,6 +3010,9 @@ def get_continue_confirmation():
 
 
 def get_agent_confirmation(title, detail):
+    bridge = get_bridge()
+    if bridge is not None:
+        return bridge.request_confirmation(title, detail)
     detail = str(detail or "").rstrip()
     detail_line = f"{detail}\n" if detail else ""
     console.print(
@@ -2953,6 +3028,11 @@ def get_agent_confirmation(title, detail):
 
 
 def get_agent_choice(question, options, default_index=1):
+    bridge = get_bridge()
+    if bridge is not None:
+        selected = bridge.request_choice(question, options, default_index=default_index)
+        normalized_options = [str(option) for option in options]
+        return selected, normalized_options[selected - 1]
     normalized_options = [str(option) for option in options]
     default_index = max(1, min(len(normalized_options), int(default_index or 1)))
     if _tui_session is not None:
@@ -3039,10 +3119,14 @@ def _confirmation_result_renderable(selected):
     no_colors = SUCCESS_COLOR if not selected else TEXT_COLOR
     prompt = _confirmation_line_prompt()
     return Text.assemble(
-        prompt, "\n",
-        gradient_text("[✓]" if selected else "[-]", *yes_colors), " ",
-        gradient_text("Yes", *TEXT_COLOR), "\n",
-        gradient_text("[-]" if selected else "[✓]", *no_colors), " ",
+        prompt,
+        "\n",
+        gradient_text("[✓]" if selected else "[-]", *yes_colors),
+        " ",
+        gradient_text("Yes", *TEXT_COLOR),
+        "\n",
+        gradient_text("[-]" if selected else "[✓]", *no_colors),
+        " ",
         gradient_text("No", *TEXT_COLOR),
     )
 

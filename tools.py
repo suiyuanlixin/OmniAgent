@@ -58,7 +58,8 @@ MAX_LIST_ENTRIES = 300
 COMMAND_TIMEOUT_SECONDS = 60
 GIT_TIMEOUT_SECONDS = 30
 AGENT_APPROVAL_CONFIRM = "confirm"
-AGENT_APPROVAL_AUTO = "auto"
+AGENT_APPROVAL_APPROVE = "approve"
+AGENT_APPROVAL_FULL = "full"
 PROGRAM_DOC_FILENAMES = ("README.md",)
 PROGRAM_DOC_DEFAULT_MAX_CHARS = 30000
 WEB_FETCH_DEFAULT_MAX_CHARS = 8000
@@ -829,7 +830,7 @@ class AgentTools:
         )
         self.subagent_registry = SubagentRegistry(
             workspace_dir=self.workspace_dir,
-            skills_summary_provider=self.skills_catalog_prompt
+            skills_summary_provider=self.skills_catalog_prompt,
         )
         self.subagent_executor = None
         self.team_executor = None
@@ -865,7 +866,11 @@ class AgentTools:
 
     def set_approval_mode(self, approval_mode):
         mode = str(approval_mode or AGENT_APPROVAL_CONFIRM).strip().lower()
-        if mode not in {AGENT_APPROVAL_CONFIRM, AGENT_APPROVAL_AUTO}:
+        if mode not in {
+            AGENT_APPROVAL_CONFIRM,
+            AGENT_APPROVAL_APPROVE,
+            AGENT_APPROVAL_FULL,
+        }:
             mode = AGENT_APPROVAL_CONFIRM
         self.approval_mode = mode
 
@@ -935,7 +940,9 @@ class AgentTools:
 
     def set_team_config(self, team_store=None, team_enabled=False):
         self.team_store = team_store
-        self.team_enabled = bool(team_enabled) and self.enabled and team_store is not None
+        self.team_enabled = (
+            bool(team_enabled) and self.enabled and team_store is not None
+        )
 
     @property
     def team_available(self):
@@ -1261,7 +1268,9 @@ class AgentTools:
         return self.todos_enabled and self.todo_store.has_actionable_incomplete()
 
     def has_unverified_completed_todos(self):
-        return self.todos_enabled and self.todo_store.has_unverified_completed_criteria()
+        return (
+            self.todos_enabled and self.todo_store.has_unverified_completed_criteria()
+        )
 
     def todo_actionable_summary(self):
         if not self.todos_enabled:
@@ -1513,9 +1522,7 @@ class AgentTools:
                 truncated = True
             remaining -= len(selected)
             sections.append(
-                f"File: {path.name}\n"
-                f"Characters: {len(content)}\n\n"
-                f"{selected}"
+                f"File: {path.name}\nCharacters: {len(content)}\n\n{selected}"
             )
 
         suffix = "\n\n[program documentation truncated]" if truncated else ""
@@ -2221,9 +2228,9 @@ class AgentTools:
                 "or ask the user to run /plan approve before using more tools."
             )
 
-        if self.approval_mode == AGENT_APPROVAL_AUTO:
+        if self.approval_mode in {AGENT_APPROVAL_APPROVE, AGENT_APPROVAL_FULL}:
             self.todo_store.approve_plan(
-                note="Auto approval mode approved the current plan.",
+                note=f"{self.approval_mode} approval mode approved the current plan.",
                 source="auto",
             )
             return self._active_todo_gate(name)
@@ -2272,7 +2279,9 @@ class AgentTools:
             self.visible_output_callback()
 
     def _auto_approves(self, risk_reason):
-        if self.approval_mode != AGENT_APPROVAL_AUTO:
+        if self.approval_mode == AGENT_APPROVAL_FULL:
+            return True
+        if self.approval_mode != AGENT_APPROVAL_APPROVE:
             return False
         blocked_reasons = (
             "delete command detected",
@@ -2462,31 +2471,25 @@ def _resolve_web_fetch_host_ips(hostname, port):
 
 
 def _is_blocked_web_fetch_ip(ip):
-    return any(
-        (
-            ip.is_private,
-            ip.is_loopback,
-            ip.is_link_local,
-            ip.is_multicast,
-            ip.is_reserved,
-            ip.is_unspecified,
-        )
-    )
+    return any((
+        ip.is_private,
+        ip.is_loopback,
+        ip.is_link_local,
+        ip.is_multicast,
+        ip.is_reserved,
+        ip.is_unspecified,
+    ))
 
 
 def _is_web_fetch_text_content_type(content_type):
-    return (
-        content_type.startswith("text/")
-        or content_type
-        in {
-            "application/atom+xml",
-            "application/json",
-            "application/ld+json",
-            "application/rss+xml",
-            "application/xhtml+xml",
-            "application/xml",
-        }
-    )
+    return content_type.startswith("text/") or content_type in {
+        "application/atom+xml",
+        "application/json",
+        "application/ld+json",
+        "application/rss+xml",
+        "application/xhtml+xml",
+        "application/xml",
+    }
 
 
 def _program_doc_paths():
