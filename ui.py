@@ -482,6 +482,10 @@ def print_stream_thinking_continue(content):
         content = content.replace("\n\n", "\n")
     if not content:
         return
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.append_stream_thinking(content)
+        return
     _flush_deferred_stream_thinking_header()
     _append_stream_thinking_text(content)
 

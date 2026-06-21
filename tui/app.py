@@ -43,6 +43,62 @@ from tui.widgets.sidebar import Sidebar
 from ui import clean_display_text, clean_display_text_preserve_newlines
 
 
+from textual.widgets._toast import Toast
+
+# Override toast notification styling
+Toast.DEFAULT_CSS = """
+Toast {
+    width: 60;
+    max-width: 50%;
+    height: auto;
+    visibility: visible;
+    margin-top: 1;
+    padding: 1 2 1 2;
+    background: #2a2a2a;
+    border: none;
+    border-left: none;
+    link-background: initial;
+    link-color: $foreground;
+    link-style: underline;
+    link-background-hover: $primary;
+    link-color-hover: $foreground;
+    link-style-hover: bold not underline;
+}
+
+.toast--title {
+    text-style: bold;
+    color: $foreground;
+}
+
+Toast.-information {
+    border: none;
+    border-left: none;
+}
+
+Toast.-information .toast--title {
+    color: $foreground;
+}
+
+Toast.-warning {
+    border: none;
+    border-left: none;
+}
+
+Toast.-warning .toast--title {
+    color: $foreground;
+}
+
+Toast.-error {
+    border: none;
+    border-left: none;
+}
+
+Toast.-error .toast--title {
+    color: $foreground;
+}
+"""
+
+
 @dataclass
 class _BlockingModalRequest:
     event: threading.Event
@@ -75,7 +131,9 @@ class AgentTUIApp(App):
         background: transparent;
     }
     #left-edge.sidebar-visible {
-        width: 32;
+        width: 25%;
+        min-width: 34;
+        max-width: 58;
         background: $SURFACE_BACKGROUND;
     }
 
@@ -124,7 +182,7 @@ class AgentTUIApp(App):
         width: 100%;
         height: auto;
         min-width: 46;
-        padding: 0 1;
+        padding: 1 1 0 1;
         align-horizontal: center;
     }
     #chat-input-wrap > #chat-input {
@@ -195,7 +253,7 @@ class AgentTUIApp(App):
         width: auto;
         height: 3;
         text-align: left;
-        margin-bottom: 2;
+        margin-bottom: 1;
         padding: 0;
     }
     #project-title.hidden {
@@ -241,6 +299,7 @@ class AgentTUIApp(App):
 
     BINDINGS = [
         ("escape", "dismiss", "Dismiss"),
+        ("ctrl+c", "quit_attempt", "Quit"),
     ]
 
     sidebar_visible: bool = False
@@ -338,8 +397,6 @@ class AgentTUIApp(App):
         worker.start()
 
     def on_chat_input_model_changed(self, event: ChatInput.ModelChanged) -> None:
-        if self._conversation_started():
-            return
         save_config_field("current_model", event.value)
         self._reload_config()
         self._apply_config_to_controls()
@@ -405,7 +462,7 @@ class AgentTUIApp(App):
             return
         session_path = str(event.session_path or "").strip()
         action = str(event.action or "").strip().lower()
-        if not session_path or action not in {"pin", "unpin", "delete"}:
+        if not session_path or action not in {"pin", "unpin", "delete", "load"}:
             return
         try:
             if action == "pin":
@@ -417,6 +474,13 @@ class AgentTUIApp(App):
             elif action == "delete":
                 self._delete_session_record(session_path)
                 self.add_status_message("[✓]", "已删除对话。")
+            elif action == "load":
+                record = load_session(session_path)
+                if not record:
+                    self.add_status_message("[✗]", "无法读取所选会话。")
+                    return
+                self._load_session_record(record)
+                return
         except Exception as error:
             self.add_status_message("[✗]", f"会话操作失败: {error}")
             return
@@ -455,6 +519,9 @@ class AgentTUIApp(App):
         elif self.is_modal_open:
             self.pop_screen()
 
+    def action_quit_attempt(self) -> None:
+        self.notify("Press Ctrl+Q to quit", title="Quit", severity="information")
+
     @property
     def is_modal_open(self) -> bool:
         return len(self.screen_stack) > 1
@@ -490,24 +557,23 @@ class AgentTUIApp(App):
 
     def add_status_message(self, symbol, content) -> None:
         text = str(content or "").strip()
-        prefix = str(symbol or "").strip()
-        if prefix:
-            text = f"{prefix} {text}".strip()
         if not text:
             return
-        self._call_ui(self._append_status_text, text)
+        self._call_ui(self._show_notification, text)
+
+    def _show_notification(self, text: str) -> None:
+        self.notify(text, severity="information")
 
     def add_thinking_message(self, content) -> None:
         text = clean_display_text_preserve_newlines(content)
         if not text:
             return
-        self._call_ui(self._append_thought_message, text, self._elapsed_since_thinking())
+        self._call_ui(
+            self._append_thought_message, text, self._elapsed_since_thinking()
+        )
 
     def start_stream_thinking(self) -> None:
-        if self._thinking_started_at is None:
-            self._thinking_started_at = perf_counter()
-        self._resume_thinking_elapsed_timer()
-        self._call_ui(self._start_thought_stream_widget)
+        pass
 
     def append_stream_thinking(self, content) -> None:
         if self._thinking_started_at is None:
@@ -517,7 +583,9 @@ class AgentTUIApp(App):
 
     def start_stream_response(self, model_name) -> None:
         self._pause_thinking_elapsed_timer()
-        self._call_ui(self._finish_thought_stream_widget, self._elapsed_since_thinking())
+        self._call_ui(
+            self._finish_thought_stream_widget, self._elapsed_since_thinking()
+        )
         self._call_ui(self._start_stream_widget, "assistant", "")
 
     def append_stream_response(self, content) -> None:
@@ -605,10 +673,6 @@ class AgentTUIApp(App):
         )
         self._stream_kind = None
 
-    def _start_thought_stream_widget(self) -> None:
-        self.query_one("#messages-view", ChatView).start_thought_stream()
-        self._stream_kind = "thought"
-
     def _append_thought_stream_widget(self, content: str) -> None:
         self.query_one("#messages-view", ChatView).append_thought_stream(content)
         self._stream_kind = "thought"
@@ -664,7 +728,6 @@ class AgentTUIApp(App):
         chat_input.plan_mode = bool(self.config.agent_plan_enable)
         chat_input.set_selected_approval(self.config.agent_approval_mode)
         chat_input.set_selected_thinking(self._thinking_value_from_config())
-        self._set_model_change_allowed(not self._conversation_started())
 
     def _thinking_value_from_config(self) -> str:
         active_model = self.config.active_model
@@ -685,7 +748,9 @@ class AgentTUIApp(App):
         for project in load_projects():
             sessions = list_sessions(project)
             for session in sessions:
-                session["_pinned"] = str(session.get("session_path") or "") in pinned_paths
+                session["_pinned"] = (
+                    str(session.get("session_path") or "") in pinned_paths
+                )
             project_rows.append({
                 "name": project.name,
                 "sessions": sessions,
@@ -828,8 +893,6 @@ class AgentTUIApp(App):
         self._refresh_project_views()
 
     def _reset_chat_state(self) -> None:
-        if self.sidebar_visible:
-            self.toggle_sidebar()
         self._clear_loaded_session_state(refresh_sidebar=True)
 
     def _clear_loaded_session_state(self, refresh_sidebar: bool = True) -> None:
@@ -998,7 +1061,6 @@ class AgentTUIApp(App):
         if base == "/load":
             self.current_session_record = None
             self._sync_chat_view_with_history()
-            self._set_model_change_allowed(False)
             self.add_status_message("[✓]", "已将会话载入当前聊天。")
             return
         if base == "/conf":
@@ -1010,6 +1072,7 @@ class AgentTUIApp(App):
         self._finish_thought_stream_widget(self._elapsed_since_thinking())
         self.chat_busy = False
         self._set_input_enabled(True)
+        self._set_model_change_allowed(True)
         self._display_response(response)
         if response and not response.get("agent_stopped"):
             self._persist_current_session()
@@ -1021,6 +1084,7 @@ class AgentTUIApp(App):
         self._finish_thought_stream_widget(self._elapsed_since_thinking())
         self.chat_busy = False
         self._set_input_enabled(True)
+        self._set_model_change_allowed(True)
         self.add_status_message("[✗]", f"处理消息失败: {error}")
         self._message_started_at = None
         self._thinking_started_at = None
@@ -1099,9 +1163,6 @@ class AgentTUIApp(App):
 
     def _sync_chat_view_with_history(self) -> None:
         history = list(self.chat.get_history() if self.chat is not None else [])
-        if not history:
-            self._reset_chat_state()
-            return
         self.start_chat()
         view = self.query_one("#messages-view", ChatView)
         view.clear()
@@ -1124,6 +1185,5 @@ class AgentTUIApp(App):
         self.chat = self._build_chat(record)
         self.chat.set_history(record.get("conversation") or [])
         self._sync_chat_view_with_history()
-        self._set_model_change_allowed(False)
         self._apply_config_to_controls()
         self._refresh_project_views()

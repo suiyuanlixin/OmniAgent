@@ -90,6 +90,11 @@ class ChatView(Widget):
         padding: 0;
     }
 
+    .message-spacer {
+        width: 100%;
+        height: 1;
+    }
+
     ThoughtBlock {
         width: 100%;
         height: auto;
@@ -112,7 +117,7 @@ class ChatView(Widget):
     ThoughtBlock > .thought-toggle:hover,
     ThoughtBlock > .thought-toggle:focus-within {
         background: transparent;
-        color: $TEXT_PRIMARY;
+        color: $TEXT_MUTED;
     }
 
     ThoughtBlock > .thought-content {
@@ -145,6 +150,10 @@ class ChatView(Widget):
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        if role == "user":
+            self.query_one("#chat-log", VerticalScroll).mount(
+                Static("", classes="message-spacer")
+            )
         row, content_widget = _build_message_widgets(role, content)
         self.query_one("#chat-log", VerticalScroll).mount(row)
         self.call_after_refresh(self._scroll_end)
@@ -271,12 +280,19 @@ def _build_message_widgets(role: str, content: str):
         markup=False,
         expand=False,
     )
-    bubble = Vertical(
-        TopHalfSpacer(classes=half_classes),
-        content_widget,
-        BottomHalfSpacer(classes=half_classes),
-        classes=bubble_classes,
-    )
+    if role == "user":
+        bubble = Vertical(
+            TopHalfSpacer(classes=half_classes),
+            content_widget,
+            BottomHalfSpacer(classes=half_classes),
+            classes=bubble_classes,
+        )
+    else:
+        bubble = Vertical(
+            TopHalfSpacer(classes=half_classes),
+            content_widget,
+            classes=bubble_classes,
+        )
     return Horizontal(bubble, classes=row_classes), content_widget
 
 
@@ -329,9 +345,10 @@ class ThoughtBlock(Vertical):
         self._refresh()
 
     def on_click(self, event: events.Click) -> None:
-        if getattr(event.control, "has_class", None) and event.control.has_class(
-            "thought-toggle"
-        ):
+        control = event.control
+        if not hasattr(control, "has_class"):
+            return
+        if control.has_class("thought-toggle") or control.has_class("thought-content"):
             self.expanded = not self.expanded
             self._refresh()
 
