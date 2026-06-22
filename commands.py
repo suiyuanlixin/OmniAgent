@@ -26,7 +26,7 @@ from config import (
     save_config_fields,
     update_config,
 )
-from session import save_conversation, load_conversation
+from session import save_conversation
 from installer import (
     SkillInstallError,
     install_registry_skill,
@@ -39,7 +39,6 @@ COMMANDS = {
     "/quit": "Exit OmniAgent.",
     "/clear": "Clear the conversation history.",
     "/save": "Save the current conversation history to a JSON file.",
-    "/load": "Load a previous conversation from JSON file.",
     "/conf": "Update configuration, or reload config.json (Example: /conf reload).",
     "/token": "Set the maximum tokens for responses (Example: /token 4096).",
     "/temp": "Set the temperature for responses (Example: /temp 0.7).",
@@ -195,13 +194,6 @@ def handle_temp(chat, args):
 
 def handle_save(chat, args):
     save_conversation(chat.get_history(), chat.model)
-    return True
-
-
-def handle_load(chat, args):
-    conversation = load_conversation()
-    if conversation is not None:
-        chat.set_history(conversation)
     return True
 
 
@@ -1359,7 +1351,6 @@ COMMAND_HANDLERS = {
     "/clear": handle_clear,
     "/conf": handle_conf,
     "/save": handle_save,
-    "/load": handle_load,
     "/mode": handle_mode,
     "/think": handle_think,
     "/comp": handle_comp,

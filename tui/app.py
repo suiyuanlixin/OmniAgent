@@ -317,6 +317,7 @@ class AgentTUIApp(App):
         self._message_started_at: float | None = None
         self._thinking_started_at: float | None = None
         self._thinking_elapsed_timer = None
+        self._summary_replace_pending = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="left-edge", classes="sidebar-hidden"):
@@ -384,21 +385,41 @@ class AgentTUIApp(App):
         self.start_chat()
         chat_view = self.query_one("#messages-view", ChatView)
         chat_view.add_message("user", event.content)
-        self._set_model_change_allowed(False)
+        chat_view.reset_explored()
+        self._set_controls_locked(True)
         self._set_input_enabled(False)
         self.chat_busy = True
         self._message_started_at = perf_counter()
         self._thinking_started_at = None
+        self._summary_replace_pending = False
+        new_session = self.current_session_record is not None and (
+            not self.current_session_record.get("conversation")
+        )
         worker = threading.Thread(
             target=self._process_user_message,
             args=(event.content,),
             daemon=True,
         )
         worker.start()
+        if new_session:
+            self._refresh_project_views()
 
     def on_chat_input_model_changed(self, event: ChatInput.ModelChanged) -> None:
         save_config_field("current_model", event.value)
         self._reload_config()
+        if self.chat is not None:
+            model = self.config.active_model
+            self.chat.configure(
+                api_type=model.api_type,
+                base_url=model.base_url,
+                model=model.model,
+                api_key=model.api_key,
+                max_tokens=model.max_tokens,
+                temperature=model.temperature,
+                stream_mode=model.stream_mode,
+                thinking_mode=model.thinking_mode,
+                reasoning_effort=model.reasoning_effort,
+            )
         self._apply_config_to_controls()
 
     def on_chat_input_thinking_changed(self, event: ChatInput.ThinkingChanged) -> None:
@@ -409,6 +430,9 @@ class AgentTUIApp(App):
             "reasoning_effort": effort,
         })
         self._reload_config()
+        if self.chat is not None:
+            self.chat.set_thinking_mode(thinking_enabled)
+            self.chat.set_reasoning_effort(effort)
         self._apply_config_to_controls()
 
     def on_chat_input_plan_mode_changed(self, event: ChatInput.PlanModeChanged) -> None:
@@ -575,18 +599,43 @@ class AgentTUIApp(App):
     def start_stream_thinking(self) -> None:
         pass
 
+    def start_thinking_timer(self) -> None:
+        if self._thinking_started_at is None:
+            self._thinking_started_at = perf_counter()
+        self._resume_thinking_elapsed_timer()
+
     def append_stream_thinking(self, content) -> None:
         if self._thinking_started_at is None:
             self._thinking_started_at = perf_counter()
         self._resume_thinking_elapsed_timer()
         self._call_ui(self._append_thought_stream_widget, str(content or ""))
 
+    def finish_thinking_round(self) -> None:
+        elapsed = self._elapsed_since_thinking()
+        self._call_ui(self._finish_thought_stream_widget, elapsed)
+        self._thinking_started_at = None
+        self._call_ui(self._reset_explored_widget)
+
+    def _reset_explored_widget(self) -> None:
+        self.query_one("#messages-view", ChatView).reset_explored()
+
     def start_stream_response(self, model_name) -> None:
         self._pause_thinking_elapsed_timer()
         self._call_ui(
-            self._finish_thought_stream_widget, self._elapsed_since_thinking()
+            self._finish_thought_stream_widget,
+            self._elapsed_since_thinking(),
+            self._summary_replace_pending,
         )
+        self._thinking_started_at = None
+        if self._summary_replace_pending:
+            return
         self._call_ui(self._start_stream_widget, "assistant", "")
+
+    def replace_thought_content(self, content: str) -> None:
+        self._call_ui(
+            self._replace_thought_stream_widget, str(content or ""), self._elapsed_since_thinking()
+        )
+        self._summary_replace_pending = False
 
     def append_stream_response(self, content) -> None:
         self._call_ui(self._append_stream_widget, "assistant", str(content or ""), "")
@@ -648,7 +697,7 @@ class AgentTUIApp(App):
         return str(request.result or "")
 
     def clear_current_lines(self, line_count) -> None:
-        self._call_ui(self._clear_recent_status, line_count)
+        return
 
     def _resolve_modal_request(self, request: _BlockingModalRequest, result) -> None:
         request.result = result
@@ -677,12 +726,26 @@ class AgentTUIApp(App):
         self.query_one("#messages-view", ChatView).append_thought_stream(content)
         self._stream_kind = "thought"
 
-    def _finish_thought_stream_widget(self, elapsed_seconds: float) -> None:
+    def _finish_thought_stream_widget(self, elapsed_seconds: float, keep_target: bool = False) -> None:
         self.query_one("#messages-view", ChatView).finish_thought_stream(
-            elapsed_seconds=elapsed_seconds
+            elapsed_seconds=elapsed_seconds, keep_target=keep_target
         )
         if self._stream_kind == "thought":
             self._stream_kind = None
+
+    def _replace_thought_stream_widget(self, content: str, elapsed: float) -> None:
+        self.query_one("#messages-view", ChatView).replace_thought_stream(
+            content, elapsed
+        )
+        self._stream_kind = None
+
+    def add_explored_entry(self, tool_name: str, description: str) -> None:
+        self._call_ui(self._append_explored_entry, tool_name, description)
+
+    def _append_explored_entry(self, tool_name: str, description: str) -> None:
+        self.query_one("#messages-view", ChatView).add_explored_entry(
+            tool_name, description
+        )
 
     def _start_stream_widget(self, role: str, prefix: str) -> None:
         self.query_one("#messages-view", ChatView).start_stream(
@@ -747,13 +810,17 @@ class AgentTUIApp(App):
         project_names = []
         for project in load_projects():
             sessions = list_sessions(project)
+            filtered = []
             for session in sessions:
-                session["_pinned"] = (
+                is_pinned = (
                     str(session.get("session_path") or "") in pinned_paths
                 )
+                session["_pinned"] = is_pinned
+                if not is_pinned:
+                    filtered.append(session)
             project_rows.append({
                 "name": project.name,
-                "sessions": sessions,
+                "sessions": filtered,
             })
             project_names.append(project.name)
 
@@ -761,10 +828,14 @@ class AgentTUIApp(App):
         for session in pinned_sessions:
             session["_pinned"] = True
         orphan_sessions = list_sessions(None)
+        filtered_orphans = []
         for session in orphan_sessions:
-            session["_pinned"] = str(session.get("session_path") or "") in pinned_paths
+            is_pinned = str(session.get("session_path") or "") in pinned_paths
+            session["_pinned"] = is_pinned
+            if not is_pinned:
+                filtered_orphans.append(session)
         self.query_one("#sidebar", Sidebar).set_sessions(
-            project_rows, pinned_sessions, orphan_sessions
+            project_rows, pinned_sessions, filtered_orphans
         )
         picker = self.query_one("#project-picker", ProjectPicker)
         picker.set_projects(project_names)
@@ -801,85 +872,341 @@ class AgentTUIApp(App):
             (self.current_session_record or {}).get("conversation")
         )
 
-    def _set_model_change_allowed(self, allowed: bool) -> None:
-        self.query_one("#chat-input", ChatInput).set_model_change_allowed(allowed)
+    def _set_controls_locked(self, locked: bool) -> None:
+        self.query_one("#chat-input", ChatInput).set_controls_locked(locked)
 
     def _set_input_enabled(self, enabled: bool) -> None:
         widget = self.query_one("#message-input", Input)
         widget.disabled = not enabled
 
     def _open_settings(self) -> None:
-        self.push_screen(SettingsModal(settings_rows=self._settings_rows()))
+        self.push_screen(SettingsModal(settings_rows=self._settings_rows(), app=self))
 
     def _settings_rows(self) -> list[dict]:
         active_model = self.config.active_model
+        model_choices = [
+            (name, name) for name in self.config.model_list.keys()
+        ]
+        thinking_choices = [
+            ("Off", "none"),
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("Max", "max"),
+        ]
+        approval_choices = [
+            ("Ask every time", "confirm"),
+            ("Approve for me", "approve"),
+            ("Full access", "full"),
+        ]
+
         return [
             {
-                "name": "Current model",
+                "name": "Model",
                 "value": self.config.current_model,
-                "keywords": "model current_model model_list",
+                "keywords": "model current_model",
+                "edit_type": "select",
+                "options": model_choices,
+                "on_change": lambda v: self._on_setting_model_changed(v),
             },
             {
-                "name": "API type",
-                "value": active_model.api_type,
-                "keywords": "api_type api model",
+                "name": "Max tokens",
+                "value": str(active_model.max_tokens),
+                "keywords": "max_tokens token",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_token_changed(v),
             },
             {
-                "name": "Model id",
-                "value": active_model.model,
-                "keywords": "model backend active",
+                "name": "Temperature",
+                "value": str(active_model.temperature),
+                "keywords": "temperature temp",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_temp_changed(v),
+            },
+            {
+                "name": "Stream mode",
+                "value": "on" if active_model.stream_mode else "off",
+                "keywords": "stream mode",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_stream_changed(v),
             },
             {
                 "name": "Thinking",
                 "value": self._thinking_value_from_config(),
-                "keywords": "thinking reasoning_effort stream",
+                "keywords": "thinking reasoning_effort",
+                "edit_type": "select",
+                "options": thinking_choices,
+                "on_change": lambda v: self._on_setting_thinking_changed(v),
+            },
+            {
+                "name": "Agent default",
+                "value": "on" if self.config.agent_mode else "off",
+                "keywords": "agent mode",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_agent_toggle(v),
             },
             {
                 "name": "Plan mode",
                 "value": "on" if self.config.agent_plan_enable else "off",
                 "keywords": "plan agent plan_mode",
-            },
-            {
-                "name": "Agent default",
-                "value": "on" if self.config.agent_mode else "off",
-                "keywords": "agent enable project workspace",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_plan_changed(v),
             },
             {
                 "name": "Approval",
                 "value": self.config.agent_approval_mode,
-                "keywords": "approve approval agent",
+                "keywords": "approve approval",
+                "edit_type": "select",
+                "options": approval_choices,
+                "on_change": lambda v: self._on_setting_approval_changed(v),
             },
             {
-                "name": "Stream mode",
-                "value": "on" if active_model.stream_mode else "off",
-                "keywords": "stream model",
+                "name": "Agent show thinking",
+                "value": self.config.agent_show_thinking,
+                "keywords": "show_thinking agent thinking",
+                "edit_type": "none",
             },
             {
-                "name": "Max tokens",
-                "value": str(active_model.max_tokens),
-                "keywords": "max_tokens model",
+                "name": "Agent max rounds",
+                "value": str(self.config.max_agent_rounds),
+                "keywords": "max_agent_rounds agent rounds",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_rounds_changed(v),
             },
             {
-                "name": "Context window",
-                "value": str(active_model.context_window_tokens),
-                "keywords": "context_window_tokens context",
+                "name": "Agent max tool calls",
+                "value": str(self.config.max_agent_tool_calls),
+                "keywords": "max_agent_tool_calls agent tool_calls",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_tool_calls_changed(v),
             },
             {
                 "name": "Skills",
                 "value": "on" if self.config.skills_enable else "off",
-                "keywords": "skills source app workspace",
+                "keywords": "skills",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_skills_changed(v),
+            },
+            {
+                "name": "Skills max chars",
+                "value": str(self.config.skills_max_chars),
+                "keywords": "skills max_chars max",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_skills_max_changed(v),
             },
             {
                 "name": "Web search",
                 "value": "on" if self.config.web_search_enable else "off",
-                "keywords": "web_search tavily search",
+                "keywords": "web_search search",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_search_changed(v),
+            },
+            {
+                "name": "Web search max results",
+                "value": str(self.config.web_search_max_results),
+                "keywords": "web_search max_results max",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_search_max_changed(v),
             },
             {
                 "name": "Debug",
                 "value": "on" if self.config.debug else "off",
                 "keywords": "debug diagnostics",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_debug_changed(v),
+            },
+            {
+                "name": "Auto compact",
+                "value": "on" if self.config.compaction_enable else "off",
+                "keywords": "compact compaction auto",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_compact_changed(v),
+            },
+            {
+                "name": "Compact trigger ratio",
+                "value": str(self.config.compaction_trigger_ratio),
+                "keywords": "compact trigger ratio compaction",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_compact_ratio_changed(v),
+            },
+            {
+                "name": "API type",
+                "value": active_model.api_type,
+                "keywords": "api_type api",
+                "edit_type": "none",
+            },
+            {
+                "name": "Model id",
+                "value": active_model.model,
+                "keywords": "model backend active",
+                "edit_type": "none",
+            },
+            {
+                "name": "Context window",
+                "value": str(active_model.context_window_tokens),
+                "keywords": "context_window_tokens context",
+                "edit_type": "none",
             },
         ]
+
+    def _on_setting_model_changed(self, value: str) -> None:
+        save_config_field("current_model", value)
+        self._reload_config()
+        if self.chat is not None:
+            model = self.config.active_model
+            self.chat.configure(
+                api_type=model.api_type,
+                base_url=model.base_url,
+                model=model.model,
+                api_key=model.api_key,
+                max_tokens=model.max_tokens,
+                temperature=model.temperature,
+                stream_mode=model.stream_mode,
+                thinking_mode=model.thinking_mode,
+                reasoning_effort=model.reasoning_effort,
+            )
+        self._apply_config_to_controls()
+
+    def _on_setting_token_changed(self, value: str) -> None:
+        try:
+            tokens = max(1, int(value))
+        except (TypeError, ValueError):
+            return
+        save_config_field("max_tokens", tokens)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_max_tokens(tokens)
+        self._apply_config_to_controls()
+
+    def _on_setting_temp_changed(self, value: str) -> None:
+        try:
+            temp = max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return
+        save_config_field("temperature", temp)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_temperature(temp)
+        self._apply_config_to_controls()
+
+    def _on_setting_stream_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("stream_mode", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_stream_mode(enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_thinking_changed(self, value: str) -> None:
+        thinking_enabled = value != "none"
+        effort = "" if value in {"", "none"} else value
+        save_config_fields({
+            "thinking_mode": thinking_enabled,
+            "reasoning_effort": effort,
+        })
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_thinking_mode(thinking_enabled)
+            self.chat.set_reasoning_effort(effort)
+        self._apply_config_to_controls()
+
+    def _on_setting_agent_toggle(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("agent_mode", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_agent_mode(enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_plan_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("agent_plan_enable", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_agent_plan_enabled(enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_approval_changed(self, value: str) -> None:
+        save_config_field("agent_approval_mode", value)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_agent_approval_mode(value)
+        self._apply_config_to_controls()
+
+    def _on_setting_rounds_changed(self, value: str) -> None:
+        try:
+            rounds = max(1, int(value))
+        except (TypeError, ValueError):
+            return
+        save_config_field("max_agent_rounds", rounds)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_agent_limits(max_rounds=rounds)
+        self._apply_config_to_controls()
+
+    def _on_setting_tool_calls_changed(self, value: str) -> None:
+        try:
+            calls = max(1, int(value))
+        except (TypeError, ValueError):
+            return
+        save_config_field("max_agent_tool_calls", calls)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_agent_limits(max_tool_calls=calls)
+        self._apply_config_to_controls()
+
+    def _on_setting_skills_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("skills_enable", enabled)
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_skills_max_changed(self, value: str) -> None:
+        try:
+            chars = max(1000, int(value))
+        except (TypeError, ValueError):
+            return
+        save_config_field("skills_max_chars", chars)
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_search_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("web_search_enable", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.agent_tools.set_web_search_config(enabled=enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_search_max_changed(self, value: str) -> None:
+        try:
+            count = max(1, min(20, int(value)))
+        except (TypeError, ValueError):
+            return
+        save_config_field("web_search_max_results", count)
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_debug_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("debug", enabled)
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_compact_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("compaction_enable", enabled)
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_compact_ratio_changed(self, value: str) -> None:
+        try:
+            ratio = max(0.1, min(0.95, float(value)))
+        except (TypeError, ValueError):
+            return
+        save_config_field("compaction_trigger_ratio", ratio)
+        self._reload_config()
+        self._apply_config_to_controls()
 
     def _handle_project_modal_result(self, result: dict | None) -> None:
         if not result:
@@ -903,7 +1230,7 @@ class AgentTUIApp(App):
         self._stream_kind = None
         self._set_input_enabled(True)
         self._set_context_label(0, self.config.context_window_tokens)
-        self._set_model_change_allowed(True)
+        self._set_controls_locked(False)
 
         messages = self.query_one("#messages-view", ChatView)
         messages_wrap = self.query_one("#messages-wrap", Container)
@@ -1058,36 +1385,39 @@ class AgentTUIApp(App):
             self._reset_chat_state()
             self.add_status_message("[✓]", "对话历史已清空。")
             return
-        if base == "/load":
-            self.current_session_record = None
-            self._sync_chat_view_with_history()
-            self.add_status_message("[✓]", "已将会话载入当前聊天。")
-            return
         if base == "/conf":
             self._sync_chat_view_with_history()
-        self._persist_current_session(refresh_sidebar=base in {"/load", "/conf"})
+        self._persist_current_session(refresh_sidebar=base in {"/conf"})
 
     def _finish_response(self, response) -> None:
         self._pause_thinking_elapsed_timer()
-        self._finish_thought_stream_widget(self._elapsed_since_thinking())
+        self._finish_thought_stream_widget(
+            self._elapsed_since_thinking(),
+            keep_target=self._summary_replace_pending,
+        )
         self.chat_busy = False
         self._set_input_enabled(True)
-        self._set_model_change_allowed(True)
+        self._set_controls_locked(False)
         self._display_response(response)
-        if response and not response.get("agent_stopped"):
-            self._persist_current_session()
+        self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
+        self._summary_replace_pending = False
 
     def _finish_with_error(self, error: Exception) -> None:
         self._pause_thinking_elapsed_timer()
-        self._finish_thought_stream_widget(self._elapsed_since_thinking())
+        self._finish_thought_stream_widget(
+            self._elapsed_since_thinking(),
+            keep_target=self._summary_replace_pending,
+        )
         self.chat_busy = False
         self._set_input_enabled(True)
-        self._set_model_change_allowed(True)
+        self._set_controls_locked(False)
         self.add_status_message("[✗]", f"处理消息失败: {error}")
+        self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
+        self._summary_replace_pending = False
 
     def _display_response(self, response) -> None:
         if not response:

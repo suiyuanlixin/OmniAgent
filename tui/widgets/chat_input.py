@@ -231,6 +231,7 @@ class ChatInput(Widget):
     plan_mode = reactive(True)
     chat_active = reactive(False)
     allow_model_change = reactive(True)
+    controls_locked = reactive(False)
     model_options: list[tuple[str, str]] = []
     thinking_options: list[tuple[str, str]] = THINKING_LEVELS.copy()
     selected_model_value = reactive("")
@@ -313,19 +314,29 @@ class ChatInput(Widget):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id
         if btn_id == "plan-opt-plan":
+            if self.controls_locked:
+                return
             self._set_plan_mode(True)
         elif btn_id == "plan-opt-build":
+            if self.controls_locked:
+                return
             self._set_plan_mode(False)
 
         elif btn_id == "plan-trigger":
+            if self.controls_locked:
+                return
             self._toggle_dropdown("plan-options")
         elif btn_id == "approval-trigger":
+            if self.controls_locked:
+                return
             self._toggle_dropdown("approval-options")
         elif btn_id == "model-trigger":
-            if not self.allow_model_change:
+            if not self.allow_model_change or self.controls_locked:
                 return
             self._toggle_dropdown("model-options")
         elif btn_id == "thinking-trigger":
+            if self.controls_locked:
+                return
             self._toggle_dropdown("thinking-options")
 
         elif btn_id and btn_id.startswith("approval-"):
@@ -491,6 +502,13 @@ class ChatInput(Widget):
         if self.allow_model_change:
             trigger.remove_class("disabled")
         else:
+            self._close_all_dropdowns()
+
+    def set_controls_locked(self, locked: bool) -> None:
+        self.controls_locked = bool(locked)
+        if not self.is_mounted:
+            return
+        if self.controls_locked:
             self._close_all_dropdowns()
 
     def _rebuild_dropdown(self, prefix, options, selected_value):

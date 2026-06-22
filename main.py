@@ -1,28 +1,10 @@
-import sys
 import base64
 import mimetypes
 import re
 from pathlib import Path
 
-from ui import (
-    console,
-    print_success,
-    print_error,
-    print_warn,
-    print_thinking,
-    get_user_input,
-    run_tui,
-    show_dashboard,
-    start_tui,
-    print_stream_thinking_continue,
-    clean_and_print_stream_response,
-    clean_display_text,
-    set_on_esc,
-)
-from config import load_config
-from chat import OmniAgent
-from commands import process_command
-from tools import MAX_READ_CHARS, normalize_workspace_dir
+from ui import clean_display_text
+from tools import MAX_READ_CHARS
 
 
 FILE_REFERENCE_PATTERN = re.compile(r"\[([^\[\]\r\n]+)\]")
@@ -41,75 +23,6 @@ VIDEO_MEDIA_TYPES = {
 IMAGE_FILE_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_FILE_MAX_BYTES = 50 * 1024 * 1024
 MULTIMODAL_REQUEST_MAX_BYTES = 64 * 1024 * 1024
-
-
-def _clean_text(text):
-    return clean_display_text(text)
-
-
-def stream_print_thinking(content):
-    if content == "\n":
-        print_stream_thinking_continue("\n")
-    elif content:
-        print_stream_thinking_continue(content)
-
-
-def stream_print_response(content):
-    if content == "\n":
-        clean_and_print_stream_response("\n")
-    elif content:
-        clean_and_print_stream_response(content)
-
-
-def _should_print_unstreamed_thinking(response, stream_mode, thinking_mode):
-    return (
-        response.get("thinking")
-        and thinking_mode
-        and (stream_mode or response.get("response_streamed"))
-        and response.get("thinking_streamed") is False
-    )
-
-
-def handle_response(response, model_name, stream_mode=False, thinking_mode=False):
-    if not response:
-        print_error(
-            "Failed to get response, please check your APIKey and network connection."
-        )
-        return
-
-    if _should_print_unstreamed_thinking(response, stream_mode, thinking_mode):
-        print_thinking(_clean_text(response.get("thinking")))
-
-    if stream_mode:
-        console.print()
-        return
-
-    if response.get("response_streamed"):
-        console.print()
-        return
-
-    if response.get("agent_stopped"):
-        return
-
-    thinking = response.get("thinking")
-    if thinking and thinking_mode:
-        print_thinking(_clean_text(thinking))
-
-    if response.get("thinking_needs_separator") and not response.get("agent_stopped"):
-        console.print()
-
-    reply = _clean_text(response["response"])
-    print_success(f"{model_name.upper()}: {reply}")
-
-
-def get_startup_workspace(argv):
-    if len(argv) < 2:
-        return None, None
-
-    workspace = normalize_workspace_dir(argv[1])
-    if workspace is None:
-        return None, f"Invalid workspace directory: {argv[1]}"
-    return str(workspace), None
 
 
 def _is_file_reference_path(path_text):
@@ -244,13 +157,6 @@ def _read_external_media_reference(path_text, encoded_bytes_before=0):
     }
 
 
-def attach_external_file_references(user_input):
-    user_input, _media_references = attach_external_file_references_with_media(
-        user_input
-    )
-    return user_input
-
-
 def attach_external_file_references_with_media(user_input):
     references = _external_file_references(user_input)
     if not references:
@@ -288,110 +194,6 @@ def attach_external_file_references_with_media(user_input):
         blocks.append(f"--- File: {path} ---\n{content}\n--- End file: {path} ---")
 
     return f"{user_input}\n\n" + "\n\n".join(blocks), media_references
-
-
-def run_chat_loop(
-    config, workspace_dir, workspace_error=None, agent_auto_disabled=False
-):
-    if workspace_error:
-        print_error(workspace_error)
-    if agent_auto_disabled:
-        print_warn(
-            "Agent mode requires a startup workspace directory and has been turned off."
-        )
-    try:
-        chat = OmniAgent(
-            model=config.model,
-            api_key=config.api_key,
-            api_type=config.api_type,
-            base_url=config.base_url,
-            max_tokens=config.max_tokens,
-            context_window_tokens=config.context_window_tokens,
-            temperature=config.temperature,
-            stream_mode=config.stream_mode,
-            thinking_mode=config.thinking_mode,
-            reasoning_effort=config.reasoning_effort,
-            agent_mode=config.agent_mode,
-            workspace_dir=workspace_dir,
-            max_agent_rounds=config.max_agent_rounds,
-            max_agent_tool_calls=config.max_agent_tool_calls,
-            agent_approval_mode=config.agent_approval_mode,
-            agent_show_thinking=config.agent_show_thinking,
-            agent_summary_model=config.agent_summary_model,
-            skills_enabled=config.skills_enable,
-            skills_source_app=config.skills_source_app,
-            skills_source_workspace=config.skills_source_workspace,
-            skills_auto_catalog=config.skills_auto_catalog,
-            skills_max_chars=config.skills_max_chars,
-            compaction_enable=config.compaction_enable,
-            compaction_trigger_ratio=config.compaction_trigger_ratio,
-            compaction_keep_recent_messages=config.compaction_keep_recent_messages,
-            compaction_compact_model=config.compaction_compact_model,
-            memory_model=config.memory_model,
-            debug=config.debug,
-            web_search_enabled=config.web_search_enable,
-            web_search_provider=config.web_search_provider,
-            web_search_api_key=config.web_search_api_key,
-            web_search_max_results=config.web_search_max_results,
-            web_search_depth=config.web_search_depth,
-            web_search_topic=config.web_search_topic,
-            agent_plan_enabled=config.agent_plan_enable,
-            agent_team_enable=config.agent_team_enable,
-        )
-        set_on_esc(lambda: chat.request_agent_stop())
-
-    except Exception as error:
-        print_error(f"Failed to initialize client: {error}")
-        return
-
-    while True:
-        try:
-            user_input = get_user_input("You: ", multiline=True)
-
-            if not user_input:
-                print_error("Please enter a non-empty message.")
-                continue
-
-            if user_input.startswith("/"):
-                should_continue = process_command(user_input, chat)
-                if should_continue is False:
-                    break
-                if should_continue is True:
-                    continue
-
-            try:
-                user_input, media_references = (
-                    attach_external_file_references_with_media(user_input)
-                )
-            except ValueError as error:
-                print_error(str(error))
-                continue
-
-            response = chat.send_message(
-                user_input,
-                stream_print_thinking,
-                stream_print_response,
-                media_references=media_references,
-            )
-            handle_response(
-                response,
-                chat.model,
-                chat.stream_mode and not chat.agent_mode,
-                chat.thinking_mode,
-            )
-            if response and not response.get("agent_stopped"):
-                chat.update_session_episodic_memory()
-
-        except KeyboardInterrupt:
-            console.print()
-            print_success("Conversation interrupted, goodbye!")
-            break
-        except EOFError:
-            console.print()
-            print_success("Conversation interrupted, goodbye!")
-            break
-        except Exception as error:
-            print_error(f"Error occurred: {error}")
 
 
 def main():

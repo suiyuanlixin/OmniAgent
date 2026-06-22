@@ -37,6 +37,7 @@ class Sidebar(Vertical):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._render_serial = 0
+        self._expanded_groups: set[str] = set()
 
     DEFAULT_CSS = render_css(
         """
@@ -321,8 +322,10 @@ class Sidebar(Vertical):
             lst = self.query_one(f"#{group_id}", Vertical)
             if lst.has_class("hidden"):
                 lst.remove_class("hidden")
+                self._expanded_groups.discard(group_id)
             else:
                 lst.add_class("hidden")
+                self._expanded_groups.add(group_id)
         else:
             self._close_action_menus()
 
@@ -414,6 +417,7 @@ class Sidebar(Vertical):
         pinned_list = self.query_one("#pinned-list", Vertical)
         projects_title = self.query_one("#projects-title", Static)
         projects_list = self.query_one("#projects-list", Vertical)
+        chats_title = self.query_one("#chats-title", Static)
         chats_list = self.query_one("#chats-list", Vertical)
         pinned_title.add_class("hidden")
         pinned_list.add_class("hidden")
@@ -422,6 +426,8 @@ class Sidebar(Vertical):
         projects_list.add_class("hidden")
         projects_list.remove_children()
         chats_list.remove_children()
+        chats_title.add_class("hidden")
+        chats_list.add_class("hidden")
 
         for index, session in enumerate(pinned_sessions or []):
             pinned_title.remove_class("hidden")
@@ -459,6 +465,8 @@ class Sidebar(Vertical):
                 )
 
         for index, session in enumerate(orphan_sessions or []):
+            chats_title.remove_class("hidden")
+            chats_list.remove_class("hidden")
             self._mount_session_item(
                 chats_list,
                 session,

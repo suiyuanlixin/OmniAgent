@@ -6,18 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from rich.text import Text
-
 from ui import (
     clean_display_text,
-    console,
-    get_user_input,
-    gradient_text,
     print_error,
     print_info,
     print_success,
-    TEXT_COLOR,
-    THINK_COLOR,
 )
 
 
@@ -403,74 +396,6 @@ def delete_session(session_path):
     if normalized:
         unpin_session(normalized)
     return True
-
-
-def load_conversation():
-    ensure_session_storage()
-    session_files = list_sessions(None)
-    for project in load_projects():
-        session_files.extend(list_sessions(project))
-
-    if not session_files:
-        print_error("No saved conversations found.")
-        return None
-
-    print_info("Available conversations:")
-    for index, session in enumerate(session_files, 1):
-        title = str(session.get("title") or "New Chat")
-        project = session.get("project") or {}
-        project_name = str(project.get("name") or "No project")
-        model = str(session.get("model_name") or "").upper() or "UNKNOWN"
-        count = len(session.get("conversation") or [])
-        updated_at = str(session.get("updated_at") or session.get("created_at") or "")
-        label = f"{title} <{project_name}> <{model}> <{count} Messages> <{updated_at}>"
-        parts = label.split(" <", 1)
-        if len(parts) == 2:
-            console.print(
-                Text.assemble(
-                    gradient_text(f"[{index}] {parts[0]}", *TEXT_COLOR),
-                    gradient_text(f" <{parts[1]}", *THINK_COLOR),
-                )
-            )
-        else:
-            console.print(gradient_text(f"[{index}] {label}", *TEXT_COLOR))
-
-    choice = get_user_input("Select number to load (Enter to cancel): ")
-    if not choice:
-        return None
-
-    try:
-        selected = int(choice) - 1
-    except ValueError:
-        print_error("Invalid selection.")
-        return None
-    if selected < 0 or selected >= len(session_files):
-        print_error("Invalid selection.")
-        return None
-
-    session = session_files[selected]
-    conversation = list(session.get("conversation") or [])
-    project = session.get("project") or {}
-    project_name = str(project.get("name") or "No project")
-    _print_loaded_conversation(conversation, session.get("model_name", ""))
-    print_success(
-        f"Loaded {len(conversation)} messages from [{selected + 1}] "
-        f"{session.get('title') or 'New Chat'} ({project_name})."
-    )
-    return conversation
-
-
-def _print_loaded_conversation(conversation, model_name):
-    assistant_name = (model_name or "assistant").upper()
-    for message in conversation:
-        role = message.get("role", "")
-        content = clean_display_text(message.get("content", ""))
-        if role == "assistant":
-            print_success(f"{assistant_name}: {content}")
-        elif role == "user":
-            print_info(f"YOU: {content}")
-        else:
-            print_info(f"{role.upper() or 'MESSAGE'}: {content}")
 
 
 def _migrate_legacy_history():
