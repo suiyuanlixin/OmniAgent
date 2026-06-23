@@ -36,7 +36,6 @@ DEFAULT_AGENT_APPROVAL_MODE = "confirm"
 AGENT_APPROVAL_CONFIRM = "confirm"
 AGENT_APPROVAL_APPROVE = "approve"
 AGENT_APPROVAL_FULL = "full"
-DEFAULT_AGENT_SUMMARY_MODEL = ""
 DEFAULT_AGENT_PLAN_ENABLE = True
 DEFAULT_AGENT_TEAM_ENABLE = False
 DEFAULT_SKILLS_ENABLE = True
@@ -51,16 +50,12 @@ DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
 DEFAULT_COMPACTION_COMPACT_MODEL = ""
 DEFAULT_MEMORY_MODEL = ""
 DEFAULT_DEBUG = False
-AGENT_THINKING_OFF = "off"
-AGENT_THINKING_SUMMARY = "summary"
-AGENT_THINKING_FULL = "full"
-DEFAULT_AGENT_SHOW_THINKING = AGENT_THINKING_SUMMARY
+DEFAULT_AGENT_SHOW_THINKING = True
 AGENT_APPROVAL_MODES = {
     AGENT_APPROVAL_CONFIRM,
     AGENT_APPROVAL_APPROVE,
     AGENT_APPROVAL_FULL,
 }
-AGENT_THINKING_MODES = {AGENT_THINKING_OFF, AGENT_THINKING_SUMMARY, AGENT_THINKING_FULL}
 REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 SUPPORTED_API_TYPES = {
     API_TYPE_GLM,
@@ -88,7 +83,6 @@ GLOBAL_FIELD_KEYS = {
     "max_agent_tool_calls",
     "agent_approval_mode",
     "agent_show_thinking",
-    "agent_summary_model",
     "agent_plan_enable",
     "agent_team_enable",
     "skills_enable",
@@ -149,8 +143,7 @@ class AppConfig:
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
-    agent_show_thinking: str = DEFAULT_AGENT_SHOW_THINKING
-    agent_summary_model: str = DEFAULT_AGENT_SUMMARY_MODEL
+    agent_show_thinking: bool = DEFAULT_AGENT_SHOW_THINKING
     agent_plan_enable: bool = DEFAULT_AGENT_PLAN_ENABLE
     agent_team_enable: bool = DEFAULT_AGENT_TEAM_ENABLE
     skills_enable: bool = DEFAULT_SKILLS_ENABLE
@@ -232,8 +225,7 @@ class AppConfig:
                 "max_rounds": self.max_agent_rounds,
                 "max_tool_calls": self.max_agent_tool_calls,
                 "approve": self.agent_approval_mode,
-                "show_thinking": self.agent_show_thinking,
-                "summary_model": self.agent_summary_model,
+                "show_thinking": bool(self.agent_show_thinking),
                 "plan_mode": self.agent_plan_enable,
                 "agent_team": {
                     "enable": self.agent_team_enable,
@@ -275,8 +267,7 @@ class AppConfig:
             "max_agent_rounds": self.max_agent_rounds,
             "max_agent_tool_calls": self.max_agent_tool_calls,
             "agent_approval_mode": self.agent_approval_mode,
-            "agent_show_thinking": self.agent_show_thinking,
-            "agent_summary_model": self.agent_summary_model,
+            "agent_show_thinking": bool(self.agent_show_thinking),
             "agent_plan_enable": self.agent_plan_enable,
             "agent_team_enable": self.agent_team_enable,
             "skills_enable": self.skills_enable,
@@ -411,17 +402,15 @@ def parse_agent_approval_mode(value):
 
 def parse_agent_show_thinking(value):
     if isinstance(value, bool):
-        return AGENT_THINKING_SUMMARY if value else AGENT_THINKING_OFF
+        return value
     if value is None:
         return DEFAULT_AGENT_SHOW_THINKING
     mode = str(value).strip().lower()
-    if mode in AGENT_THINKING_MODES:
-        return mode
-    if mode in {"true", "ture", "1", "yes", "on"}:
-        return AGENT_THINKING_SUMMARY
+    if mode in {"true", "ture", "1", "yes", "on", "full", "show"}:
+        return True
     if mode in {"false", "0", "no", "off", "none", "hide", "hidden"}:
-        return AGENT_THINKING_OFF
-    raise ValueError("Agent thinking display must be summary, full, or off.")
+        return False
+    raise ValueError("Agent thinking display must be true or false.")
 
 
 def parse_reasoning_effort(value):
@@ -631,7 +620,6 @@ def _sanitize_config(data):
         max_agent_tool_calls=max_agent_tool_calls,
         agent_approval_mode=agent_approval_mode,
         agent_show_thinking=agent_show_thinking,
-        agent_summary_model=str(agent_config.get("summary_model") or "").strip(),
         agent_plan_enable=_parse_bool(
             agent_config.get("plan_mode"), DEFAULT_AGENT_PLAN_ENABLE
         ),
@@ -762,8 +750,6 @@ def save_config_fields(fields):
             config.agent_approval_mode = parse_agent_approval_mode(value)
         elif key == "agent_show_thinking":
             config.agent_show_thinking = parse_agent_show_thinking(value)
-        elif key == "agent_summary_model":
-            config.agent_summary_model = str(value or "").strip()
         elif key == "agent_plan_enable":
             config.agent_plan_enable = _parse_bool(value, config.agent_plan_enable)
         elif key == "agent_team_enable":

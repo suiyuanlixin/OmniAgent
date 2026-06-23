@@ -18,7 +18,6 @@ from ui import (
     print_stream_response_continue,
     print_stream_response_start,
     print_warn,
-    replace_thought_content,
     set_plan_panel,
     set_context_usage,
     start_thinking_timer,
@@ -29,8 +28,6 @@ from config import (
     API_TYPE_GLM,
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
-    AGENT_THINKING_FULL,
-    AGENT_THINKING_SUMMARY,
     DEFAULT_COMPACTION_TRIGGER_RATIO,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     DEFAULT_MAX_AGENT_ROUNDS,
@@ -38,7 +35,6 @@ from config import (
     GEMINI_OPENAI_BASE_URL,
     SUPPORTED_API_TYPES,
     normalize_api_type,
-    parse_agent_show_thinking,
     parse_reasoning_effort,
 )
 from memory import MemoryStore, parse_memory_update_response
@@ -66,7 +62,6 @@ from team import (
 
 AGENT_CONTEXT_WARN_CHARS = 180000
 AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
-AGENT_SUMMARY_MAX_TOKENS = 96
 NORMAL_WEB_SEARCH_MAX_ROUNDS = 3
 COMPACTION_MAX_TOKENS = 2048
 MEMORY_UPDATE_MAX_TOKENS = 4096
@@ -91,13 +86,6 @@ USER_PROMPT_TEMPLATE = """<!--
 -->
 """
 USER_PROMPT_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
-AGENT_SUMMARY_SYSTEM_PROMPT = (
-    "把 agent 的内部思考压成一句很短的终端状态。"
-    "优先中文，除非输入明显要求其他语言。"
-    "不要 markdown、代码、引号或前缀。只说正在做什么。"
-)
-
-
 NORMAL_SYSTEM_PROMPT = (
     "You are the built-in assistant for the OmniAgent project, a terminal LLM "
     "agent workbench. Help the user discuss, understand, configure, and improve "
@@ -229,7 +217,6 @@ class OmniAgent:
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
         agent_approval_mode="confirm",
         agent_show_thinking=True,
-        agent_summary_model="",
         skills_enabled=True,
         skills_source_app=True,
         skills_source_workspace=False,
@@ -291,8 +278,7 @@ class OmniAgent:
             skills_max_chars=skills_max_chars,
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
-        self.agent_show_thinking = parse_agent_show_thinking(agent_show_thinking)
-        self.agent_summary_model = str(agent_summary_model or "").strip()
+        self.agent_show_thinking = bool(agent_show_thinking)
         self.max_agent_rounds = max(1, int(max_agent_rounds))
         self.max_agent_tool_calls = max(1, int(max_agent_tool_calls))
         self.agent_running = False
@@ -304,12 +290,9 @@ class OmniAgent:
         self.agent_context_warning_sent = False
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
-        self.agent_summary_thinking_active = False
-        self.agent_summary_rendered_lines = 1
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
-        self._summary_replace_pending = False
         self.resume_existing_plan = False
         self.configure(
             api_type,
@@ -456,10 +439,7 @@ class OmniAgent:
         self.agent_tools.set_approval_mode(approval_mode)
 
     def set_agent_show_thinking(self, enabled):
-        self.agent_show_thinking = parse_agent_show_thinking(enabled)
-
-    def set_agent_summary_model(self, model):
-        self.agent_summary_model = str(model or "").strip()
+        self.agent_show_thinking = bool(enabled)
 
     def set_agent_plan_enabled(self, enabled):
         self.agent_tools.set_todos_enabled(enabled)
@@ -578,8 +558,7 @@ class OmniAgent:
             "max_rounds": self.max_agent_rounds,
             "max_tool_calls": self.max_agent_tool_calls,
             "approval_mode": self.agent_tools.approval_mode,
-            "show_thinking": self.agent_show_thinking,
-            "summary_model": self.agent_summary_model,
+            "show_thinking": bool(self.agent_show_thinking),
             "plan_enabled": self.agent_tools.todos_enabled,
             "skills": self.agent_tools.skills_status(),
             "plan": self.agent_tools.todo_status(),
@@ -733,8 +712,6 @@ class OmniAgent:
         self.agent_context_warning_sent = False
         self.agent_thinking_streamed = False
         self.agent_thinking_needs_separator = False
-        self.agent_summary_thinking_active = False
-        self.agent_summary_rendered_lines = 1
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
@@ -762,7 +739,7 @@ class OmniAgent:
             self.agent_running = False
 
     def _finalize_agent_response(self, response):
-        if response and self.agent_show_thinking != AGENT_THINKING_FULL:
+        if response and not self.agent_show_thinking:
             response = dict(response)
             response["thinking"] = ""
             response["thinking_streamed"] = self.agent_thinking_streamed
@@ -789,7 +766,6 @@ class OmniAgent:
     def _anthropic_agent_response(self):
         full_thinking = ""
         final_response = ""
-        summary_mode = self.agent_show_thinking == AGENT_THINKING_SUMMARY
 
         for round_index in range(1, self.max_agent_rounds + 1):
             if self._agent_should_stop():
@@ -810,8 +786,6 @@ class OmniAgent:
                 final_response = self._agent_response_with_plan_exit_note(
                     final_response
                 )
-                if summary_mode and full_thinking:
-                    self._launch_summary_replacement(full_thinking)
                 if response_streamed:
                     plan_note = self.agent_plan_check_exit_note
                     if plan_note:
@@ -864,7 +838,6 @@ class OmniAgent:
         return {"thinking": full_thinking, "response": final_response or message}
 
     def _stream_chat_completion_agent_turn(self):
-        summary_mode = self.agent_show_thinking == AGENT_THINKING_SUMMARY
         kwargs = self._chat_completion_kwargs(
             messages=self._chat_agent_messages(),
             tools=self._chat_tool_schemas(),
@@ -908,9 +881,7 @@ class OmniAgent:
             )
             if reasoning:
                 field_thinking = field_thinking_candidate
-                if summary_mode:
-                    self._stream_raw_thinking(reasoning)
-                elif self.agent_show_thinking == AGENT_THINKING_FULL:
+                if self.agent_show_thinking:
                     self._stream_agent_thinking(reasoning)
 
             content, full_response, raw_response = self._stream_content_delta(
@@ -926,11 +897,9 @@ class OmniAgent:
                 tagged_reasoning
                 and not response_streamed
                 and self.thinking_mode
+                and self.agent_show_thinking
             ):
-                if summary_mode:
-                    self._stream_raw_thinking(tagged_reasoning)
-                elif self.agent_show_thinking == AGENT_THINKING_FULL:
-                    self._stream_agent_thinking(tagged_reasoning)
+                self._stream_agent_thinking(tagged_reasoning)
             if content:
                 if not response_streamed:
                     self._separate_after_agent_thinking()
@@ -976,7 +945,6 @@ class OmniAgent:
     def _chat_completion_agent_response(self):
         full_thinking = ""
         final_response = ""
-        summary_mode = self.agent_show_thinking == AGENT_THINKING_SUMMARY
 
         for round_index in range(1, self.max_agent_rounds + 1):
             if self._agent_should_stop():
@@ -1001,8 +969,6 @@ class OmniAgent:
                 final_response = self._agent_response_with_plan_exit_note(
                     final_response
                 )
-                if summary_mode and full_thinking:
-                    self._launch_summary_replacement(full_thinking)
                 if response_streamed:
                     plan_note = self.agent_plan_check_exit_note
                     if plan_note:
@@ -2178,7 +2144,6 @@ class OmniAgent:
         tool_call_parts = {}
         usage_input_tokens = None
         response_streamed = False
-        summary_mode = self.agent_show_thinking == AGENT_THINKING_SUMMARY
 
         for chunk in response:
             chunk_input_tokens = _response_input_tokens(chunk)
@@ -2189,10 +2154,8 @@ class OmniAgent:
             thinking = self._get_field(message, "thinking", "") or ""
             if thinking:
                 field_thinking += thinking
-                if self.agent_show_thinking == AGENT_THINKING_FULL:
+                if self.agent_show_thinking:
                     self._stream_agent_thinking(thinking)
-                elif summary_mode:
-                    self._stream_raw_thinking(thinking)
 
             content = self._get_field(message, "content", "") or ""
             if content:
@@ -2230,7 +2193,6 @@ class OmniAgent:
     def _ollama_agent_response(self):
         full_thinking = ""
         final_response = ""
-        summary_mode = self.agent_show_thinking == AGENT_THINKING_SUMMARY
 
         for round_index in range(1, self.max_agent_rounds + 1):
             if self._agent_should_stop():
@@ -2255,8 +2217,6 @@ class OmniAgent:
                 final_response = self._agent_response_with_plan_exit_note(
                     final_response
                 )
-                if summary_mode and full_thinking:
-                    self._launch_summary_replacement(full_thinking)
                 if response_streamed:
                     plan_note = self.agent_plan_check_exit_note
                     if plan_note:
@@ -2274,6 +2234,7 @@ class OmniAgent:
                             _error_text(message),
                         )
                     )
+
                 self._separate_after_agent_thinking()
                 print_error(message)
                 return {
@@ -2301,7 +2262,6 @@ class OmniAgent:
         blocks = []
         active_block_index = None
         response_streamed = False
-        summary_mode = self.agent_show_thinking == AGENT_THINKING_SUMMARY
 
         response = self.client.messages.create(
             model=self.model,
@@ -2337,10 +2297,8 @@ class OmniAgent:
                             "type": "thinking",
                             "thinking": initial_reasoning,
                         })
-                        if summary_mode:
-                            self._stream_raw_thinking(initial_reasoning)
-                        else:
-                            self._show_agent_thinking(initial_reasoning)
+                        if self.agent_show_thinking:
+                            self._stream_agent_thinking(initial_reasoning)
                     block = {"type": "text", "text": ""}
                 elif (
                     self._is_anthropic_reasoning_block_type(block_type)
@@ -2384,9 +2342,7 @@ class OmniAgent:
                 elif self._is_anthropic_reasoning_delta_type(delta_type):
                     thinking_delta = self._anthropic_delta_reasoning_text(delta)
                     block["thinking"] = block.get("thinking", "") + thinking_delta
-                    if summary_mode:
-                        self._stream_raw_thinking(thinking_delta)
-                    else:
+                    if self.agent_show_thinking:
                         self._stream_agent_thinking(thinking_delta)
                 elif delta_type == "signature_delta":
                     block["signature"] = block.get("signature", "") + (
@@ -2448,7 +2404,7 @@ class OmniAgent:
     def _stream_agent_thinking(self, content):
         if (
             not self.thinking_mode
-            or self.agent_show_thinking != AGENT_THINKING_FULL
+            or not self.agent_show_thinking
             or not content
         ):
             return
@@ -2457,297 +2413,12 @@ class OmniAgent:
             self.agent_output_needs_separator = False
             self.agent_thinking_streamed = False
             self.agent_thinking_needs_separator = False
-            self.agent_summary_thinking_active = False
-            self.agent_summary_rendered_lines = 1
             leading_newline = False
         if not self.agent_thinking_streamed:
             print_stream_thinking("", leading_newline=leading_newline)
             self.agent_thinking_streamed = True
         print_stream_thinking_continue(content)
         self.agent_thinking_needs_separator = True
-        self.agent_summary_thinking_active = False
-
-    def _stream_raw_thinking(self, content):
-        if not self.thinking_mode or not content:
-            return
-        if self.agent_output_needs_separator:
-            self.agent_output_needs_separator = False
-            self.agent_thinking_streamed = False
-            self.agent_thinking_needs_separator = False
-            self.agent_summary_thinking_active = False
-            self.agent_summary_rendered_lines = 1
-        if not self.agent_thinking_streamed:
-            print_stream_thinking("")
-            self.agent_thinking_streamed = True
-        print_stream_thinking_continue(content)
-        self.agent_thinking_needs_separator = True
-        self.agent_summary_thinking_active = False
-
-    def _launch_summary_replacement(self, field_thinking):
-        if not field_thinking:
-            return
-        self._summary_replace_pending = True
-
-        def run():
-            summary = self._fetch_agent_thinking_summary(field_thinking)
-            if not summary:
-                summary = _summarize_agent_thinking(field_thinking)
-            if summary:
-                replace_thought_content(f"Summary: {summary}")
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _fetch_agent_thinking_summary(self, content):
-        if not self.agent_summary_model:
-            return ""
-        prompt = _summary_model_prompt(content)
-        if not prompt:
-            return ""
-        try:
-            if self.api_type == API_TYPE_OLLAMA:
-                response = self.client.chat(
-                    **self._ollama_chat_kwargs(
-                        model=self.agent_summary_model,
-                        messages=[
-                            {"role": "system", "content": AGENT_SUMMARY_SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=min(float(self.temperature), 0.3),
-                        max_tokens=AGENT_SUMMARY_MAX_TOKENS,
-                        stream=False,
-                        include_reasoning=False,
-                    )
-                )
-                return _clean_content_text(
-                    self._get_field(
-                        self._get_field(response, "message", {}),
-                        "content",
-                        "",
-                    ) or ""
-                ).strip()
-            if self.api_type == API_TYPE_ANTHROPIC:
-                response = self.client.messages.create(
-                    model=self.agent_summary_model,
-                    max_tokens=AGENT_SUMMARY_MAX_TOKENS,
-                    temperature=min(float(self.temperature), 0.3),
-                    system=AGENT_SUMMARY_SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return _clean_content_text(
-                    self._get_field(
-                        self._get_field(response, "content", [{}]),
-                        0,
-                        {},
-                    ).get("text", "") or ""
-                ).strip()
-            kwargs = self._chat_completion_kwargs(
-                model=self.agent_summary_model,
-                messages=[
-                    {"role": "system", "content": AGENT_SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=min(float(self.temperature), 0.3),
-                max_tokens=AGENT_SUMMARY_MAX_TOKENS,
-            )
-            response = self.client.chat.completions.create(**kwargs)
-            return _clean_content_text(
-                self._get_field(
-                    self._get_field(response, "choices", [{}]),
-                    0,
-                    {},
-                ).get("message", {}).get("content", "") or ""
-            ).strip()
-        except Exception:
-            return ""
-
-    def _show_agent_thinking(self, content):
-        if self.agent_show_thinking == AGENT_THINKING_FULL:
-            self._stream_agent_thinking(content)
-        elif self.agent_show_thinking == AGENT_THINKING_SUMMARY:
-            self._show_agent_thinking_summary(content)
-
-    def _show_agent_thinking_summary(self, content):
-        if (
-            not self.thinking_mode
-            or self.agent_show_thinking != AGENT_THINKING_SUMMARY
-            or not content
-        ):
-            return
-
-        replace_current_line = False
-        leading_newline = True
-        if self.agent_output_needs_separator:
-            self.agent_output_needs_separator = False
-            self.agent_thinking_streamed = False
-            self.agent_thinking_needs_separator = False
-            self.agent_summary_thinking_active = False
-            self.agent_summary_rendered_lines = 1
-            leading_newline = False
-        elif self.agent_thinking_needs_separator:
-            self.agent_thinking_needs_separator = False
-            self.agent_summary_thinking_active = False
-            self.agent_summary_rendered_lines = 1
-
-        summary = self._stream_agent_thinking_summary_with_model(
-            content,
-            leading_newline=leading_newline,
-            replace_current_line=replace_current_line,
-        )
-        if not summary:
-            summary = _summarize_agent_thinking(content)
-            if not summary:
-                return
-            self._print_agent_thinking_summary(
-                summary,
-                leading_newline=leading_newline,
-                replace_current_line=replace_current_line,
-            )
-
-        self.agent_thinking_streamed = True
-        self.agent_thinking_needs_separator = True
-        self.agent_summary_thinking_active = True
-
-    def _print_agent_thinking_summary(
-        self, summary, leading_newline=True, replace_current_line=False
-    ):
-        summary = _clean_summary_stream_delta(summary).strip()
-        if not summary:
-            return
-        self._start_agent_thinking_summary_line(leading_newline, replace_current_line)
-        for character in summary:
-            print_stream_thinking_continue(character)
-        self.agent_summary_rendered_lines = 1
-
-    def _start_agent_thinking_summary_line(
-        self, leading_newline=True, replace_current_line=False
-    ):
-        if replace_current_line:
-            clear_current_lines(self.agent_summary_rendered_lines)
-            print_stream_thinking("", leading_newline=False)
-        else:
-            print_stream_thinking("", leading_newline=leading_newline)
-        print_stream_thinking_continue("Summary: ")
-
-    def _agent_summary_rendered_line_count(self, summary):
-        return 1
-
-    def _stream_agent_thinking_summary_with_model(
-        self,
-        content,
-        leading_newline=True,
-        replace_current_line=False,
-    ):
-        if not self.agent_summary_model:
-            return ""
-
-        prompt = _summary_model_prompt(content)
-        if not prompt:
-            return ""
-
-        summary_text = ""
-        raw_summary_text = ""
-        started = False
-
-        def emit(delta):
-            nonlocal started, summary_text
-            delta = _clean_summary_stream_delta(delta)
-            if not summary_text:
-                delta = delta.lstrip()
-            if not delta:
-                return
-            if not started:
-                self._start_agent_thinking_summary_line(
-                    leading_newline, replace_current_line
-                )
-                started = True
-            summary_text += delta
-            print_stream_thinking_continue(delta)
-            self.agent_summary_rendered_lines = self._agent_summary_rendered_line_count(
-                summary_text
-            )
-
-        try:
-            if self.api_type == API_TYPE_ANTHROPIC:
-                response = self.client.messages.create(
-                    model=self.agent_summary_model,
-                    max_tokens=AGENT_SUMMARY_MAX_TOKENS,
-                    temperature=min(float(self.temperature), 0.3),
-                    system=AGENT_SUMMARY_SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=True,
-                )
-                for chunk in response:
-                    if self._get_field(chunk, "type", "") != "content_block_delta":
-                        continue
-                    delta = self._get_field(chunk, "delta")
-                    if self._get_field(delta, "type", "") == "text_delta":
-                        emit(self._get_field(delta, "text", "") or "")
-            elif self.api_type == API_TYPE_OLLAMA:
-                response = self.client.chat(
-                    **self._ollama_chat_kwargs(
-                        model=self.agent_summary_model,
-                        messages=[
-                            {"role": "system", "content": AGENT_SUMMARY_SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=min(float(self.temperature), 0.3),
-                        max_tokens=AGENT_SUMMARY_MAX_TOKENS,
-                        stream=True,
-                        include_reasoning=False,
-                    )
-                )
-                for chunk in response:
-                    message = self._get_field(chunk, "message", {})
-                    _, raw_summary_text = self._split_stream_delta(
-                        raw_summary_text,
-                        self._get_field(message, "content", "") or "",
-                    )
-                    clean_summary = _clean_summary_stream_delta(
-                        _clean_content_text(raw_summary_text)
-                    ).strip()
-                    visible_delta, summary_text_candidate = self._split_stream_delta(
-                        summary_text,
-                        clean_summary,
-                    )
-                    if visible_delta:
-                        emit(visible_delta)
-                        summary_text = summary_text_candidate
-            else:
-                kwargs = self._chat_completion_kwargs(
-                    model=self.agent_summary_model,
-                    messages=[
-                        {"role": "system", "content": AGENT_SUMMARY_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=min(float(self.temperature), 0.3),
-                    max_tokens=AGENT_SUMMARY_MAX_TOKENS,
-                    stream=True,
-                    include_reasoning=False,
-                )
-                if self._uses_minimax_openai_compat(self.agent_summary_model):
-                    kwargs["extra_body"] = {"reasoning_split": True}
-
-                response = self.client.chat.completions.create(**kwargs)
-                for chunk in response:
-                    delta = chunk.choices[0].delta
-                    _, raw_summary_text = self._split_stream_delta(
-                        raw_summary_text,
-                        self._get_field(delta, "content", "") or "",
-                    )
-                    clean_summary = _clean_summary_stream_delta(
-                        _clean_content_text(raw_summary_text)
-                    ).strip()
-                    visible_delta, summary_text_candidate = self._split_stream_delta(
-                        summary_text,
-                        clean_summary,
-                    )
-                    if visible_delta:
-                        emit(visible_delta)
-                        summary_text = summary_text_candidate
-        except Exception:
-            return summary_text.strip()
-
-        return summary_text.strip()
 
     def _stream_agent_response_text(self, content, pseudo=False):
         if not self.stream_mode or not content:
@@ -2772,8 +2443,6 @@ class OmniAgent:
         if not self.agent_thinking_needs_separator:
             return
         self.agent_thinking_needs_separator = False
-        self.agent_summary_thinking_active = False
-        self.agent_summary_rendered_lines = 1
 
     def _before_agent_visible_output(self):
         self._separate_after_agent_thinking()
@@ -3593,7 +3262,6 @@ class OmniAgent:
         tool_result = self.agent_tools.execute(name, tool_input)
         if self.agent_tools.consume_output_separator():
             self.agent_output_needs_separator = True
-            self.agent_summary_thinking_active = False
         if (
             self.agent_tools.session_change_count() > change_count_before
             or self.agent_tools.todo_revision() != todo_revision_before
@@ -5518,188 +5186,11 @@ def _clean_content_text(content):
     return text
 
 
-def _summarize_agent_thinking(content):
-    text = _strip_code_from_thinking(content)
-    if not text:
-        return "整理下一步。"
-
-    sentence = _pick_thinking_summary_sentence(text)
-    return _single_line_unlimited(sentence)
-
-
-def _summary_model_prompt(content):
-    text = _summary_model_source_text(content)
-    if not text:
-        return ""
-    return (
-        "把这段 agent 思考压成一句很短的终端状态，优先中文，越短越好。\n\n"
-        f"{_single_line(text, 4000)}"
-    )
-
-
-def _summary_model_source_text(content):
-    text = str(content or "")
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    text = text.replace("`", "")
-
-    kept_lines = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if _looks_like_code_line(stripped):
-            continue
-        stripped = _strip_list_marker(stripped)
-        if stripped:
-            kept_lines.append(stripped)
-    return "\n".join(kept_lines)
-
-
-def _clean_summary_stream_delta(delta):
-    text = str(delta or "")
-    text = text.replace("\r", " ").replace("\n", " ")
-    text = text.replace("`", "")
-    return text
-
-
-def _strip_code_from_thinking(content):
-    text = str(content or "")
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    text = re.sub(r"`[^`]*`", " ", text)
-
-    kept_lines = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if _looks_like_code_line(stripped):
-            continue
-        stripped = _strip_list_marker(stripped)
-        if stripped:
-            kept_lines.append(stripped)
-    return "\n".join(kept_lines)
-
-
-def _looks_like_code_line(line):
-    code_prefixes = (
-        "{",
-        "}",
-        "[",
-        "]",
-        "(",
-        ")",
-        "<",
-        ">",
-        "+",
-        "-",
-        "*",
-        "#",
-        "//",
-        "/*",
-        "*/",
-        "def ",
-        "class ",
-        "import ",
-        "from ",
-        "return ",
-        "if ",
-        "elif ",
-        "else:",
-        "for ",
-        "while ",
-        "try:",
-        "except ",
-        "with ",
-        "async ",
-        "await ",
-        "const ",
-        "let ",
-        "var ",
-        "function ",
-    )
-    if line.startswith(code_prefixes):
-        return True
-
-    code_marks = sum(
-        line.count(mark)
-        for mark in ("=", "{", "}", "(", ")", "[", "]", ";", "=>", "::", "</", "/>")
-    )
-    if code_marks >= 5:
-        return True
-
-    if len(line) > 160 and code_marks >= 3:
-        return True
-    return False
-
-
-def _pick_thinking_summary_sentence(text):
-    sentences = _summary_sentence_candidates(text)
-    if not sentences:
-        return text
-
-    intent_pattern = re.compile(
-        r"("
-        r"need|plan|check|inspect|read|search|find|edit|update|modify|implement|"
-        r"verify|test|compare|decide|ensure|confirm|analy[sz]e|定位|检查|读取|"
-        r"搜索|查找|修改|更新|实现|验证|测试|确认|分析|计划|整理"
-        r")",
-        re.IGNORECASE,
-    )
-    for sentence in sentences:
-        if intent_pattern.search(sentence):
-            return _finish_summary_sentence(sentence)
-    return _finish_summary_sentence(sentences[0])
-
-
-def _summary_sentence_candidates(text):
-    raw_sentences = re.split(r"(?<=[!?。！？])\s*|(?<=\.)\s+|\n+", text)
-    sentences = []
-    for raw_sentence in raw_sentences:
-        sentence = _clean_summary_sentence(raw_sentence)
-        if sentence:
-            sentences.append(sentence)
-    return sentences
-
-
-def _clean_summary_sentence(sentence):
-    sentence = _strip_list_marker(str(sentence or ""))
-    sentence = re.sub(
-        r"[:：]\s*(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?\s*$", "", sentence
-    )
-    sentence = sentence.strip(" \t\r\n-:;：")
-    if not sentence or re.fullmatch(
-        r"(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]?", sentence
-    ):
-        return ""
-    return sentence
-
-
-def _strip_list_marker(text):
-    return re.sub(
-        r"^\s*(?:\d+|[A-Za-z]|[一二三四五六七八九十]+)[.)、]\s*",
-        "",
-        str(text or "").strip(),
-    )
-
-
-def _finish_summary_sentence(sentence):
-    sentence = str(sentence or "").strip()
-    if not sentence or sentence[-1] in ".!?。！？":
-        return sentence
-    if re.search(r"[\u4e00-\u9fff]", sentence):
-        return sentence + "。"
-    return sentence + "."
-
-
 def _single_line(text, max_chars):
     text = " ".join(str(text or "").split())
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3] + "..."
-
-
-def _single_line_unlimited(text):
-    return " ".join(str(text or "").split())
 
 
 def _error_text(message):

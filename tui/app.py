@@ -317,7 +317,6 @@ class AgentTUIApp(App):
         self._message_started_at: float | None = None
         self._thinking_started_at: float | None = None
         self._thinking_elapsed_timer = None
-        self._summary_replace_pending = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="left-edge", classes="sidebar-hidden"):
@@ -391,7 +390,6 @@ class AgentTUIApp(App):
         self.chat_busy = True
         self._message_started_at = perf_counter()
         self._thinking_started_at = None
-        self._summary_replace_pending = False
         new_session = self.current_session_record is not None and (
             not self.current_session_record.get("conversation")
         )
@@ -624,18 +622,9 @@ class AgentTUIApp(App):
         self._call_ui(
             self._finish_thought_stream_widget,
             self._elapsed_since_thinking(),
-            self._summary_replace_pending,
         )
         self._thinking_started_at = None
-        if self._summary_replace_pending:
-            return
         self._call_ui(self._start_stream_widget, "assistant", "")
-
-    def replace_thought_content(self, content: str) -> None:
-        self._call_ui(
-            self._replace_thought_stream_widget, str(content or ""), self._elapsed_since_thinking()
-        )
-        self._summary_replace_pending = False
 
     def append_stream_response(self, content) -> None:
         self._call_ui(self._append_stream_widget, "assistant", str(content or ""), "")
@@ -726,9 +715,9 @@ class AgentTUIApp(App):
         self.query_one("#messages-view", ChatView).append_thought_stream(content)
         self._stream_kind = "thought"
 
-    def _finish_thought_stream_widget(self, elapsed_seconds: float, keep_target: bool = False) -> None:
+    def _finish_thought_stream_widget(self, elapsed_seconds: float) -> None:
         self.query_one("#messages-view", ChatView).finish_thought_stream(
-            elapsed_seconds=elapsed_seconds, keep_target=keep_target
+            elapsed_seconds=elapsed_seconds
         )
         if self._stream_kind == "thought":
             self._stream_kind = None
@@ -962,9 +951,10 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Agent show thinking",
-                "value": self.config.agent_show_thinking,
+                "value": "on" if self.config.agent_show_thinking else "off",
                 "keywords": "show_thinking agent thinking",
-                "edit_type": "none",
+                "edit_type": "toggle",
+                "on_change": lambda v: self._on_setting_agent_show_thinking_changed(v),
             },
             {
                 "name": "Agent max rounds",
@@ -1133,6 +1123,14 @@ class AgentTUIApp(App):
             self.chat.set_agent_approval_mode(value)
         self._apply_config_to_controls()
 
+    def _on_setting_agent_show_thinking_changed(self, value: str) -> None:
+        enabled = str(value or "").lower() in ("on", "true", "yes")
+        save_config_field("agent_show_thinking", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_agent_show_thinking(enabled)
+        self._apply_config_to_controls()
+
     def _on_setting_rounds_changed(self, value: str) -> None:
         try:
             rounds = max(1, int(value))
@@ -1292,8 +1290,7 @@ class AgentTUIApp(App):
             max_agent_rounds=self.config.max_agent_rounds,
             max_agent_tool_calls=self.config.max_agent_tool_calls,
             agent_approval_mode=self.config.agent_approval_mode,
-            agent_show_thinking=self.config.agent_show_thinking,
-            agent_summary_model=self.config.agent_summary_model,
+            agent_show_thinking=bool(self.config.agent_show_thinking),
             skills_enabled=self.config.skills_enable,
             skills_source_app=self.config.skills_source_app,
             skills_source_workspace=self.config.skills_source_workspace,
@@ -1393,7 +1390,6 @@ class AgentTUIApp(App):
         self._pause_thinking_elapsed_timer()
         self._finish_thought_stream_widget(
             self._elapsed_since_thinking(),
-            keep_target=self._summary_replace_pending,
         )
         self.chat_busy = False
         self._set_input_enabled(True)
@@ -1402,13 +1398,11 @@ class AgentTUIApp(App):
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
-        self._summary_replace_pending = False
 
     def _finish_with_error(self, error: Exception) -> None:
         self._pause_thinking_elapsed_timer()
         self._finish_thought_stream_widget(
             self._elapsed_since_thinking(),
-            keep_target=self._summary_replace_pending,
         )
         self.chat_busy = False
         self._set_input_enabled(True)
@@ -1417,7 +1411,6 @@ class AgentTUIApp(App):
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
-        self._summary_replace_pending = False
 
     def _display_response(self, response) -> None:
         if not response:

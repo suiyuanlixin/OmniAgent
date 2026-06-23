@@ -279,13 +279,12 @@ class ChatView(Widget):
             self._thought_stream_target.set_content(self._thought_stream_content)
             self.call_after_refresh(self._scroll_end)
 
-    def finish_thought_stream(self, elapsed_seconds: float = 0.0, keep_target: bool = False) -> None:
+    def finish_thought_stream(self, elapsed_seconds: float = 0.0) -> None:
         if self._thought_stream_target is None:
             return
         self._thought_stream_target.set_elapsed_seconds(elapsed_seconds)
-        if not keep_target:
-            self._thought_stream_target = None
-            self._thought_stream_content = ""
+        self._thought_stream_target = None
+        self._thought_stream_content = ""
 
     def update_thought_stream_elapsed(self, elapsed_seconds: float) -> None:
         if self._thought_stream_target is None:
@@ -417,8 +416,10 @@ class ThoughtBlock(Vertical):
             self.expanded = not self.expanded
             self._refresh()
 
-    def set_content(self, content: str) -> None:
-        self.thought_content = str(content or "")
+    def set_content(self, content) -> None:
+        if content is None:
+            content = ""
+        self.thought_content = content
         self._refresh()
 
     def set_elapsed_seconds(self, elapsed_seconds: float) -> None:

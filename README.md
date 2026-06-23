@@ -78,8 +78,7 @@ pip install -r requirements.txt
     "max_rounds": 12,
     "max_tool_calls": 40,
     "approve": "confirm",
-    "show_thinking": "summary",
-    "summary_model": "",
+    "show_thinking": true,
     "plan_mode": true
   },
   "skills": {
@@ -172,8 +171,7 @@ MiniMax-M3 推荐使用 OpenAI 兼容配置。程序会在调用 MiniMax OpenAI 
 | `agent_mode.max_rounds` | 每次用户请求中，agent 最多执行多少轮工具循环。 |
 | `agent_mode.max_tool_calls` | 每次用户请求中，agent 最多调用多少次工具。 |
 | `agent_mode.approve` | Agent 写操作审批模式，只支持 `confirm` 或 `auto`。 |
-| `agent_mode.show_thinking` | Agent thinking 显示方式，支持 `summary`、`full`、`off`。`true` 等同于 `summary`，`false` 等同于 `off`。它不改变模型 thinking 是否开启。 |
-| `agent_mode.summary_model` | Agent thinking 概括模型。留空时使用本地规则生成一句话；填写轻量模型名时，会复用当前 API 配置发起单独的流式请求来生成一句话概括。 |
+| `agent_mode.show_thinking` | 是否显示 Agent 的 thinking 过程。布尔值，`true` 显示完整 thinking，`false` 隐藏。它只影响显示，不改变模型 reasoning/thinking 是否开启。 |
 | `agent_mode.plan_mode` | 是否启用 Agent plan 系统。默认 `true`；关闭后不注入 `update_plan`，也不会强制计划审批或显示 Plan 面板。 |
 | `skills.enable` | Agent skills 总开关。关闭后不会注入 `list_skills` 和 `read_skill`。 |
 | `skills.sources.app` | 是否加载程序目录 `skills/`，适合放所有项目通用的本机 skills。 |
@@ -313,9 +311,8 @@ Agent 模式类似 Claude Code 的本地工具调用流程：模型可以请求�
 设置 agent thinking 显示：
 
 ```text
-/agent show-thinking summary
-/agent show-thinking full
-/agent show-thinking off
+/agent show-thinking true
+/agent show-thinking false
 /agent plan on
 /agent plan off
 ```
@@ -457,7 +454,7 @@ Skills 只提供工作流指导，不会执行 skill 里的脚本，也不能覆
 | `/agent stop` | 请求停止当前正在运行的 agent 任务。 |
 | `/agent budget <rounds> <tool-calls>` | 设置每次请求的 agent 工具循环轮数和工具调用次数上限。 |
 | `/agent approve confirm` / `/agent approve auto` | 设置 Agent 写操作审批模式。 |
-| `/agent show-thinking summary` / `/agent show-thinking full` / `/agent show-thinking off` | 只控制 agent thinking 的显示，不改变模型 thinking 是否开启。`summary` 只显示一句话概括。 |
+| `/agent show-thinking true` / `/agent show-thinking false` | 控制 agent thinking 是否在 UI 中显示，不改变模型 thinking 是否开启。 |
 | `/agent plan on` / `/agent plan off` | 开启或关闭 Agent plan 系统。关闭后不注入 `update_plan`，也不会强制计划审批。 |
 | `/skills` | 查看 agent skills 状态、来源和读取限制。 |
 | `/skills on` / `/skills off` / `/skills reload` | 开启、关闭或重新加载 agent skills。 |
@@ -480,7 +477,7 @@ Anthropic Agent 模式使用 streaming API 读取工具调用事件和 thinking 
 
 Agent 运行时会隐藏 round 编号、工具调用编号、工具结果摘要和 final check 摘要等中间噪音，只保留必要的确认、警告、错误和最终回复。Thinking、确认框和最终回复之间会自动保持一行间距。
 
-Agent 模式在 `show_thinking=summary` 时只显示一句话概括，避免完整 thinking 中的大段代码影响阅读。配置 `agent_mode.summary_model` 后，会使用轻量模型单独发起流式请求生成概括；未配置时使用本地规则伪流式显示。开启流式模式时，Agent 最终回复会以伪流式方式显示。
+Agent 模式在 `show_thinking=true` 时会显示完整的 thinking/reasoning 过程，`show_thinking=false` 时只保留最终回复和必要的确认、错误信息。该选项只影响显示，不改变模型是否进行 reasoning/thinking。开启流式模式时，Agent 最终回复会以流式方式显示。
 
 ## 上下文压缩
 

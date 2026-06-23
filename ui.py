@@ -116,16 +116,16 @@ def print_stream_thinking(content, leading_newline=True):
             bridge.append_stream_thinking(content)
 
 
+def append_stream_thinking(content):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.append_stream_thinking(content)
+
+
 def start_thinking_timer():
     bridge = get_bridge()
     if bridge is not None:
         bridge.start_thinking_timer()
-
-
-def replace_thought_content(content):
-    bridge = get_bridge()
-    if bridge is not None:
-        bridge.replace_thought_content(content)
 
 
 def print_stream_thinking_continue(content):

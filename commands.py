@@ -11,7 +11,6 @@ from ui import (
 from config import (
     parse_agent_approval_mode,
     parse_agent_rounds,
-    parse_agent_show_thinking,
     parse_agent_tool_calls,
     parse_max_tokens,
     parse_skill_max_chars,
@@ -49,7 +48,7 @@ COMMANDS = {
     "/memory": "Inspect or search persistent memory (Example: /memory today, /memory search <query>).",
     "/search": "Toggle, inspect or configure web search (Example: /search on).",
     "/skills": "Toggle, inspect or configure agent skills (Example: /skills workspace on).",
-    "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking summary).",
+    "/agent": "Toggle, inspect or configure local file-editing agent mode (Example: /agent show-thinking true).",
     "/team": "Toggle, inspect or configure agent team mode (Example: /team on, /team list, /team shutdown <name>).",
 }
 
@@ -129,7 +128,6 @@ def _apply_config(chat, config):
         chat.set_agent_limits(config.max_agent_rounds, config.max_agent_tool_calls)
         chat.set_agent_approval_mode(config.agent_approval_mode)
         chat.set_agent_show_thinking(config.agent_show_thinking)
-        chat.set_agent_summary_model(config.agent_summary_model)
         chat.set_agent_plan_enabled(config.agent_plan_enable)
         chat.set_skills_config(
             config.skills_enable,
@@ -1148,8 +1146,7 @@ def handle_agent(chat, args):
             f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
         )
         approval = status.get("approval_mode", "confirm")
-        show_thinking = status.get("show_thinking", "summary")
-        summary_model = status.get("summary_model") or "local"
+        show_thinking = "on" if status.get("show_thinking", True) else "off"
         plan = "on" if status.get("plan_enabled", True) else "off"
         skills = status.get("skills") or {}
         skills_state = "on" if skills.get("enabled") else "off"
@@ -1159,13 +1156,12 @@ def handle_agent(chat, args):
             f"Budget: {budget}.\n"
             f"Approval: {approval}.\n"
             f"Show thinking: {show_thinking}.\n"
-            f"Summary model: {summary_model}.\n"
             f"Plan: {plan}.\n"
             f"Skills: {skills_state} ({skills.get('count', 0)} loaded; "
             f"app={'on' if skill_sources.get('app') else 'off'}, "
             f"workspace={'on' if skill_sources.get('workspace') else 'off'}).\n"
             f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
-            f"/agent approve confirm|approve|full | /agent show-thinking summary|full|off | "
+            f"/agent approve confirm|approve|full | /agent show-thinking true|false | "
             f"/agent plan on|off | /skills"
         )
         return True
@@ -1236,24 +1232,19 @@ def handle_agent(chat, args):
         print_success(f"Agent approval mode set to {approval_mode}.")
     elif mode in {"show-thinking", "show_thinking", "thinking"}:
         if len(parts) == 1:
-            current = status.get("show_thinking", "summary")
+            current = "on" if status.get("show_thinking", True) else "off"
             print_info(
                 f"Current agent thinking display: {current}. "
-                "Usage: /agent show-thinking summary|full|off"
+                "Usage: /agent show-thinking true|false"
             )
             return True
-        if len(parts) != 2:
-            print_error("Usage: /agent show-thinking summary|full|off")
+        if len(parts) != 2 or parts[1].lower() not in {"true", "false"}:
+            print_error("Usage: /agent show-thinking true|false")
             return True
-        try:
-            show_thinking = parse_agent_show_thinking(parts[1])
-        except ValueError as error:
-            print_error(str(error))
-            return True
-
-        chat.set_agent_show_thinking(show_thinking)
-        save_config_field("agent_show_thinking", show_thinking)
-        print_success(f"Agent thinking display set to {show_thinking}.")
+        enabled = parts[1].lower() == "true"
+        chat.set_agent_show_thinking(enabled)
+        save_config_field("agent_show_thinking", enabled)
+        print_success(f"Agent thinking display turned {'on' if enabled else 'off'}.")
     elif mode == "plan":
         if len(parts) == 1:
             current = "on" if status.get("plan_enabled", True) else "off"
@@ -1272,7 +1263,7 @@ def handle_agent(chat, args):
         print_error(
             f"Invalid option: {args}. Use /agent on, /agent off, /agent stop or "
             f"/agent budget <rounds> <tool-calls>, /agent approve confirm|approve|full, "
-            f"/agent show-thinking summary|full|off, /agent plan on|off, or /agent skills ..."
+            f"/agent show-thinking true|false, /agent plan on|off, or /agent skills ..."
         )
         return True
 
