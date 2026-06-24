@@ -888,6 +888,7 @@ class AgentTUIApp(App):
             ("Approve for me", "approve"),
             ("Full access", "full"),
         ]
+        bool_choices = [("true", "true"), ("false", "false")]
 
         return [
             {
@@ -914,9 +915,10 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Stream mode",
-                "value": "on" if active_model.stream_mode else "off",
+                "value": "true" if active_model.stream_mode else "false",
                 "keywords": "stream mode",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_stream_changed(v),
             },
             {
@@ -929,16 +931,18 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Agent default",
-                "value": "on" if self.config.agent_mode else "off",
+                "value": "true" if self.config.agent_mode else "false",
                 "keywords": "agent mode",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_agent_toggle(v),
             },
             {
                 "name": "Plan mode",
-                "value": "on" if self.config.agent_plan_enable else "off",
+                "value": "true" if self.config.agent_plan_enable else "false",
                 "keywords": "plan agent plan_mode",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_plan_changed(v),
             },
             {
@@ -951,9 +955,10 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Agent show thinking",
-                "value": "on" if self.config.agent_show_thinking else "off",
+                "value": "true" if self.config.agent_show_thinking else "false",
                 "keywords": "show_thinking agent thinking",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_agent_show_thinking_changed(v),
             },
             {
@@ -972,9 +977,10 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Skills",
-                "value": "on" if self.config.skills_enable else "off",
+                "value": "true" if self.config.skills_enable else "false",
                 "keywords": "skills",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_skills_changed(v),
             },
             {
@@ -986,9 +992,10 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Web search",
-                "value": "on" if self.config.web_search_enable else "off",
+                "value": "true" if self.config.web_search_enable else "false",
                 "keywords": "web_search search",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_search_changed(v),
             },
             {
@@ -1000,16 +1007,18 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Debug",
-                "value": "on" if self.config.debug else "off",
+                "value": "true" if self.config.debug else "false",
                 "keywords": "debug diagnostics",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_debug_changed(v),
             },
             {
                 "name": "Auto compact",
-                "value": "on" if self.config.compaction_enable else "off",
+                "value": "true" if self.config.compaction_enable else "false",
                 "keywords": "compact compaction auto",
                 "edit_type": "toggle",
+                "options": bool_choices,
                 "on_change": lambda v: self._on_setting_compact_changed(v),
             },
             {

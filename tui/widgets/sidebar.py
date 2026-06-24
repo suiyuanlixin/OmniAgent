@@ -451,11 +451,21 @@ class Sidebar(Vertical):
             )
             project_item.data_group_id = group_id
             projects_list.mount(project_item)
+            group_classes = "sidebar-list project-chat-list"
+            if sessions:
+                group_classes += " hidden"
             session_group = Vertical(
                 id=group_id,
-                classes="sidebar-list project-chat-list hidden",
+                classes=group_classes,
             )
             projects_list.mount(session_group)
+            if not sessions:
+                no_chats = Static(
+                    "No Chats",
+                    id=f"project-empty-{serial}-{index}",
+                    classes="sidebar-item sidebar-chat-item sidebar-empty-item",
+                )
+                session_group.mount(no_chats)
             for session_index, session in enumerate(sessions):
                 self._mount_session_item(
                     session_group,
