@@ -153,9 +153,7 @@ def _apply_config(chat, config):
             config.web_search_topic,
         )
 
-        chat.set_agent_mode(
-            config.agent_mode and bool(chat.get_agent_status().get("workspace_dir"))
-        )
+        chat.set_agent_mode(bool(chat.get_agent_status().get("workspace_dir")))
     except Exception as error:
         print_error(f"Failed to apply configuration: {error}")
         return False
@@ -1140,8 +1138,8 @@ def handle_agent(chat, args):
     status = chat.get_agent_status()
 
     if args is None:
-        current = "on" if status["enabled"] else "off"
         running = "running" if status.get("running") else "idle"
+        current = "on" if status["enabled"] else "off"
         budget = (
             f"{status.get('max_rounds')} rounds / {status.get('max_tool_calls')} tools"
         )
@@ -1160,7 +1158,7 @@ def handle_agent(chat, args):
             f"Skills: {skills_state} ({skills.get('count', 0)} loaded; "
             f"app={'on' if skill_sources.get('app') else 'off'}, "
             f"workspace={'on' if skill_sources.get('workspace') else 'off'}).\n"
-            f"Usage: /agent on | /agent off | /agent stop | /agent budget <rounds> <tool-calls> | "
+            f"Usage: /agent stop | /agent budget <rounds> <tool-calls> | "
             f"/agent approve confirm|approve|full | /agent show-thinking true|false | "
             f"/agent plan on|off | /skills"
         )
@@ -1168,19 +1166,12 @@ def handle_agent(chat, args):
 
     parts = args.split()
     mode = parts[0].lower().strip() if parts else ""
-    if mode == "on" and len(parts) == 1:
-        if not status["workspace_dir"]:
-            chat.set_agent_mode(False)
-            print_error("Agent mode requires selecting a project in the TUI first.")
-            return True
-        chat.set_agent_mode(True)
-        save_config_field("agent_mode", True)
-        print_success("Agent mode turned on.")
-    elif mode == "off" and len(parts) == 1:
-        chat.set_agent_mode(False)
-        save_config_field("agent_mode", False)
-        print_success("Agent mode turned off.")
-    elif mode == "stop" and len(parts) == 1:
+    if mode in {"on", "off"} and len(parts) == 1:
+        print_error(
+            "Agent mode is determined automatically by whether a project is selected in the TUI."
+        )
+        return True
+    if mode == "stop" and len(parts) == 1:
         if chat.request_agent_stop():
             print_warn("Agent stop requested.")
         else:
@@ -1325,7 +1316,7 @@ def handle_team(chat, args):
         name = parts[1]
         try:
             removed = chat.team_store.remove_teammate(name)
-        except Exception as e:
+        except Exception:
             removed = False
         if removed:
             print_success(f"Teammate '{name}' shutdown.")

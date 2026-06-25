@@ -3,7 +3,7 @@ import threading
 
 from rich.console import Console
 
-from tui.runtime import get_bridge, render_console_text
+from tui.runtime import get_bridge
 
 
 VERSION = "3.0.0"

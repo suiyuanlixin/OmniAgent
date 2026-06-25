@@ -3,7 +3,6 @@ import mimetypes
 import re
 from pathlib import Path
 
-from ui import clean_display_text
 from tools import MAX_READ_CHARS
 
 

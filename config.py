@@ -78,7 +78,6 @@ MODEL_FIELD_KEYS = {
 }
 GLOBAL_FIELD_KEYS = {
     "current_model",
-    "agent_mode",
     "max_agent_rounds",
     "max_agent_tool_calls",
     "agent_approval_mode",
@@ -139,7 +138,6 @@ class AppConfig:
     model_list: dict[str, ModelConfig] = field(
         default_factory=lambda: {DEFAULT_MODEL_ALIAS: ModelConfig()}
     )
-    agent_mode: bool = DEFAULT_AGENT_MODE
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
@@ -221,7 +219,6 @@ class AppConfig:
             },
             "current_model": self.active_model_name,
             "agent_mode": {
-                "enable": self.agent_mode,
                 "max_rounds": self.max_agent_rounds,
                 "max_tool_calls": self.max_agent_tool_calls,
                 "approve": self.agent_approval_mode,
@@ -263,7 +260,6 @@ class AppConfig:
     def to_flat_dict(self):
         values = {
             "current_model": self.active_model_name,
-            "agent_mode": self.agent_mode,
             "max_agent_rounds": self.max_agent_rounds,
             "max_agent_tool_calls": self.max_agent_tool_calls,
             "agent_approval_mode": self.agent_approval_mode,
@@ -486,6 +482,9 @@ def _sanitize_model_config(data):
         )
     except ValueError:
         reasoning_effort = DEFAULT_REASONING_EFFORT
+    thinking_mode = _parse_bool(data.get("thinking_mode"), DEFAULT_THINKING_MODE)
+    if not thinking_mode:
+        reasoning_effort = ""
     return ModelConfig(
         api_type=api_type,
         base_url=_normalize_base_url(api_type, data.get("base_url", DEFAULT_BASE_URL)),
@@ -494,7 +493,7 @@ def _sanitize_model_config(data):
         max_tokens=max_tokens,
         temperature=temperature,
         stream_mode=_parse_bool(data.get("stream_mode"), DEFAULT_STREAM_MODE),
-        thinking_mode=_parse_bool(data.get("thinking_mode"), DEFAULT_THINKING_MODE),
+        thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
         context_window_tokens=context_window_tokens,
     )
@@ -615,7 +614,6 @@ def _sanitize_config(data):
     return AppConfig(
         current_model=current_model,
         model_list=model_list,
-        agent_mode=_parse_bool(agent_config.get("enable"), DEFAULT_AGENT_MODE),
         max_agent_rounds=max_agent_rounds,
         max_agent_tool_calls=max_agent_tool_calls,
         agent_approval_mode=agent_approval_mode,
@@ -697,6 +695,77 @@ def save_config_field(key, value):
     save_config_fields({key: value})
 
 
+def add_model_profile(name, source_name=""):
+    config = _load_existing_config()
+    model_name = str(name or "").strip()
+    if not model_name:
+        raise ValueError("Model profile name cannot be empty.")
+    if model_name in config.model_list:
+        raise ValueError(f"Model profile already exists: {model_name}")
+
+    source_key = str(source_name or "").strip()
+    if source_key and source_key in config.model_list:
+        source_model = config.model_list[source_key]
+    else:
+        source_model = config.active_model
+
+    config.model_list[model_name] = _sanitize_model_config(source_model.to_dict())
+    config.current_model = model_name
+    _persist_config(_sanitize_config(config.to_dict()))
+    return model_name
+
+
+def add_model_profile_with_config(name, model_config):
+    config = _load_existing_config()
+    model_name = str(name or "").strip()
+    if not model_name:
+        raise ValueError("Model profile name cannot be empty.")
+    if model_name in config.model_list:
+        raise ValueError(f"Model profile already exists: {model_name}")
+
+    config.model_list[model_name] = _sanitize_model_config(dict(model_config or {}))
+    config.current_model = model_name
+    _persist_config(_sanitize_config(config.to_dict()))
+    return model_name
+
+
+def delete_model_profile(name):
+    config = _load_existing_config()
+    model_name = str(name or "").strip()
+    if not model_name:
+        raise ValueError("Model profile name cannot be empty.")
+    if model_name not in config.model_list:
+        raise ValueError(f"Model profile not found: {model_name}")
+    if len(config.model_list) <= 1:
+        raise ValueError("Cannot delete the last model profile.")
+
+    del config.model_list[model_name]
+    if config.current_model == model_name:
+        config.current_model = next(iter(config.model_list.keys()), DEFAULT_MODEL_ALIAS)
+    _persist_config(_sanitize_config(config.to_dict()))
+
+
+def rename_model_profile(old_name, new_name):
+    config = _load_existing_config()
+    old_key = str(old_name or "").strip()
+    new_key = str(new_name or "").strip()
+    if not old_key or not new_key:
+        raise ValueError("Model profile name cannot be empty.")
+    if old_key not in config.model_list:
+        raise ValueError(f"Model profile not found: {old_key}")
+    if new_key != old_key and new_key in config.model_list:
+        raise ValueError(f"Model profile already exists: {new_key}")
+
+    if new_key == old_key:
+        return new_key
+
+    config.model_list[new_key] = config.model_list.pop(old_key)
+    if config.current_model == old_key:
+        config.current_model = new_key
+    _persist_config(_sanitize_config(config.to_dict()))
+    return new_key
+
+
 def save_config_fields(fields):
     config = _load_existing_config()
     active_name = config.active_model_name
@@ -726,8 +795,13 @@ def save_config_fields(fields):
                 active_model.thinking_mode = _parse_bool(
                     value, active_model.thinking_mode
                 )
+                if not active_model.thinking_mode:
+                    active_model.reasoning_effort = ""
             elif key == "reasoning_effort":
-                active_model.reasoning_effort = parse_reasoning_effort(value)
+                if not active_model.thinking_mode:
+                    active_model.reasoning_effort = ""
+                else:
+                    active_model.reasoning_effort = parse_reasoning_effort(value)
             elif key == "context_window_tokens":
                 active_model.context_window_tokens = parse_context_window_tokens(value)
             continue
@@ -740,8 +814,6 @@ def save_config_fields(fields):
             if value not in config.model_list:
                 raise ValueError(f"Unknown model profile: {value}")
             config.current_model = value
-        elif key == "agent_mode":
-            config.agent_mode = _parse_bool(value, config.agent_mode)
         elif key == "max_agent_rounds":
             config.max_agent_rounds = parse_agent_rounds(value)
         elif key == "max_agent_tool_calls":

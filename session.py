@@ -9,7 +9,6 @@ from pathlib import Path
 from ui import (
     clean_display_text,
     print_error,
-    print_info,
     print_success,
 )
 

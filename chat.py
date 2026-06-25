@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 
 from ui import (
     add_explored_entry,
-    clear_current_lines,
     clean_and_print_stream_response,
     clean_display_text,
     finish_thinking_round,
@@ -20,7 +19,6 @@ from ui import (
     print_warn,
     set_plan_panel,
     set_context_usage,
-    start_thinking_timer,
 )
 from config import (
     API_TYPE_ANTHROPIC,
@@ -306,7 +304,9 @@ class OmniAgent:
             reasoning_effort=None,
         )
         self.agent_tools.set_subagent_executor(self._dispatch_subagent)
-        self.agent_team_enabled = bool(agent_team_enable) and (workspace_dir is not None)
+        self.agent_team_enabled = bool(agent_team_enable) and (
+            workspace_dir is not None
+        )
         if self.agent_team_enabled:
             self.team_store = TeamStore(workspace_dir=workspace_dir)
             self.agent_tools.set_team_config(
@@ -874,10 +874,12 @@ class OmniAgent:
                 reasoning_detail_parts,
                 self._get_field(delta, "reasoning_details", None),
             )
-            reasoning, field_thinking_candidate, raw_thinking = self._stream_reasoning_delta(
-                delta,
-                field_thinking,
-                raw_thinking,
+            reasoning, field_thinking_candidate, raw_thinking = (
+                self._stream_reasoning_delta(
+                    delta,
+                    field_thinking,
+                    raw_thinking,
+                )
             )
             if reasoning:
                 field_thinking = field_thinking_candidate
@@ -2037,9 +2039,7 @@ class OmniAgent:
         stream_callback_thinking=None,
         thinking_streamed=False,
     ):
-        message = (
-            "Normal-mode tools stopped after reaching the round limit."
-        )
+        message = "Normal-mode tools stopped after reaching the round limit."
         thinking_printed_now, thinking_streamed = (
             self._stream_normal_thinking_if_needed(
                 thinking,
@@ -2088,12 +2088,10 @@ class OmniAgent:
         callback_thinking=None,
         callback_response=None,
     ):
-        _, thinking_streamed = (
-            self._stream_normal_thinking_if_needed(
-                thinking,
-                callback_thinking,
-                False,
-            )
+        _, thinking_streamed = self._stream_normal_thinking_if_needed(
+            thinking,
+            callback_thinking,
+            False,
         )
         print_stream_response_start(self.model)
         if response:
@@ -2107,9 +2105,7 @@ class OmniAgent:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
-        message = (
-            "Normal-mode tools stopped after reaching the round limit."
-        )
+        message = "Normal-mode tools stopped after reaching the round limit."
         print_error(message)
         if not response:
             return {
@@ -2188,7 +2184,13 @@ class OmniAgent:
             thinking_content,
             assistant_tool_calls,
         )
-        return (assistant_message, thinking_content, full_response, tool_calls, response_streamed)
+        return (
+            assistant_message,
+            thinking_content,
+            full_response,
+            tool_calls,
+            response_streamed,
+        )
 
     def _ollama_agent_response(self):
         full_thinking = ""
@@ -2402,11 +2404,7 @@ class OmniAgent:
         return
 
     def _stream_agent_thinking(self, content):
-        if (
-            not self.thinking_mode
-            or not self.agent_show_thinking
-            or not content
-        ):
+        if not self.thinking_mode or not self.agent_show_thinking or not content:
             return
         leading_newline = True
         if self.agent_output_needs_separator:
@@ -3459,14 +3457,6 @@ class OmniAgent:
                     and self.thinking_mode
                 ):
                     callback_thinking(tagged_reasoning)
-                full_thinking = _combine_reasoning_text(
-                    field_thinking,
-                    tagged_thinking,
-                )
-                separator_thinking = _combine_reasoning_text(
-                    initial_thinking,
-                    full_thinking,
-                )
                 if content:
                     if not thinking_ended:
                         print_stream_response_start(model_name)
@@ -3555,10 +3545,6 @@ class OmniAgent:
                 ):
                     callback_thinking(tagged_reasoning)
                 full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
-                separator_thinking = _combine_reasoning_text(
-                    initial_thinking,
-                    full_thinking,
-                )
                 if content:
                     if not response_started:
                         print_stream_response_start(model_name)
@@ -3682,14 +3668,6 @@ class OmniAgent:
                                 and self.thinking_mode
                             ):
                                 callback_thinking(tagged_reasoning)
-                            full_thinking = _combine_reasoning_text(
-                                field_thinking,
-                                tagged_thinking,
-                            )
-                            separator_thinking = _combine_reasoning_text(
-                                initial_thinking,
-                                full_thinking,
-                            )
                             if content:
                                 if not response_started:
                                     print_stream_response_start(model_name)
@@ -3753,14 +3731,6 @@ class OmniAgent:
                             and self.thinking_mode
                         ):
                             callback_thinking(tagged_reasoning)
-                        full_thinking = _combine_reasoning_text(
-                            field_thinking,
-                            tagged_thinking,
-                        )
-                        separator_thinking = _combine_reasoning_text(
-                            initial_thinking,
-                            full_thinking,
-                        )
                         if content:
                             if not response_started:
                                 print_stream_response_start(model_name)
@@ -3823,7 +3793,9 @@ class OmniAgent:
                 self._get_field(response, "content", [])
             )
             full_thinking, full_response, _ = self._parse_anthropic_blocks(blocks)
-            history_content = blocks if self._uses_minimax_anthropic_compat() else full_response
+            history_content = (
+                blocks if self._uses_minimax_anthropic_compat() else full_response
+            )
 
             self.conversation_history.append({
                 "role": "assistant",
@@ -4015,8 +3987,7 @@ class OmniAgent:
         model_name = str(self.model or "").lower()
         is_m3 = model_name.startswith("minimax-m3")
         return is_m3 and (
-            self._uses_minimax_openai_compat()
-            or self._uses_minimax_anthropic_compat()
+            self._uses_minimax_openai_compat() or self._uses_minimax_anthropic_compat()
         )
 
     def _openai_user_media_content(self, text, media_references):
@@ -4397,7 +4368,10 @@ class OmniAgent:
         include_web_search = self.agent_tools.web_search_available
         include_skills = self.agent_tools.skills_available
         include_plan = self.agent_tools.todos_enabled
-        extra_definitions = self.agent_tools.subagent_tool_definitions() + self.agent_tools.team_tool_definitions()
+        extra_definitions = (
+            self.agent_tools.subagent_tool_definitions()
+            + self.agent_tools.team_tool_definitions()
+        )
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
             return openai_tool_schemas(
                 include_web_search,
@@ -4416,9 +4390,8 @@ class OmniAgent:
         include_web_search = (
             self.agent_tools.web_search_available and "web_search" in spec.tool_names
         )
-        include_skills = (
-            self.agent_tools.skills_available
-            and bool({"list_skills", "read_skill"} & set(spec.tool_names))
+        include_skills = self.agent_tools.skills_available and bool(
+            {"list_skills", "read_skill"} & set(spec.tool_names)
         )
         if self.api_type == API_TYPE_ANTHROPIC:
             return anthropic_tool_schemas(
@@ -4456,9 +4429,8 @@ class OmniAgent:
         include_web_search = (
             self.agent_tools.web_search_available and "web_search" in spec.tool_names
         )
-        include_skills = (
-            self.agent_tools.skills_available
-            and bool({"list_skills", "read_skill"} & set(spec.tool_names))
+        include_skills = self.agent_tools.skills_available and bool(
+            {"list_skills", "read_skill"} & set(spec.tool_names)
         )
         excluded = FORBIDDEN_SUBAGENT_TOOL_NAMES | {
             "spawn_teammate",
@@ -4737,10 +4709,9 @@ class OmniAgent:
                 self._get_field(item, "reasoning_details", None)
             )
         compatible_text = ""
-        if (
-            self._is_anthropic_reasoning_block_type(item_type)
-            or self._is_anthropic_reasoning_delta_type(item_type)
-        ):
+        if self._is_anthropic_reasoning_block_type(
+            item_type
+        ) or self._is_anthropic_reasoning_delta_type(item_type):
             compatible_text = (
                 self._get_field(item, "text", "")
                 or self._get_field(item, "content", "")
@@ -4920,6 +4891,7 @@ def _compact_tool_result_for_context(tool_result):
 
 def _escape_rich_markup(text: str) -> str:
     return str(text or "").replace("[", r"\[")
+
 
 def _format_explored_entry(name, tool_input):
     if not isinstance(tool_input, dict):

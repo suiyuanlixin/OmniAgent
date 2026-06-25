@@ -8,12 +8,26 @@ from datetime import datetime
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import Button, Input, Label, Static
 
 from chat import OmniAgent
 from commands import process_command
-from config import load_config, save_config_field, save_config_fields
+from config import (
+    API_TYPE_ANTHROPIC,
+    API_TYPE_GEMINI,
+    API_TYPE_GLM,
+    API_TYPE_OLLAMA,
+    API_TYPE_OPENAI,
+    add_model_profile,
+    delete_model_profile,
+    load_config,
+    rename_model_profile,
+    save_config_field,
+    save_config_fields,
+)
 from main import attach_external_file_references_with_media
+from search import TAVILY_SEARCH_DEPTHS, TAVILY_TOPICS, WEB_SEARCH_PROVIDERS
 from session import (
     ProjectRecord,
     add_project,
@@ -44,6 +58,7 @@ from ui import clean_display_text, clean_display_text_preserve_newlines
 
 
 from textual.widgets._toast import Toast
+
 
 # Override toast notification styling
 Toast.DEFAULT_CSS = """
@@ -317,6 +332,25 @@ class AgentTUIApp(App):
         self._message_started_at: float | None = None
         self._thinking_started_at: float | None = None
         self._thinking_elapsed_timer = None
+        self._settings_skills_sources_expanded = False
+
+    def _model_profile_choices(self) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = [("none", "")]
+        options.extend((name, name) for name in self.config.model_list.keys())
+        return options
+
+    def _api_type_title(self, api_type: str) -> str:
+        api_type = str(api_type or "").strip().lower()
+        titles = {
+            API_TYPE_OLLAMA: "Ollama",
+            API_TYPE_OPENAI: "OpenAI",
+            API_TYPE_ANTHROPIC: "Anthropic",
+            API_TYPE_GEMINI: "Gemini",
+            API_TYPE_GLM: "GLM",
+        }
+        if api_type in titles:
+            return titles[api_type]
+        return (api_type or "Other").title()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="left-edge", classes="sidebar-hidden"):
@@ -774,7 +808,10 @@ class AgentTUIApp(App):
         self.config = load_config()
 
     def _apply_config_to_controls(self) -> None:
-        chat_input = self.query_one("#chat-input", ChatInput)
+        try:
+            chat_input = self.query_one("#chat-input", ChatInput)
+        except NoMatches:
+            return
         model_options = [(name, name) for name in self.config.model_list.keys()]
         chat_input.set_model_options(model_options, self.config.current_model)
         chat_input.plan_mode = bool(self.config.agent_plan_enable)
@@ -801,9 +838,7 @@ class AgentTUIApp(App):
             sessions = list_sessions(project)
             filtered = []
             for session in sessions:
-                is_pinned = (
-                    str(session.get("session_path") or "") in pinned_paths
-                )
+                is_pinned = str(session.get("session_path") or "") in pinned_paths
                 session["_pinned"] = is_pinned
                 if not is_pinned:
                     filtered.append(session)
@@ -869,201 +904,578 @@ class AgentTUIApp(App):
         widget.disabled = not enabled
 
     def _open_settings(self) -> None:
-        self.push_screen(SettingsModal(settings_rows=self._settings_rows(), app=self))
+        self.push_screen(SettingsModal(pages=self._settings_pages(), app=self))
 
-    def _settings_rows(self) -> list[dict]:
-        active_model = self.config.active_model
-        model_choices = [
-            (name, name) for name in self.config.model_list.keys()
-        ]
-        thinking_choices = [
-            ("Off", "none"),
-            ("Low", "low"),
-            ("Medium", "medium"),
-            ("High", "high"),
-            ("Max", "max"),
-        ]
-        approval_choices = [
-            ("Ask every time", "confirm"),
-            ("Approve for me", "approve"),
-            ("Full access", "full"),
-        ]
-        bool_choices = [("true", "true"), ("false", "false")]
+    def _settings_pages(self) -> dict[str, dict]:
+        return {
+            "root": {
+                "title": "Settings",
+                "layout": "list",
+                "rows": self._settings_home_rows,
+            },
+            "model_list": {
+                "title": "Model list",
+                "layout": "model_list",
+                "show_search": False,
+                "state": self._settings_model_page_state,
+                "on_select_model": self._on_setting_model_changed,
+                "on_add_model": self._on_setting_add_model,
+            },
+            "agent_mode": {
+                "title": "Agent mode",
+                "layout": "list",
+                "rows": self._settings_agent_mode_rows,
+            },
+            "skills": {
+                "title": "Skills",
+                "layout": "list",
+                "rows": self._settings_skills_rows,
+            },
+            "auto_compact": {
+                "title": "Auto compact",
+                "layout": "list",
+                "rows": self._settings_auto_compact_rows,
+            },
+            "memory_system": {
+                "title": "Memory system",
+                "layout": "list",
+                "rows": self._settings_memory_rows,
+            },
+            "web_search": {
+                "title": "Web search",
+                "layout": "list",
+                "rows": self._settings_web_search_rows,
+            },
+        }
 
+    def _settings_home_rows(self) -> list[dict]:
         return [
             {
-                "name": "Model",
+                "name": "Model list",
+                "value": ">",
+                "keywords": "model list model_list current_model",
+                "edit_type": "nav",
+                "target_page": "model_list",
+            },
+            {
+                "name": "Agent mode",
+                "value": ">",
+                "keywords": "agent mode agent_mode",
+                "edit_type": "nav",
+                "target_page": "agent_mode",
+            },
+            {
+                "name": "Skills",
+                "value": ">",
+                "keywords": "skills",
+                "edit_type": "nav",
+                "target_page": "skills",
+            },
+            {
+                "name": "Auto compact",
+                "value": ">",
+                "keywords": "auto compact auto_compact",
+                "edit_type": "nav",
+                "target_page": "auto_compact",
+            },
+            {
+                "name": "Memory system",
+                "value": ">",
+                "keywords": "memory system memory_system",
+                "edit_type": "nav",
+                "target_page": "memory_system",
+            },
+            {
+                "name": "Web search",
+                "value": ">",
+                "keywords": "web search web_search",
+                "edit_type": "nav",
+                "target_page": "web_search",
+            },
+        ]
+
+    def _settings_model_page_state(self, selected_name: str = "") -> dict:
+        models = [name for name in self.config.model_list.keys()]
+        current_model = (
+            self.config.current_model if self.config.current_model in models else ""
+        )
+        if selected_name and selected_name in models:
+            current_model = selected_name
+
+        grouped: dict[str, list[str]] = {}
+        for model_name, profile in self.config.model_list.items():
+            api_type = str(getattr(profile, "api_type", "") or "").strip().lower()
+            grouped.setdefault(api_type, []).append(str(model_name))
+        groups = [
+            {
+                "api_type": api_type,
+                "title": self._api_type_title(api_type),
+                "models": sorted(model_names, key=lambda x: x.lower()),
+            }
+            for api_type, model_names in grouped.items()
+        ]
+        groups.sort(key=lambda g: str(g.get("title") or "").lower())
+        return {
+            "models": models,
+            "groups": groups,
+            "selected_model": current_model,
+            "rows": self._settings_model_rows(),
+        }
+
+    def _settings_model_rows(self) -> list[dict]:
+        active_model = self.config.active_model
+        bool_choices = [("true", "true"), ("false", "false")]
+        reasoning_choices = [
+            ("none", "none"),
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+        ]
+        current_effort = str(active_model.reasoning_effort or "none")
+        if current_effort not in {value for _, value in reasoning_choices}:
+            current_effort = "none"
+
+        rows = [
+            {
+                "name": "API type",
+                "value": self._api_type_title(active_model.api_type),
+                "keywords": "api_type",
+                "edit_type": "none",
+            },
+            {
+                "name": "Model name",
                 "value": self.config.current_model,
-                "keywords": "model current_model",
-                "edit_type": "select",
-                "options": model_choices,
-                "on_change": lambda v: self._on_setting_model_changed(v),
+                "keywords": "model name rename",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_model_name_changed(v),
+            },
+            {
+                "name": "Base URL",
+                "value": active_model.base_url,
+                "keywords": "base_url",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_model_base_url_changed(v),
+            },
+            {
+                "name": "Model",
+                "value": active_model.model,
+                "keywords": "model backend",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_model_id_changed(v),
+            },
+            {
+                "name": "API key",
+                "value": active_model.api_key,
+                "keywords": "api_key",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_model_api_key_changed(v),
             },
             {
                 "name": "Max tokens",
                 "value": str(active_model.max_tokens),
-                "keywords": "max_tokens token",
+                "keywords": "max_tokens",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_token_changed(v),
             },
             {
                 "name": "Temperature",
                 "value": str(active_model.temperature),
-                "keywords": "temperature temp",
+                "keywords": "temperature",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_temp_changed(v),
             },
             {
-                "name": "Stream mode",
+                "name": "Stream",
                 "value": "true" if active_model.stream_mode else "false",
-                "keywords": "stream mode",
+                "keywords": "stream_mode stream",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_stream_changed(v),
             },
             {
                 "name": "Thinking",
-                "value": self._thinking_value_from_config(),
-                "keywords": "thinking reasoning_effort",
-                "edit_type": "select",
-                "options": thinking_choices,
-                "on_change": lambda v: self._on_setting_thinking_changed(v),
-            },
-            {
-                "name": "Agent default",
-                "value": "true" if self.config.agent_mode else "false",
-                "keywords": "agent mode",
+                "value": "true" if active_model.thinking_mode else "false",
+                "keywords": "thinking_mode thinking",
                 "edit_type": "toggle",
                 "options": bool_choices,
-                "on_change": lambda v: self._on_setting_agent_toggle(v),
+                "on_change": lambda v: self._on_setting_model_thinking_changed(v),
             },
             {
-                "name": "Plan mode",
-                "value": "true" if self.config.agent_plan_enable else "false",
-                "keywords": "plan agent plan_mode",
-                "edit_type": "toggle",
-                "options": bool_choices,
-                "on_change": lambda v: self._on_setting_plan_changed(v),
+                "name": "Context",
+                "value": str(active_model.context_window_tokens),
+                "keywords": "context_window_tokens context",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_model_context_changed(v),
+            },
+        ]
+        if active_model.thinking_mode:
+            rows.insert(
+                -1,
+                {
+                    "name": "Reasoning effort",
+                    "value": current_effort,
+                    "keywords": "reasoning_effort",
+                    "edit_type": "select",
+                    "options": reasoning_choices,
+                    "on_change": lambda v: (
+                        self._on_setting_model_reasoning_effort_changed(v)
+                    ),
+                },
+            )
+        rows.append({"name": "", "value": "", "edit_type": "none"})
+        rows.append({
+            "name": "",
+            "value": "Delete",
+            "keywords": "delete",
+            "edit_type": "action",
+            "show_value": True,
+            "on_activate": self._on_setting_delete_current_model,
+        })
+        return rows
+
+    def _on_setting_model_name_changed(self, value: str) -> None:
+        new_name = str(value or "").strip()
+        if not new_name:
+            return
+        old_name = str(self.config.current_model or "").strip()
+        if not old_name:
+            return
+        try:
+            renamed = rename_model_profile(old_name, new_name)
+        except Exception as error:
+            self.add_status_message("[✗]", f"重命名失败: {error}")
+            return
+        self._reload_config()
+        self._on_setting_model_changed(renamed)
+
+    def _settings_agent_mode_rows(self) -> list[dict]:
+        bool_choices = [("true", "true"), ("false", "false")]
+        return [
+            {
+                "name": "Max rounds",
+                "value": str(self.config.max_agent_rounds),
+                "keywords": "max_rounds",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_rounds_changed(v),
             },
             {
-                "name": "Approval",
-                "value": self.config.agent_approval_mode,
-                "keywords": "approve approval",
-                "edit_type": "select",
-                "options": approval_choices,
-                "on_change": lambda v: self._on_setting_approval_changed(v),
+                "name": "Max tool calls",
+                "value": str(self.config.max_agent_tool_calls),
+                "keywords": "max_tool_calls",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_tool_calls_changed(v),
             },
             {
-                "name": "Agent show thinking",
+                "name": "Show thinking",
                 "value": "true" if self.config.agent_show_thinking else "false",
-                "keywords": "show_thinking agent thinking",
+                "keywords": "show_thinking",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_agent_show_thinking_changed(v),
             },
             {
-                "name": "Agent max rounds",
-                "value": str(self.config.max_agent_rounds),
-                "keywords": "max_agent_rounds agent rounds",
-                "edit_type": "input",
-                "on_change": lambda v: self._on_setting_rounds_changed(v),
+                "name": "Plan mode",
+                "value": "true" if self.config.agent_plan_enable else "false",
+                "keywords": "plan_mode",
+                "edit_type": "toggle",
+                "options": bool_choices,
+                "on_change": lambda v: self._on_setting_plan_changed(v),
             },
             {
-                "name": "Agent max tool calls",
-                "value": str(self.config.max_agent_tool_calls),
-                "keywords": "max_agent_tool_calls agent tool_calls",
-                "edit_type": "input",
-                "on_change": lambda v: self._on_setting_tool_calls_changed(v),
+                "name": "Agent team",
+                "value": "true" if self.config.agent_team_enable else "false",
+                "keywords": "agent_team enable",
+                "edit_type": "toggle",
+                "options": bool_choices,
+                "on_change": lambda v: self._on_setting_agent_team_changed(v),
             },
+        ]
+
+    def _toggle_settings_skills_sources(self) -> None:
+        self._settings_skills_sources_expanded = (
+            not self._settings_skills_sources_expanded
+        )
+
+    def _settings_skills_rows(self) -> list[dict]:
+        bool_choices = [("true", "true"), ("false", "false")]
+        rows = [
             {
-                "name": "Skills",
+                "name": "Enable",
                 "value": "true" if self.config.skills_enable else "false",
-                "keywords": "skills",
+                "keywords": "enable skills",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_skills_changed(v),
             },
             {
-                "name": "Skills max chars",
+                "name": "Sources",
+                "value": "v" if self._settings_skills_sources_expanded else ">",
+                "keywords": "sources app workspace",
+                "edit_type": "action",
+                "on_activate": self._toggle_settings_skills_sources,
+            },
+            {
+                "name": "Auto catalog",
+                "value": "true" if self.config.skills_auto_catalog else "false",
+                "keywords": "auto_catalog",
+                "edit_type": "toggle",
+                "options": bool_choices,
+                "on_change": lambda v: self._on_setting_skills_auto_catalog_changed(v),
+            },
+            {
+                "name": "Max skill chars",
                 "value": str(self.config.skills_max_chars),
-                "keywords": "skills max_chars max",
+                "keywords": "max_skill_chars",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_skills_max_changed(v),
             },
+        ]
+        if self._settings_skills_sources_expanded:
+            rows[2:2] = [
+                {
+                    "name": "App",
+                    "value": "true" if self.config.skills_source_app else "false",
+                    "keywords": "sources app",
+                    "edit_type": "toggle",
+                    "options": bool_choices,
+                    "indented": True,
+                    "on_change": lambda v: self._on_setting_skills_source_app_changed(
+                        v
+                    ),
+                },
+                {
+                    "name": "Workspace",
+                    "value": "true" if self.config.skills_source_workspace else "false",
+                    "keywords": "sources workspace",
+                    "edit_type": "toggle",
+                    "options": bool_choices,
+                    "indented": True,
+                    "on_change": lambda v: (
+                        self._on_setting_skills_source_workspace_changed(v)
+                    ),
+                },
+            ]
+        return rows
+
+    def _settings_auto_compact_rows(self) -> list[dict]:
+        bool_choices = [("true", "true"), ("false", "false")]
+        model_choices = self._model_profile_choices()
+        return [
             {
-                "name": "Web search",
-                "value": "true" if self.config.web_search_enable else "false",
-                "keywords": "web_search search",
-                "edit_type": "toggle",
-                "options": bool_choices,
-                "on_change": lambda v: self._on_setting_search_changed(v),
-            },
-            {
-                "name": "Web search max results",
-                "value": str(self.config.web_search_max_results),
-                "keywords": "web_search max_results max",
-                "edit_type": "input",
-                "on_change": lambda v: self._on_setting_search_max_changed(v),
-            },
-            {
-                "name": "Debug",
-                "value": "true" if self.config.debug else "false",
-                "keywords": "debug diagnostics",
-                "edit_type": "toggle",
-                "options": bool_choices,
-                "on_change": lambda v: self._on_setting_debug_changed(v),
-            },
-            {
-                "name": "Auto compact",
+                "name": "Enable",
                 "value": "true" if self.config.compaction_enable else "false",
-                "keywords": "compact compaction auto",
+                "keywords": "enable compact",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_compact_changed(v),
             },
             {
-                "name": "Compact trigger ratio",
+                "name": "Trigger ratio",
                 "value": str(self.config.compaction_trigger_ratio),
-                "keywords": "compact trigger ratio compaction",
+                "keywords": "trigger_ratio",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_compact_ratio_changed(v),
             },
             {
-                "name": "API type",
-                "value": active_model.api_type,
-                "keywords": "api_type api",
-                "edit_type": "none",
+                "name": "Keep recent messages",
+                "value": str(self.config.compaction_keep_recent_messages),
+                "keywords": "keep_recent_messages",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_compact_keep_recent_changed(v),
             },
             {
-                "name": "Model id",
-                "value": active_model.model,
-                "keywords": "model backend active",
-                "edit_type": "none",
-            },
-            {
-                "name": "Context window",
-                "value": str(active_model.context_window_tokens),
-                "keywords": "context_window_tokens context",
-                "edit_type": "none",
+                "name": "Compact model",
+                "value": str(self.config.compaction_compact_model or ""),
+                "keywords": "compact_model",
+                "edit_type": "select",
+                "options": model_choices,
+                "on_change": lambda v: self._on_setting_compact_model_changed(v),
             },
         ]
+
+    def _settings_memory_rows(self) -> list[dict]:
+        model_choices = self._model_profile_choices()
+        return [
+            {
+                "name": "Memory model",
+                "value": str(self.config.memory_model or ""),
+                "keywords": "memory_model",
+                "edit_type": "select",
+                "options": model_choices,
+                "on_change": lambda v: self._on_setting_memory_model_changed(v),
+            },
+        ]
+
+    def _settings_web_search_rows(self) -> list[dict]:
+        bool_choices = [("true", "true"), ("false", "false")]
+        provider_choices = [
+            (provider, provider) for provider in sorted(WEB_SEARCH_PROVIDERS)
+        ]
+        search_depth_choices = [
+            (depth, depth)
+            for depth in ("basic", "fast", "ultra-fast", "advanced")
+            if depth in TAVILY_SEARCH_DEPTHS
+        ]
+        topic_choices = [
+            (topic, topic)
+            for topic in ("general", "news", "finance")
+            if topic in TAVILY_TOPICS
+        ]
+        return [
+            {
+                "name": "Enable",
+                "value": "true" if self.config.web_search_enable else "false",
+                "keywords": "enable web_search",
+                "edit_type": "toggle",
+                "options": bool_choices,
+                "on_change": lambda v: self._on_setting_search_changed(v),
+            },
+            {
+                "name": "Provider",
+                "value": self.config.web_search_provider,
+                "keywords": "provider",
+                "edit_type": "select",
+                "options": provider_choices,
+                "on_change": lambda v: self._on_setting_search_provider_changed(v),
+            },
+            {
+                "name": "API key",
+                "value": self.config.web_search_api_key,
+                "keywords": "api_key",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_search_api_key_changed(v),
+            },
+            {
+                "name": "Max results",
+                "value": str(self.config.web_search_max_results),
+                "keywords": "max_results",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_search_max_changed(v),
+            },
+            {
+                "name": "Search depth",
+                "value": self.config.web_search_depth,
+                "keywords": "search_depth",
+                "edit_type": "select",
+                "options": search_depth_choices,
+                "on_change": lambda v: self._on_setting_search_depth_changed(v),
+            },
+            {
+                "name": "Topic",
+                "value": self.config.web_search_topic,
+                "keywords": "topic",
+                "edit_type": "select",
+                "options": topic_choices,
+                "on_change": lambda v: self._on_setting_search_topic_changed(v),
+            },
+        ]
+
+    def _sync_chat_from_active_model(self) -> None:
+        if self.chat is None:
+            return
+        model = self.config.active_model
+        self.chat.configure(
+            api_type=model.api_type,
+            base_url=model.base_url,
+            model=model.model,
+            api_key=model.api_key,
+            max_tokens=model.max_tokens,
+            temperature=model.temperature,
+            stream_mode=model.stream_mode,
+            thinking_mode=model.thinking_mode,
+            reasoning_effort=model.reasoning_effort,
+        )
+
+    def _on_setting_add_model(self, model_name: str, source_name: str = "") -> str:
+        model_name = str(model_name or "").strip()
+        if not model_name:
+            return ""
+        try:
+            created_name = add_model_profile(model_name, source_name)
+        except Exception as error:
+            self.add_status_message("[✗]", f"新增模型失败: {error}")
+            return ""
+        self._reload_config()
+        self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
+        return created_name
+
+    def _on_setting_delete_current_model(self) -> None:
+        name = str(self.config.current_model or "").strip()
+        if not name:
+            return
+        try:
+            delete_model_profile(name)
+        except Exception as error:
+            self.add_status_message("[✗]", f"删除模型失败: {error}")
+            return
+        self._reload_config()
+        self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
 
     def _on_setting_model_changed(self, value: str) -> None:
         save_config_field("current_model", value)
         self._reload_config()
+        self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
+
+    def _on_setting_model_api_type_changed(self, value: str) -> None:
+        save_config_field("api_type", value)
+        self._reload_config()
+        self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
+
+    def _on_setting_model_base_url_changed(self, value: str) -> None:
+        save_config_field("base_url", value)
+        self._reload_config()
+        self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
+
+    def _on_setting_model_id_changed(self, value: str) -> None:
+        model_id = str(value or "").strip()
+        if not model_id:
+            return
+        save_config_field("model", model_id)
+        self._reload_config()
+        self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
+
+    def _on_setting_model_api_key_changed(self, value: str) -> None:
+        save_config_field("api_key", str(value or "").strip())
+        self._reload_config()
+        self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
+
+    def _on_setting_model_thinking_changed(self, value: str) -> None:
+        enabled = str(value or "").lower() in ("on", "true", "yes")
+        save_config_field("thinking_mode", enabled)
+        if not enabled:
+            save_config_field("reasoning_effort", "")
+        self._reload_config()
         if self.chat is not None:
-            model = self.config.active_model
-            self.chat.configure(
-                api_type=model.api_type,
-                base_url=model.base_url,
-                model=model.model,
-                api_key=model.api_key,
-                max_tokens=model.max_tokens,
-                temperature=model.temperature,
-                stream_mode=model.stream_mode,
-                thinking_mode=model.thinking_mode,
-                reasoning_effort=model.reasoning_effort,
-            )
+            self.chat.set_thinking_mode(enabled)
+            if not enabled:
+                self.chat.set_reasoning_effort("")
+        self._apply_config_to_controls()
+
+    def _on_setting_model_reasoning_effort_changed(self, value: str) -> None:
+        effort = str(value or "").strip().lower() or "none"
+        save_config_field("reasoning_effort", effort)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_reasoning_effort(effort)
+        self._apply_config_to_controls()
+
+    def _on_setting_model_context_changed(self, value: str) -> None:
+        try:
+            tokens = max(1, int(value))
+        except (TypeError, ValueError):
+            return
+        save_config_field("context_window_tokens", tokens)
+        self._reload_config()
         self._apply_config_to_controls()
 
     def _on_setting_token_changed(self, value: str) -> None:
@@ -1109,20 +1521,20 @@ class AgentTUIApp(App):
             self.chat.set_reasoning_effort(effort)
         self._apply_config_to_controls()
 
-    def _on_setting_agent_toggle(self, value: str) -> None:
-        enabled = value.lower() in ("on", "true", "yes")
-        save_config_field("agent_mode", enabled)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_agent_mode(enabled)
-        self._apply_config_to_controls()
-
     def _on_setting_plan_changed(self, value: str) -> None:
         enabled = value.lower() in ("on", "true", "yes")
         save_config_field("agent_plan_enable", enabled)
         self._reload_config()
         if self.chat is not None:
             self.chat.set_agent_plan_enabled(enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_agent_team_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("agent_team_enable", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_team_mode(enabled)
         self._apply_config_to_controls()
 
     def _on_setting_approval_changed(self, value: str) -> None:
@@ -1166,6 +1578,32 @@ class AgentTUIApp(App):
         enabled = value.lower() in ("on", "true", "yes")
         save_config_field("skills_enable", enabled)
         self._reload_config()
+        if self.chat is not None:
+            self.chat.set_skills_config(enabled=enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_skills_source_app_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("skills_source_app", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_skills_config(app_enabled=enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_skills_source_workspace_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("skills_source_workspace", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_skills_config(workspace_enabled=enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_skills_auto_catalog_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("skills_auto_catalog", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_skills_config(auto_catalog=enabled)
         self._apply_config_to_controls()
 
     def _on_setting_skills_max_changed(self, value: str) -> None:
@@ -1175,6 +1613,8 @@ class AgentTUIApp(App):
             return
         save_config_field("skills_max_chars", chars)
         self._reload_config()
+        if self.chat is not None:
+            self.chat.set_skills_config(max_chars=chars)
         self._apply_config_to_controls()
 
     def _on_setting_search_changed(self, value: str) -> None:
@@ -1192,6 +1632,37 @@ class AgentTUIApp(App):
             return
         save_config_field("web_search_max_results", count)
         self._reload_config()
+        if self.chat is not None:
+            self.chat.set_web_search_config(max_results=count)
+        self._apply_config_to_controls()
+
+    def _on_setting_search_provider_changed(self, value: str) -> None:
+        save_config_field("web_search_provider", value)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_web_search_config(provider=value)
+        self._apply_config_to_controls()
+
+    def _on_setting_search_api_key_changed(self, value: str) -> None:
+        api_key = str(value or "").strip()
+        save_config_field("web_search_api_key", api_key)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_web_search_config(api_key=api_key)
+        self._apply_config_to_controls()
+
+    def _on_setting_search_depth_changed(self, value: str) -> None:
+        save_config_field("web_search_depth", value)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_web_search_config(search_depth=value)
+        self._apply_config_to_controls()
+
+    def _on_setting_search_topic_changed(self, value: str) -> None:
+        save_config_field("web_search_topic", value)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_web_search_config(topic=value)
         self._apply_config_to_controls()
 
     def _on_setting_debug_changed(self, value: str) -> None:
@@ -1212,6 +1683,25 @@ class AgentTUIApp(App):
         except (TypeError, ValueError):
             return
         save_config_field("compaction_trigger_ratio", ratio)
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_compact_keep_recent_changed(self, value: str) -> None:
+        try:
+            keep_recent = max(1, int(value))
+        except (TypeError, ValueError):
+            return
+        save_config_field("compaction_keep_recent_messages", keep_recent)
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_compact_model_changed(self, value: str) -> None:
+        save_config_field("compaction_compact_model", str(value or "").strip())
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_memory_model_changed(self, value: str) -> None:
+        save_config_field("memory_model", str(value or "").strip())
         self._reload_config()
         self._apply_config_to_controls()
 
@@ -1281,7 +1771,7 @@ class AgentTUIApp(App):
     def _build_chat(self, session_record: dict) -> OmniAgent:
         project = self._project_from_session(session_record)
         workspace_dir = project.path if project is not None else None
-        agent_mode = bool(self.config.agent_mode and project is not None)
+        agent_mode = bool(project is not None)
         model = self.config.active_model
         chat = OmniAgent(
             model=model.model,

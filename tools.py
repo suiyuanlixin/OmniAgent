@@ -45,8 +45,6 @@ from team import (
     READ_INBOX_TOOL_NAME,
     BROADCAST_TOOL_NAME,
     SHUTDOWN_TEAMMATE_TOOL_NAME,
-    TEAM_TOOL_NAMES,
-    TeamStore,
 )
 
 
