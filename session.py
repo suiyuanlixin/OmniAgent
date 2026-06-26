@@ -1,6 +1,5 @@
 import json
 import re
-import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,10 +18,7 @@ PROJECT_INDEX_FILE = SESSIONS_DIR / "projects.json"
 PINNED_INDEX_FILE = SESSIONS_DIR / "pinned.json"
 PROJECTS_DIR = SESSIONS_DIR / "projects"
 ORPHAN_SESSIONS_DIR = SESSIONS_DIR / "orphan"
-LEGACY_HISTORY_FILE = BASE_DIR / "memory" / "history.jsonl"
-LEGACY_HISTORY_MIGRATED_FILE = BASE_DIR / "memory" / "history.migrated.jsonl"
 SESSION_VERSION = "4.0.0"
-_legacy_migration_running = False
 
 
 @dataclass
@@ -49,8 +45,6 @@ def ensure_session_storage():
         PROJECT_INDEX_FILE.write_text("[]\n", encoding="utf-8")
     if not PINNED_INDEX_FILE.exists():
         PINNED_INDEX_FILE.write_text("[]\n", encoding="utf-8")
-    if not _legacy_migration_running:
-        _migrate_legacy_history()
 
 
 def normalize_project_path(path_text):
@@ -396,53 +390,3 @@ def delete_session(session_path):
         unpin_session(normalized)
     return True
 
-
-def _migrate_legacy_history():
-    global _legacy_migration_running
-    if not LEGACY_HISTORY_FILE.exists() or LEGACY_HISTORY_MIGRATED_FILE.exists():
-        return
-
-    try:
-        lines = LEGACY_HISTORY_FILE.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()
-    except OSError:
-        return
-
-    conversation = []
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        role = str(row.get("role") or "").strip()
-        if role not in {"user", "assistant", "system", "tool"}:
-            continue
-        conversation.append({
-            "role": role,
-            "content": row.get("content", ""),
-        })
-
-    _legacy_migration_running = True
-    try:
-        if conversation:
-            record = create_session(
-                title="Imported Legacy History",
-                model_name="",
-            )
-            record["conversation"] = conversation
-            save_session_record(record)
-            history_target = Path(record["history_path"])
-            shutil.copyfile(LEGACY_HISTORY_FILE, history_target)
-
-        try:
-            LEGACY_HISTORY_MIGRATED_FILE.write_text(
-                f"Migrated at {datetime.now().isoformat(timespec='seconds')}\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-    finally:
-        _legacy_migration_running = False

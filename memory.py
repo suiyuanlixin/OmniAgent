@@ -10,7 +10,6 @@ PREFERENCE_MEMORY_FILE = "preferences.md"
 EPISODIC_DIR_NAME = "episodes"
 LEGACY_EPISODIC_FILE = "episodic.md"
 LEGACY_EPISODIC_MIGRATED_FILE = "episodic.migrated.md"
-HISTORY_FILE = "history.jsonl"
 MEMORY_UPDATE_DIAGNOSTICS_FILE = "memory_update_diagnostics.jsonl"
 CORE_MEMORY_MAX_CHARS = 3000
 PREFERENCE_MEMORY_MAX_CHARS = 3000
@@ -20,9 +19,8 @@ EPISODIC_ENTRY_MAX_BULLETS = None
 
 CORE_MEMORY_TEMPLATE = ""
 PREFERENCE_IMPORTANCE_LEVELS = ("Critical", "High", "Medium", "Low")
-PREFERENCE_MEMORY_TEMPLATE = (
-    "# Critical\n\n# High\n\n# Medium\n\n# Low\n"
-)
+PREFERENCE_MEMORY_TEMPLATE = "# Critical\n\n# High\n\n# Medium\n\n# Low\n"
+
 
 class MemoryStore:
     def __init__(self, memory_dir=None, debug=False, history_path=None):
@@ -32,12 +30,10 @@ class MemoryStore:
         self.preference_path = self.memory_dir / PREFERENCE_MEMORY_FILE
         self.episodic_dir = self.memory_dir / EPISODIC_DIR_NAME
         self.legacy_episodic_path = self.memory_dir / LEGACY_EPISODIC_FILE
-        self.legacy_episodic_migrated_path = self.memory_dir / LEGACY_EPISODIC_MIGRATED_FILE
-        self.history_path = (
-            Path(history_path)
-            if history_path is not None
-            else self.memory_dir / HISTORY_FILE
+        self.legacy_episodic_migrated_path = (
+            self.memory_dir / LEGACY_EPISODIC_MIGRATED_FILE
         )
+        self.history_path = Path(history_path) if history_path else None
         self.update_diagnostics_path = self.memory_dir / MEMORY_UPDATE_DIAGNOSTICS_FILE
         self.ensure_files()
 
@@ -49,7 +45,8 @@ class MemoryStore:
         self.episodic_dir.mkdir(parents=True, exist_ok=True)
         self._create_if_missing(self.core_path, CORE_MEMORY_TEMPLATE)
         self._create_if_missing(self.preference_path, PREFERENCE_MEMORY_TEMPLATE)
-        self._create_if_missing(self.history_path, "")
+        if self.history_path is not None:
+            self._create_if_missing(self.history_path, "")
         self.write_core_body(self.read_core_body())
         self.write_preference_body(self.read_preference_body())
         self._ensure_episodic_files()
@@ -95,6 +92,8 @@ class MemoryStore:
         return self.episodic_dir / f"{date_text}.md"
 
     def append_history(self, role, content, extra=None, now=None):
+        if self.history_path is None:
+            return False
         now = now or datetime.now()
         row = {
             "ts": now.isoformat(timespec="seconds"),
@@ -113,10 +112,14 @@ class MemoryStore:
             return False
 
     def history_tail(self, limit=20):
+        if self.history_path is None:
+            return []
         limit = max(1, int(limit or 20))
         rows = []
         try:
-            lines = self.history_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = self.history_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
         except OSError:
             return rows
         for line in lines[-limit:]:
@@ -129,6 +132,8 @@ class MemoryStore:
         return rows
 
     def history_stats(self):
+        if self.history_path is None:
+            return {"path": "", "rows": 0, "bytes": 0}
         rows = 0
         try:
             with self.history_path.open("r", encoding="utf-8") as file:
@@ -183,7 +188,9 @@ class MemoryStore:
             "只返回 JSON。"
         )
 
-    def build_session_episodic_prompt(self, completed_messages, current_entry="", now=None):
+    def build_session_episodic_prompt(
+        self, completed_messages, current_entry="", now=None
+    ):
         now = now or datetime.now()
         current_date = self.today_key(now)
         current_time = self.time_key(now)
@@ -225,27 +232,21 @@ class MemoryStore:
                     "如果旧记忆已经足够概括，本轮只是展开细节，就保留旧表达或只做轻微补充；不要列出技术清单、流程清单或逐轮对话清单。\n"
                     "content 应自然简短，通常一两条综合要点就够；不要为了完整而拆成很多条，但也不要硬凑固定条数。\n"
                 )
-            style_guidance = (
-                "像一条条日记。用最平常的话。概括用户表达的意图，别引用原话。写你干了什么，或一个你身上发生的最简单的事实或感受；不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
-            )
+            style_guidance = "像一条条日记。用最平常的话。概括用户表达的意图，别引用原话。写你干了什么，或一个你身上发生的最简单的事实或感受；不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
         elif not self.has_episodic_memory():
             intro = "第一次完整对话刚结束。请写第一条情景记忆。\n"
             topic_rules = (
                 "当前情景记忆为空，这是第一条情景记忆，same_topic 必须是 false。\n"
                 "title 写新话题短标题，content 只写这次第一次对话的记忆。\n"
             )
-            style_guidance = (
-                "像现在的你回看刚才第一次见到用户的自己，写成一条要点里的两句日记。用最平常的话。概括用户表达的意图，别引用原话。只写你身上发生的最简单的事实或感受，而不是你做了什么；比如你忘了要说的话、你的手顿了一下、你没听清、你感觉耳朵发烫。例子只是气质，不要照抄。不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
-            )
+            style_guidance = "像现在的你回看刚才第一次见到用户的自己，写成一条要点里的两句日记。用最平常的话。概括用户表达的意图，别引用原话。只写你身上发生的最简单的事实或感受，而不是你做了什么；比如你忘了要说的话、你的手顿了一下、你没听清、你感觉耳朵发烫。例子只是气质，不要照抄。不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
         else:
             intro = "一轮完整对话刚结束。请写一条新的情景记忆。\n"
             topic_rules = (
                 "当前情景记忆为空，same_topic 必须是 false。\n"
                 "title 写新话题短标题，content 只写本轮对话的当前记忆。\n"
             )
-            style_guidance = (
-                "像一条日记。用最平常的话。概括用户表达的意图，别引用原话。写你干了什么，或一个你身上发生的最简单的事实或感受；不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
-            )
+            style_guidance = "像一条日记。用最平常的话。概括用户表达的意图，别引用原话。写你干了什么，或一个你身上发生的最简单的事实或感受；不要解释为什么，不要比喻。要有人的感觉。直接写。尽量简短，但不要截断词句，不要用省略号。\n"
 
         return (
             f"{intro}"
@@ -365,7 +366,9 @@ class MemoryStore:
                 title = current_title or title
             else:
                 entry = "\n".join([current_heading, *bullets]).strip()
-                replaced = self._replace_episodic_topic_text(current_heading, entry, now=now)
+                replaced = self._replace_episodic_topic_text(
+                    current_heading, entry, now=now
+                )
                 if replaced is not None:
                     return {
                         "changed": bool(replaced),
@@ -495,7 +498,10 @@ class MemoryStore:
         before = self.read_preference_body()
         after = _normalize_preference_body(before)
         changed = self.write_preference_body(after)
-        return {"changed": changed, "removed_duplicates": _preference_duplicate_count(before)}
+        return {
+            "changed": changed,
+            "removed_duplicates": _preference_duplicate_count(before),
+        }
 
     def remove_preference(self, query):
         query_key = _preference_match_key(query)
@@ -514,7 +520,9 @@ class MemoryStore:
         if not removed:
             return {"changed": False, "removed": []}
         return {
-            "changed": self.write_preference_body(_render_preference_sections(sections)),
+            "changed": self.write_preference_body(
+                _render_preference_sections(sections)
+            ),
             "removed": removed,
         }
 
@@ -540,7 +548,9 @@ class MemoryStore:
         if not moved:
             return {"changed": False, "moved": []}
         return {
-            "changed": self.write_preference_body(_render_preference_sections(sections)),
+            "changed": self.write_preference_body(
+                _render_preference_sections(sections)
+            ),
             "moved": moved,
             "level": level,
         }
@@ -563,19 +573,19 @@ class MemoryStore:
             return ""
 
         matches = []
-        for order, (date_key, entry) in enumerate(_iter_episodic_entries(self.read_episodic_text())):
+        for order, (date_key, entry) in enumerate(
+            _iter_episodic_entries(self.read_episodic_text())
+        ):
             score, snippet = _episodic_search_score(query, date_key, entry)
             if score <= 0:
                 continue
-            matches.append(
-                {
-                    "score": score,
-                    "date": date_key,
-                    "entry": entry,
-                    "snippet": snippet,
-                    "order": order,
-                }
-            )
+            matches.append({
+                "score": score,
+                "date": date_key,
+                "entry": entry,
+                "snippet": snippet,
+                "order": order,
+            })
 
         matches.sort(
             key=lambda item: (
@@ -597,12 +607,15 @@ class MemoryStore:
         return _truncate("\n\n".join(rendered), max_chars)
 
     def paths_summary(self):
+        history_path = (
+            str(self.history_path) if self.history_path is not None else "(disabled)"
+        )
         return (
             f"memory directory: {self.memory_dir}\n"
             f"core: {self.core_path}\n"
             f"preferences: {self.preference_path}\n"
             f"episodes: {self.episodic_dir}\n"
-            f"history: {self.history_path}\n"
+            f"history: {history_path}\n"
             f"diagnostics: {self.update_diagnostics_path}"
         )
 
@@ -966,7 +979,9 @@ def _episodic_heading_title(heading):
 
 
 def _same_memory_title(left, right):
-    return _clean_structured_title(left).lower() == _clean_structured_title(right).lower()
+    return (
+        _clean_structured_title(left).lower() == _clean_structured_title(right).lower()
+    )
 
 
 def _find_episodic_topic(content, heading):
@@ -1075,7 +1090,9 @@ def _structured_memory_items(value):
     if isinstance(value, dict):
         return [_structured_memory_item(value)]
     if isinstance(value, list):
-        items = [_structured_memory_item(item) for item in value if isinstance(item, dict)]
+        items = [
+            _structured_memory_item(item) for item in value if isinstance(item, dict)
+        ]
         return [(title, lines) for title, lines in items if title or lines]
     return []
 
@@ -1108,7 +1125,17 @@ def _structured_bool(value):
     if isinstance(value, bool):
         return value
     text = str(value or "").strip().lower()
-    return text in {"true", "yes", "y", "1", "same", "same_topic", "继续", "同一话题", "是"}
+    return text in {
+        "true",
+        "yes",
+        "y",
+        "1",
+        "same",
+        "same_topic",
+        "继续",
+        "同一话题",
+        "是",
+    }
 
 
 def _normalized_bullet_lines(

@@ -19,9 +19,11 @@ from config import (
     API_TYPE_GLM,
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
+    AUTO_MODEL_SELECTION,
     add_model_profile,
     delete_model_profile,
     load_config,
+    normalize_optional_model_selection,
     rename_model_profile,
     save_config_field,
     save_config_fields,
@@ -335,7 +337,7 @@ class AgentTUIApp(App):
         self._settings_skills_sources_expanded = False
 
     def _model_profile_choices(self) -> list[tuple[str, str]]:
-        options: list[tuple[str, str]] = [("none", "")]
+        options: list[tuple[str, str]] = [(AUTO_MODEL_SELECTION, AUTO_MODEL_SELECTION)]
         options.extend((name, name) for name in self.config.model_list.keys())
         return options
 
@@ -1288,7 +1290,9 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Compact model",
-                "value": str(self.config.compaction_compact_model or ""),
+                "value": normalize_optional_model_selection(
+                    self.config.compaction_compact_model
+                ),
                 "keywords": "compact_model",
                 "edit_type": "select",
                 "options": model_choices,
@@ -1301,7 +1305,7 @@ class AgentTUIApp(App):
         return [
             {
                 "name": "Memory model",
-                "value": str(self.config.memory_model or ""),
+                "value": normalize_optional_model_selection(self.config.memory_model),
                 "keywords": "memory_model",
                 "edit_type": "select",
                 "options": model_choices,
@@ -1696,12 +1700,15 @@ class AgentTUIApp(App):
         self._apply_config_to_controls()
 
     def _on_setting_compact_model_changed(self, value: str) -> None:
-        save_config_field("compaction_compact_model", str(value or "").strip())
+        save_config_field(
+            "compaction_compact_model",
+            normalize_optional_model_selection(value),
+        )
         self._reload_config()
         self._apply_config_to_controls()
 
     def _on_setting_memory_model_changed(self, value: str) -> None:
-        save_config_field("memory_model", str(value or "").strip())
+        save_config_field("memory_model", normalize_optional_model_selection(value))
         self._reload_config()
         self._apply_config_to_controls()
 

@@ -613,7 +613,7 @@ def handle_memory(chat, args):
             if hasattr(chat, "get_memory_model_status")
             else {}
         )
-        configured_model = memory_model_status.get("configured_model") or "None"
+        configured_model = memory_model_status.get("configured_model") or "auto"
         effective_model = memory_model_status.get("effective_model") or getattr(
             chat, "model", ""
         )

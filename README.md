@@ -497,10 +497,9 @@ memory/
   preferences.md
   episodes/
     YYYY-MM-DD.md
-  history.jsonl
 ```
 
-`core.md` 保存长期事实、目标和约束，`preferences.md` 保存偏好，`episodes/YYYY-MM-DD.md` 保存按日期归档的情景记忆，`history.jsonl` 保存热历史。使用 `/memory` 可以查看路径和状态，使用 `/memory prefs tidy`、`/memory prefs remove <text>`、`/memory prefs level Critical|High|Medium|Low <text>` 可以整理偏好记忆。
+`core.md` 保存长期事实、目标和约束，`preferences.md` 保存偏好，`episodes/YYYY-MM-DD.md` 保存按日期归档的情景记忆。使用 `/memory` 可以查看路径和状态，使用 `/memory prefs tidy`、`/memory prefs remove <text>`、`/memory prefs level Critical|High|Medium|Low <text>` 可以整理偏好记忆。会话级原始历史会保存在各自 session 旁边的 `.history.jsonl` 文件中。
 
 全局 `debug` 默认为 `false`。只有开启后，记忆更新才会额外写入 `memory/memory_update_diagnostics.jsonl`，用于排查模型返回的记忆 JSON、解析结果和写入状态。`memory/` 已被 `.gitignore` 忽略，默认不会提交到仓库。
 

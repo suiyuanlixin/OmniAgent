@@ -47,8 +47,9 @@ DEFAULT_COMPACTION_ENABLE = True
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
 DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75
 DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
-DEFAULT_COMPACTION_COMPACT_MODEL = ""
-DEFAULT_MEMORY_MODEL = ""
+AUTO_MODEL_SELECTION = "auto"
+DEFAULT_COMPACTION_COMPACT_MODEL = AUTO_MODEL_SELECTION
+DEFAULT_MEMORY_MODEL = AUTO_MODEL_SELECTION
 DEFAULT_DEBUG = False
 DEFAULT_AGENT_SHOW_THINKING = True
 AGENT_APPROVAL_MODES = {
@@ -303,6 +304,15 @@ def _normalize_base_url(api_type, base_url):
     if api_type == API_TYPE_GEMINI:
         return str(base_url or "").strip() or GEMINI_OPENAI_BASE_URL
     return str(base_url or "").strip()
+
+
+def normalize_optional_model_selection(value):
+    normalized = str(value or "").strip()
+    if not normalized:
+        return AUTO_MODEL_SELECTION
+    if normalized.lower() in {"none", AUTO_MODEL_SELECTION}:
+        return AUTO_MODEL_SELECTION
+    return normalized
 
 
 def _parse_positive_integer(value, label):
@@ -640,10 +650,12 @@ def _sanitize_config(data):
         ),
         compaction_trigger_ratio=compaction_trigger_ratio,
         compaction_keep_recent_messages=compaction_keep_recent_messages,
-        compaction_compact_model=str(
-            compaction_config.get("compact_model") or ""
-        ).strip(),
-        memory_model=str(memory_config.get("memory_model") or "").strip(),
+        compaction_compact_model=normalize_optional_model_selection(
+            compaction_config.get("compact_model")
+        ),
+        memory_model=normalize_optional_model_selection(
+            memory_config.get("memory_model")
+        ),
         debug=_parse_bool(data.get("debug"), DEFAULT_DEBUG),
         web_search_enable=_parse_bool(
             web_search.get("enable"), DEFAULT_WEB_SEARCH_ENABLE
@@ -847,9 +859,9 @@ def save_config_fields(fields):
                 parse_compaction_keep_recent_messages(value)
             )
         elif key == "compaction_compact_model":
-            config.compaction_compact_model = str(value or "").strip()
+            config.compaction_compact_model = normalize_optional_model_selection(value)
         elif key == "memory_model":
-            config.memory_model = str(value or "").strip()
+            config.memory_model = normalize_optional_model_selection(value)
         elif key == "debug":
             config.debug = _parse_bool(value, DEFAULT_DEBUG)
         elif key == "web_search_enable":

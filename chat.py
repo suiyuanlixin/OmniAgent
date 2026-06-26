@@ -26,6 +26,7 @@ from config import (
     API_TYPE_GLM,
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
+    AUTO_MODEL_SELECTION,
     DEFAULT_COMPACTION_TRIGGER_RATIO,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     DEFAULT_MAX_AGENT_ROUNDS,
@@ -33,6 +34,7 @@ from config import (
     GEMINI_OPENAI_BASE_URL,
     SUPPORTED_API_TYPES,
     normalize_api_type,
+    normalize_optional_model_selection,
     parse_reasoning_effort,
 )
 from memory import MemoryStore, parse_memory_update_response
@@ -223,8 +225,8 @@ class OmniAgent:
         compaction_enable=True,
         compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
         compaction_keep_recent_messages=12,
-        compaction_compact_model="",
-        memory_model="",
+        compaction_compact_model=AUTO_MODEL_SELECTION,
+        memory_model=AUTO_MODEL_SELECTION,
         debug=False,
         web_search_enabled=True,
         web_search_provider="tavily",
@@ -506,7 +508,9 @@ class OmniAgent:
         if keep_recent_messages is not None:
             self.compaction_keep_recent_messages = max(1, int(keep_recent_messages))
         if compact_model is not None:
-            self.compaction_compact_model = str(compact_model or "").strip()
+            self.compaction_compact_model = normalize_optional_model_selection(
+                compact_model
+            )
         if trigger_ratio is not None:
             ratio = float(trigger_ratio)
             if ratio <= 0 or ratio > 1:
@@ -516,14 +520,16 @@ class OmniAgent:
             self.compaction_trigger_ratio = ratio
 
     def set_memory_model(self, model):
-        self.memory_model = str(model or "").strip()
+        self.memory_model = normalize_optional_model_selection(model)
 
     def set_debug(self, enabled):
         self.debug = bool(enabled)
         self.memory_store.set_debug(self.debug)
 
     def _memory_model_name(self):
-        return self.memory_model or self.model
+        if self.memory_model == AUTO_MODEL_SELECTION:
+            return self.model
+        return self.memory_model
 
     def get_memory_model_status(self):
         return {
@@ -2548,7 +2554,11 @@ class OmniAgent:
         before_input_tokens, usage_source = self._context_tokens_for_compaction()
         token_threshold = self._compaction_token_threshold()
         keep_recent = max(1, int(self.compaction_keep_recent_messages))
-        compact_model = self.compaction_compact_model or self.model
+        compact_model = (
+            self.model
+            if self.compaction_compact_model == AUTO_MODEL_SELECTION
+            else self.compaction_compact_model
+        )
 
         if before_messages <= keep_recent:
             return {
