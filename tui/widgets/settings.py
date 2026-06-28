@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from textual import events
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
@@ -47,6 +47,10 @@ class _ModelAction(Static):
 
 class _ModelGroupTitle(Static):
     can_focus = False
+
+
+class _FooterAction(Static):
+    can_focus = True
 
 
 class SettingsModal(ModalScreen[None]):
@@ -154,7 +158,8 @@ class SettingsModal(ModalScreen[None]):
     #settings-list-scroll,
     #settings-list,
     .settings-row,
-    #settings-list-panel {
+    #settings-list-panel,
+    #settings-model-detail-list {
         width: 100%;
         height: auto;
     }
@@ -187,6 +192,13 @@ class SettingsModal(ModalScreen[None]):
         color: $TEXT_PRIMARY;
         margin: 0;
     }
+    .settings-row-stacked {
+        height: auto;
+    }
+    .settings-row-stacked-header {
+        width: 100%;
+        height: 1;
+    }
 
     .settings-row-button,
     .settings-row-button:hover,
@@ -209,8 +221,25 @@ class SettingsModal(ModalScreen[None]):
     .settings-row-button.-active .settings-name,
     .settings-row-button:hover .settings-control-trigger,
     .settings-row-button:focus .settings-control-trigger,
-    .settings-row-button.-active .settings-control-trigger {
+    .settings-row-button.-active .settings-control-trigger,
+    .settings-row-button:hover .settings-long-value,
+    .settings-row-button:focus .settings-long-value,
+    .settings-row-button.-active .settings-long-value {
         color: $PAGE_BACKGROUND;
+        background: transparent;
+    }
+    .settings-row-disabled,
+    .settings-row-disabled:hover,
+    .settings-row-disabled:focus,
+    .settings-row-disabled.-active {
+        background: transparent;
+        color: $TEXT_MUTED;
+    }
+    .settings-row-disabled .settings-name,
+    .settings-row-disabled .settings-control-trigger,
+    .settings-row-disabled .settings-long-value,
+    .settings-row-disabled .settings-value {
+        color: $TEXT_MUTED;
         background: transparent;
     }
 
@@ -227,6 +256,12 @@ class SettingsModal(ModalScreen[None]):
 
     .settings-name-editing {
         color: $TEXT_PRIMARY;
+    }
+    .settings-long-value {
+        width: 100%;
+        height: auto;
+        color: $TEXT_MUTED;
+        padding: 0 1 0 2;
     }
 
     .settings-value {
@@ -351,6 +386,39 @@ class SettingsModal(ModalScreen[None]):
         height: auto;
         padding: 0 0 0 0;
     }
+    #settings-model-detail-footer {
+        display: none;
+        width: 100%;
+        height: 1;
+        align-horizontal: right;
+        background: $SURFACE_BACKGROUND;
+        color: $TEXT_PRIMARY;
+        padding: 0 1 0 2;
+        margin-top: 1;
+    }
+    #settings-model-detail-footer.open {
+        display: block;
+    }
+    .settings-footer-action,
+    .settings-footer-action:hover,
+    .settings-footer-action:focus,
+    .settings-footer-action.-active {
+        width: auto;
+        height: 1;
+        background: transparent;
+        color: $TEXT_PRIMARY;
+        padding: 0;
+        margin-left: 2;
+        text-align: right;
+        content-align: right middle;
+    }
+    .settings-footer-action.disabled,
+    .settings-footer-action.disabled:hover,
+    .settings-footer-action.disabled:focus,
+    .settings-footer-action.disabled.-active {
+        color: $TEXT_MUTED;
+        background: transparent;
+    }
 
     .settings-model-add,
     .settings-model-add:hover,
@@ -407,6 +475,11 @@ class SettingsModal(ModalScreen[None]):
         padding: 0 0 0 1;
         margin: 0 0 0 1;
     }
+    .settings-model-item.inactive,
+    .settings-model-item.inactive:focus,
+    .settings-model-item.inactive.-active {
+        color: $TEXT_MUTED;
+    }
     .settings-model-item:hover {
         background: $TEXT_PRIMARY;
         color: $PAGE_BACKGROUND;
@@ -445,6 +518,7 @@ class SettingsModal(ModalScreen[None]):
         self._editing_row_index: int | None = None
         self._select_open_index: int | None = None
         self._render_generation: int = 0
+        self._current_footer_actions: list[dict] = []
 
         self.pages.setdefault(
             "add_model",
@@ -480,7 +554,7 @@ class SettingsModal(ModalScreen[None]):
                                 id="settings-search-gap", classes="settings-gap"
                             )
                             with Vertical(id="settings-list-panel"):
-                                with Vertical(id="settings-list-scroll"):
+                                with VerticalScroll(id="settings-list-scroll"):
                                     yield Vertical(id="settings-list")
                             with Horizontal(
                                 id="settings-model-panel", classes="hidden"
@@ -492,11 +566,17 @@ class SettingsModal(ModalScreen[None]):
                                         classes="settings-model-add",
                                     )
                                     yield Static(classes="settings-gap")
-                                    with Vertical(id="settings-model-items-scroll"):
+                                    with VerticalScroll(
+                                        id="settings-model-items-scroll"
+                                    ):
                                         yield Vertical(id="settings-model-items")
                                 with Vertical(id="settings-model-detail-wrap"):
-                                    with Vertical(id="settings-model-detail-scroll"):
+                                    with VerticalScroll(
+                                        id="settings-model-detail-scroll"
+                                    ):
                                         yield Vertical(id="settings-model-detail-list")
+                                    with Horizontal(id="settings-model-detail-footer"):
+                                        pass
                     yield HalfRowSpacer(id="settings-bottom-edge")
                 yield Static(
                     "", id="settings-outer-gap-bottom", classes="settings-outer-gap"
@@ -526,8 +606,16 @@ class SettingsModal(ModalScreen[None]):
             return
 
         if control_id == "settings-model-add-top":
+            page = self._current_page()
+            on_add_item = page.get("on_add_item")
+            if callable(on_add_item):
+                created_name = on_add_item(self._selected_model_name)
+                if created_name:
+                    self._selected_model_name = str(created_name)
+                self._render_current_page("")
+                return
             self._begin_add_model(self._selected_model_name)
-            self._push_page("add_model")
+            self._push_page(str(page.get("add_page") or "add_model"))
             return
 
         if control_id.startswith("settings-model-group-"):
@@ -535,6 +623,8 @@ class SettingsModal(ModalScreen[None]):
             if group_index is None or group_index >= len(self._model_groups):
                 return
             group = self._model_groups[group_index]
+            if not bool(group.get("allow_collapse", True)):
+                return
             api_type = str(group.get("api_type") or "")
             list_id = str(group.get("list_id") or "")
             if not list_id:
@@ -563,6 +653,19 @@ class SettingsModal(ModalScreen[None]):
                 return
             model_name = self._current_model_names[index]
             self._select_model(model_name)
+            return
+
+        if control_id.startswith("settings-footer-action-"):
+            index = self._parse_row_index(control_id, "settings-footer-action-")
+            if index is None or index >= len(self._current_footer_actions):
+                return
+            action = self._current_footer_actions[index]
+            if bool(action.get("disabled")):
+                return
+            on_activate = action.get("on_activate")
+            if callable(on_activate):
+                on_activate()
+            self._render_current_page(self._current_query())
             return
 
         if control_id.startswith("settings-row-"):
@@ -656,6 +759,7 @@ class SettingsModal(ModalScreen[None]):
         title = self.query_one("#settings-title", Static)
         back_button = self.query_one("#settings-back-btn", Static)
         close_button = self.query_one("#settings-close-btn", Static)
+        add_button = self.query_one("#settings-model-add-top", _ModelAction)
         body = self.query_one("#settings-body", Vertical)
         search_row = self.query_one("#settings-search-row", Horizontal)
         search_gap = self.query_one("#settings-search-gap", Static)
@@ -665,6 +769,7 @@ class SettingsModal(ModalScreen[None]):
         title.update(str(page.get("title") or "Settings"))
         back_button.add_class("hidden")
         close_button.update("esc")
+        add_button.update(str(page.get("add_label") or "Add model"))
 
         show_search = bool(page.get("show_search", True)) and (
             self._current_layout() == _LAYOUT_LIST
@@ -712,6 +817,9 @@ class SettingsModal(ModalScreen[None]):
     def _model_group_list_id(self, group_index: int) -> str:
         return f"settings-model-group-list-{self._render_generation}-{group_index}"
 
+    def _footer_action_id(self, action_index: int) -> str:
+        return f"settings-footer-action-{self._render_generation}-{action_index}"
+
     def _parse_row_index(self, control_id: str, prefix: str) -> int | None:
         if not control_id.startswith(prefix):
             return None
@@ -746,6 +854,8 @@ class SettingsModal(ModalScreen[None]):
 
     def _activate_row(self, row_index: int) -> None:
         row = self._visible_rows()[row_index]
+        if bool(row.get("disabled")):
+            return
         edit_type = row.get("edit_type", _EDIT_NONE)
         if edit_type == _EDIT_NAV:
             self._push_page(str(row.get("target_page") or ""))
@@ -795,13 +905,14 @@ class SettingsModal(ModalScreen[None]):
     def _update_layout_constraints(self) -> None:
         try:
             settings_stack = self.query_one("#settings-stack", Vertical)
-            list_scroll = self.query_one("#settings-list-scroll", Vertical)
+            list_scroll = self.query_one("#settings-list-scroll", VerticalScroll)
             model_items_scroll = self.query_one(
-                "#settings-model-items-scroll", Vertical
+                "#settings-model-items-scroll", VerticalScroll
             )
             model_detail_scroll = self.query_one(
-                "#settings-model-detail-scroll", Vertical
+                "#settings-model-detail-scroll", VerticalScroll
             )
+            detail_footer = self.query_one("#settings-model-detail-footer", Horizontal)
             outer_top_gap = self.query_one("#settings-outer-gap-top", Static)
             outer_bottom_gap = self.query_one("#settings-outer-gap-bottom", Static)
             search_row = self.query_one("#settings-search-row", Horizontal)
@@ -825,9 +936,14 @@ class SettingsModal(ModalScreen[None]):
         available_height = max(1, self.size.height - outer_gap_height - reserved)
 
         if self._current_layout() == _LAYOUT_MODEL_LIST:
-            detail_needed = max(1, len(self._current_rows) or 0)
+            footer_rows = 2 if detail_footer.has_class("open") else 0
+            detail_available = max(1, available_height - footer_rows)
+            detail_needed = max(
+                1,
+                sum(self._estimated_row_height(row) for row in self._current_rows) or 0,
+            )
             models_needed = max(1, int(self._model_sidebar_content_rows or 0))
-            detail_height = min(detail_needed, available_height)
+            detail_height = min(detail_needed, detail_available)
             model_items_height = min(models_needed, max(1, available_height - 2))
             sidebar_target = min(
                 max(1, detail_height - 2),
@@ -835,7 +951,7 @@ class SettingsModal(ModalScreen[None]):
             )
             model_items_height = max(model_items_height, sidebar_target)
             model_detail_scroll.styles.height = detail_height
-            model_detail_scroll.styles.max_height = available_height
+            model_detail_scroll.styles.max_height = detail_available
             model_items_scroll.styles.height = model_items_height
             model_items_scroll.styles.max_height = max(1, available_height - 2)
             list_scroll.styles.height = 1
@@ -851,9 +967,24 @@ class SettingsModal(ModalScreen[None]):
             model_detail_scroll.styles.height = 1
             model_detail_scroll.styles.max_height = 1
 
+    def _estimated_row_height(self, row: dict) -> int:
+        height = 1
+        long_value = str(row.get("long_value") or "")
+        if long_value:
+            height += max(1, len(long_value.splitlines()))
+        return height
+
     def _render_list_page(self, query: str) -> None:
         query = str(query or "").strip().lower()
         settings_list = self.query_one("#settings-list", Vertical)
+        try:
+            detail_footer = self.query_one("#settings-model-detail-footer", Horizontal)
+            for child in list(detail_footer.children):
+                child.remove()
+            detail_footer.remove_class("open")
+        except Exception:
+            pass
+        self._current_footer_actions = []
         self._render_generation += 1
         self._current_rows = self._page_rows()
         for child in list(settings_list.children):
@@ -878,9 +1009,16 @@ class SettingsModal(ModalScreen[None]):
     def _render_model_page(self) -> None:
         state = self._model_state()
         self._current_rows = [dict(row) for row in list(state.get("rows") or [])]
+        self._current_footer_actions = [
+            dict(action) for action in list(state.get("footer_actions") or [])
+        ]
         all_model_names = [str(name) for name in list(state.get("models") or [])]
         groups = list(state.get("groups") or [])
         selected_model = str(state.get("selected_model") or "")
+        item_labels = dict(state.get("item_labels") or {})
+        item_classes = dict(state.get("item_classes") or {})
+        show_group_titles = bool(state.get("show_group_titles", True))
+        allow_group_collapse = bool(state.get("allow_group_collapse", True))
         if selected_model in all_model_names:
             self._selected_model_name = selected_model
         elif all_model_names:
@@ -890,11 +1028,14 @@ class SettingsModal(ModalScreen[None]):
 
         model_items = self.query_one("#settings-model-items", Vertical)
         detail_list = self.query_one("#settings-model-detail-list", Vertical)
+        detail_footer = self.query_one("#settings-model-detail-footer", Horizontal)
         self._render_generation += 1
 
         for child in list(model_items.children):
             child.remove()
         for child in list(detail_list.children):
+            child.remove()
+        for child in list(detail_footer.children):
             child.remove()
 
         if not groups:
@@ -918,41 +1059,49 @@ class SettingsModal(ModalScreen[None]):
             api_type = str(group.get("api_type") or "")
             title = str(group.get("title") or "") or (api_type or "Other")
             group_models = [str(name) for name in list(group.get("models") or [])]
-            header_count += 1
+            if show_group_titles:
+                header_count += 1
 
             if group_index > 0:
                 model_items.mount(Static("", classes="settings-model-group-gap"))
 
-            model_items.mount(
-                _ModelGroupTitle(
-                    title,
-                    id=self._model_group_id(group_index),
-                    classes="settings-model-group",
+            if show_group_titles:
+                model_items.mount(
+                    _ModelGroupTitle(
+                        title,
+                        id=self._model_group_id(group_index),
+                        classes="settings-model-group",
+                    )
                 )
-            )
             group_list_id = self._model_group_list_id(group_index)
             group_list_classes = "settings-model-group-list"
-            if api_type in self._collapsed_model_api_types:
+            if allow_group_collapse and api_type in self._collapsed_model_api_types:
                 group_list_classes += " hidden"
             group_list = Vertical(id=group_list_id, classes=group_list_classes)
             self._model_groups.append({
                 "api_type": api_type,
                 "list_id": group_list_id,
                 "count": len(group_models),
+                "allow_collapse": allow_group_collapse,
             })
             model_items.mount(group_list)
 
             for model_name in group_models:
                 classes = "settings-model-item"
+                extra_classes = str(item_classes.get(model_name) or "").strip()
+                if extra_classes:
+                    classes += f" {extra_classes}"
                 if model_name == self._selected_model_name:
                     classes += " selected"
-                if api_type not in self._collapsed_model_api_types:
+                if (not allow_group_collapse) or (
+                    api_type not in self._collapsed_model_api_types
+                ):
                     visible_model_count += 1
                 flat_index = len(self._current_model_names)
                 self._current_model_names.append(model_name)
                 group_list.mount(
                     _ModelItem(
-                        model_name,
+                        str(item_labels.get(model_name) or model_name),
                         id=self._model_item_id(flat_index),
                         classes=classes,
                     )
@@ -972,13 +1121,29 @@ class SettingsModal(ModalScreen[None]):
         if not self._current_rows:
             detail_list.mount(Static("No model settings", classes="settings-name"))
 
-    def _build_row_widget(self, row: dict, row_index: int) -> Horizontal:
+        if self._current_footer_actions:
+            detail_footer.add_class("open")
+            for action_index, action in enumerate(self._current_footer_actions):
+                classes = "settings-footer-action"
+                if bool(action.get("disabled")):
+                    classes += " disabled"
+                detail_footer.mount(
+                    _FooterAction(
+                        str(action.get("label") or ""),
+                        id=self._footer_action_id(action_index),
+                        classes=classes,
+                    )
+                )
+        else:
+            detail_footer.remove_class("open")
+
+    def _build_row_widget(self, row: dict, row_index: int):
         edit_type = row.get("edit_type", _EDIT_NONE)
         name = str(row.get("name") or "")
-        row_children = [Static(name, classes="settings-name")]
+        header_children = [Static(name, classes="settings-name")]
 
         if edit_type == _EDIT_NONE:
-            row_children.append(
+            header_children.append(
                 Static(
                     self._display_value(row),
                     classes="settings-value settings-value-static",
@@ -1023,7 +1188,7 @@ class SettingsModal(ModalScreen[None]):
             )
             drop_container.styles.width = trigger_width
             drop_container.styles.min_width = trigger_width
-            row_children.append(drop_container)
+            header_children.append(drop_container)
         elif edit_type == _EDIT_TOGGLE:
             display_value = self._display_value(row)
             trigger = _ValueTrigger(
@@ -1038,12 +1203,12 @@ class SettingsModal(ModalScreen[None]):
                 trigger.add_class("toggle-on")
             else:
                 trigger.add_class("toggle-off")
-            row_children.append(trigger)
+            header_children.append(trigger)
         else:
             trigger_classes = "settings-control-trigger"
             if edit_type == _EDIT_NAV:
                 trigger_classes += " settings-nav-trigger"
-            row_children.append(
+            header_children.append(
                 _ValueTrigger(
                     self._display_value(row),
                     markup=False,
@@ -1057,8 +1222,19 @@ class SettingsModal(ModalScreen[None]):
             row_classes.append("settings-row-button")
         if bool(row.get("indented")):
             row_classes.append("settings-row-indented")
+        if bool(row.get("disabled")):
+            row_classes.append("settings-row-disabled")
+        long_value = str(row.get("long_value") or "")
+        if long_value:
+            row_classes.append("settings-row-stacked")
+            return Vertical(
+                Horizontal(*header_children, classes="settings-row-stacked-header"),
+                Static(long_value, classes="settings-long-value"),
+                id=self._row_widget_id(row_index),
+                classes=" ".join(row_classes),
+            )
         return Horizontal(
-            *row_children,
+            *header_children,
             id=self._row_widget_id(row_index),
             classes=" ".join(row_classes),
         )

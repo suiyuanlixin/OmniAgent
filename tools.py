@@ -45,6 +45,7 @@ from team import (
     READ_INBOX_TOOL_NAME,
     BROADCAST_TOOL_NAME,
     SHUTDOWN_TEAMMATE_TOOL_NAME,
+    display_teammate_name,
 )
 
 
@@ -2016,7 +2017,7 @@ class AgentTools:
         lines = []
         for t in roster:
             lines.append(
-                f"- {t['name']} ({t.get('role', '?')}) "
+                f"- {display_teammate_name(t['name'])} ({t.get('role', '?')}) "
                 f"[{t.get('status', 'unknown')}] "
                 f"tasks: {t.get('task_count', 0)}"
             )
@@ -2042,7 +2043,10 @@ class AgentTools:
             sender = msg.get("from", "?")
             content = str(msg.get("content", ""))
             ts = msg.get("timestamp", "?")
-            lines.append(f"[{ts}] {sender}: {content}")
+            sender_text = (
+                display_teammate_name(sender) if str(sender) != "lead" else "lead"
+            )
+            lines.append(f"[{ts}] {sender_text}: {content}")
         return "Inbox messages:\n" + "\n".join(lines)
 
     def _broadcast(self, tool_input):
@@ -2060,8 +2064,14 @@ class AgentTools:
         teammate_name = _required_string(tool_input, "teammate_name")
         removed = self.team_store.remove_teammate(teammate_name)
         if removed:
-            return f"Teammate '{teammate_name}' shutdown and removed from team."
-        return f"No active teammate found with name '{teammate_name}'."
+            return (
+                "Teammate "
+                f"'{display_teammate_name(teammate_name)}' shutdown and removed from team."
+            )
+        return (
+            "No active teammate found with name "
+            f"'{display_teammate_name(teammate_name)}'."
+        )
 
     def _web_search(self, tool_input):
         if not self.web_search_enabled:
@@ -2223,7 +2233,7 @@ class AgentTools:
         if self.todo_store.approval_state == "rejected":
             return _error_result(
                 "Current plan was rejected. Revise the plan with update_plan, "
-                "or ask the user to run /plan approve before using more tools."
+                "or ask the user to approve the updated plan before using more tools."
             )
 
         if self.approval_mode in {AGENT_APPROVAL_APPROVE, AGENT_APPROVAL_FULL}:

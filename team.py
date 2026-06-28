@@ -9,6 +9,9 @@ TEAM_STORE_DIR = ".omniagent" / Path("team")
 
 DEFAULT_TEAMMATE_MAX_TURNS = 12
 DEFAULT_TEAMMATE_TOOL_CALL_FACTOR = 4
+DEFAULT_TEAMMATE_ROLE = "Custom Teammate"
+DEFAULT_TEAMMATE_DESCRIPTION = "Custom teammate."
+DEFAULT_TEAMMATE_PROMPT = "You are a teammate in OmniAgent's team."
 
 FORBIDDEN_TEAM_TOOL_NAMES = {
     "dispatch_subagent",
@@ -177,6 +180,13 @@ _TEAMMATE_ALIASES = {
 }
 
 
+def display_teammate_name(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    return text[:1].upper() + text[1:]
+
+
 class TeamStore:
     def __init__(
         self,
@@ -185,8 +195,14 @@ class TeamStore:
     ):
         self.workspace_dir = Path(workspace_dir) if workspace_dir else None
         self.templates_dir = Path(templates_dir) if templates_dir else None
+        self._builtin_names = set(_BUILTIN_TEAMMATES.keys())
         self._specs: dict[str, TeammateSpec] = {}
+        self.reload_specs()
+
+    def reload_specs(self) -> None:
+        self._specs = {}
         self._load_builtin_specs()
+        self._load_custom_specs()
 
     @property
     def team_dir(self) -> Path | None:
@@ -218,13 +234,26 @@ class TeamStore:
                     f"Teammate '{name}' includes forbidden tools: {', '.join(forbidden)}"
                 )
             self._specs[name] = TeammateSpec(
-                name=name,
+                name=display_teammate_name(name),
                 role=config["role"],
                 description=config["description"],
                 system_prompt=self._template_prompt(name, config["system_prompt"]),
                 tool_names=tool_names,
                 max_turns=int(config["max_turns"]),
             )
+
+    def _load_custom_specs(self) -> None:
+        config = self.load_config()
+        members = config.get("members", {})
+        if not isinstance(members, dict):
+            return
+        for name, member in members.items():
+            member_name = str(name or "").strip().lower()
+            if not member_name or not isinstance(member, dict):
+                continue
+            spec = self._spec_from_data(member_name, member)
+            if spec is not None:
+                self._specs[member_name] = spec
 
     def _template_prompt(self, name: str, fallback: str) -> str:
         templates_dir = self.templates_dir
@@ -247,13 +276,51 @@ class TeamStore:
         return _TEAMMATE_ALIASES.get(key, key)
 
     def get_spec(self, name: str) -> TeammateSpec | None:
+        self.reload_specs()
         return self._specs.get(self.resolve_name(name))
 
     def names(self, *, include_aliases: bool = False) -> list[str]:
+        self.reload_specs()
         result = set(self._specs.keys())
         if include_aliases:
             result.update(_TEAMMATE_ALIASES.keys())
         return sorted(result)
+
+    def spec_records(self) -> list[dict[str, Any]]:
+        self.reload_specs()
+        config = self.load_config()
+        members = config.get("members", {})
+        if not isinstance(members, dict):
+            members = {}
+        records = []
+        for name in sorted(self._specs.keys()):
+            spec = self._specs[name]
+            source = "builtin"
+            if name in members and name in self._builtin_names:
+                source = "override"
+            elif name in members:
+                source = "custom"
+            records.append({
+                "key": name,
+                "name": spec.name,
+                "role": spec.role,
+                "description": spec.description,
+                "system_prompt": spec.system_prompt,
+                "tool_names": list(spec.tool_names),
+                "max_turns": int(spec.max_turns),
+                "source": source,
+                "builtin": name in self._builtin_names,
+                "customized": name in members,
+                "active": self.is_active(name),
+            })
+        return records
+
+    def get_spec_record(self, name: str) -> dict[str, Any] | None:
+        resolved = self.resolve_name(name)
+        for record in self.spec_records():
+            if str(record.get("key") or "") == resolved:
+                return record
+        return None
 
     def describe(self) -> str:
         lines = [
@@ -295,6 +362,113 @@ class TeamStore:
             encoding="utf-8",
         )
 
+    def save_spec(
+        self,
+        name: str,
+        *,
+        role: str,
+        description: str,
+        system_prompt: str,
+        tool_names: list[str] | tuple[str, ...],
+        max_turns: int,
+        old_name: str | None = None,
+    ) -> str:
+        old_key = self.resolve_name(old_name or name)
+        new_key = self.resolve_name(name)
+        if not new_key:
+            raise ValueError("Teammate name cannot be empty.")
+        if old_key in self._builtin_names and new_key != old_key:
+            raise ValueError("Builtin teammates cannot be renamed.")
+        if not role.strip():
+            raise ValueError("Role cannot be empty.")
+        if not description.strip():
+            raise ValueError("Description cannot be empty.")
+        if not system_prompt.strip():
+            raise ValueError("System prompt cannot be empty.")
+        max_turns = max(1, int(max_turns))
+        cleaned_tools = self._normalize_tool_names(tool_names)
+        forbidden = sorted(set(cleaned_tools) & FORBIDDEN_TEAM_TOOL_NAMES)
+        if forbidden:
+            raise ValueError(
+                "Teammate includes forbidden tools: " + ", ".join(forbidden)
+            )
+
+        config = self.load_config()
+        members = config.get("members", {})
+        if not isinstance(members, dict):
+            members = {}
+        if new_key != old_key and (new_key in self._specs or new_key in members):
+            raise ValueError(f"Teammate already exists: {new_key}")
+
+        if old_key != new_key and old_key in members:
+            members.pop(old_key, None)
+        members[new_key] = {
+            "role": role.strip(),
+            "description": description.strip(),
+            "system_prompt": system_prompt.strip(),
+            "tool_names": cleaned_tools,
+            "max_turns": max_turns,
+        }
+        config["members"] = members
+
+        teammates = config.get("teammates", [])
+        if isinstance(teammates, list) and old_key != new_key:
+            for teammate in teammates:
+                if self.resolve_name(teammate.get("name")) == old_key:
+                    teammate["name"] = display_teammate_name(new_key)
+                    teammate["role"] = role.strip()
+        elif isinstance(teammates, list):
+            for teammate in teammates:
+                if self.resolve_name(teammate.get("name")) == new_key:
+                    teammate["name"] = display_teammate_name(new_key)
+                    teammate["role"] = role.strip()
+
+        self.save_config(config)
+        if old_key != new_key:
+            self._rename_member_files(old_key, new_key)
+        self.reload_specs()
+        return new_key
+
+    def delete_spec(self, name: str) -> bool:
+        resolved = self.resolve_name(name)
+        config = self.load_config()
+        members = config.get("members", {})
+        if not isinstance(members, dict):
+            members = {}
+        if resolved not in members:
+            return False
+        members.pop(resolved, None)
+        config["members"] = members
+        if resolved not in self._builtin_names:
+            teammates = config.get("teammates", [])
+            if isinstance(teammates, list):
+                config["teammates"] = [
+                    teammate
+                    for teammate in teammates
+                    if self.resolve_name(teammate.get("name")) != resolved
+                ]
+            self._delete_member_files(resolved)
+        self.save_config(config)
+        self.reload_specs()
+        return True
+
+    def create_default_member(self, base_name: str = "member") -> str:
+        existing = set(self.names())
+        index = 1
+        candidate = str(base_name or "member").strip().lower() or "member"
+        name = candidate
+        while name in existing:
+            index += 1
+            name = f"{candidate}{index}"
+        return self.save_spec(
+            name,
+            role=DEFAULT_TEAMMATE_ROLE,
+            description=DEFAULT_TEAMMATE_DESCRIPTION,
+            system_prompt=DEFAULT_TEAMMATE_PROMPT,
+            tool_names=["read_file", "list_dir", "grep", "glob"],
+            max_turns=DEFAULT_TEAMMATE_MAX_TURNS,
+        )
+
     def get_roster(self) -> list[dict[str, Any]]:
         config = self.load_config()
         return config.get("teammates", [])
@@ -302,7 +476,7 @@ class TeamStore:
     def is_active(self, name: str) -> bool:
         roster = self.get_roster()
         resolved = self.resolve_name(name)
-        return any(t.get("name") == resolved for t in roster)
+        return any(self.resolve_name(t.get("name")) == resolved for t in roster)
 
     def add_teammate(self, name: str) -> dict[str, Any]:
         resolved = self.resolve_name(name)
@@ -311,13 +485,16 @@ class TeamStore:
             raise ValueError(f"Unknown teammate type: {name!r}")
         config = self.load_config()
         teammates = config.get("teammates", [])
-        existing = [t for t in teammates if t.get("name") == resolved]
+        existing = [
+            t for t in teammates if self.resolve_name(t.get("name")) == resolved
+        ]
         if existing:
+            existing[0]["name"] = spec.name
             existing[0]["status"] = "active"
             self.save_config(config)
             return existing[0]
         entry = {
-            "name": resolved,
+            "name": spec.name,
             "role": spec.role,
             "status": "active",
             "created_at": _now_iso(),
@@ -332,7 +509,9 @@ class TeamStore:
         resolved = self.resolve_name(name)
         config = self.load_config()
         teammates = config.get("teammates", [])
-        new_list = [t for t in teammates if t.get("name") != resolved]
+        new_list = [
+            t for t in teammates if self.resolve_name(t.get("name")) != resolved
+        ]
         if len(new_list) == len(teammates):
             return False
         config["teammates"] = new_list
@@ -344,7 +523,8 @@ class TeamStore:
         config = self.load_config()
         teammates = config.get("teammates", [])
         for t in teammates:
-            if t.get("name") == resolved:
+            if self.resolve_name(t.get("name")) == resolved:
+                t["name"] = display_teammate_name(resolved)
                 t["status"] = status
                 t["task_count"] = t.get("task_count", 0) + task_count
                 break
@@ -361,7 +541,7 @@ class TeamStore:
         }
         with open(str(inbox_path), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return f"Message sent to teammate '{resolved_to}'."
+        return f"Message sent to teammate '{display_teammate_name(resolved_to)}'."
 
     def read_inbox(self, name: str, clear: bool = False) -> list[dict[str, Any]]:
         self.ensure_dirs()
@@ -385,7 +565,9 @@ class TeamStore:
         teammates = config.get("teammates", [])
         if teammate_names:
             resolved = {self.resolve_name(n) for n in teammate_names}
-            targets = [t for t in teammates if t.get("name") in resolved]
+            targets = [
+                t for t in teammates if self.resolve_name(t.get("name")) in resolved
+            ]
         else:
             targets = teammates
         if not targets:
@@ -393,7 +575,7 @@ class TeamStore:
         sent = []
         for t in targets:
             self.send_message(from_name, t["name"], content)
-            sent.append(t["name"])
+            sent.append(display_teammate_name(t["name"]))
         return f"Broadcast sent to: {', '.join(sent)}."
 
     def save_thread(self, name: str, messages: list[dict[str, Any]]) -> None:
@@ -415,9 +597,75 @@ class TeamStore:
         except (json.JSONDecodeError, OSError):
             return []
 
+    def _spec_from_data(self, name: str, data: dict[str, Any]) -> TeammateSpec | None:
+        role = str(data.get("role") or "").strip() or DEFAULT_TEAMMATE_ROLE
+        description = (
+            str(data.get("description") or "").strip() or DEFAULT_TEAMMATE_DESCRIPTION
+        )
+        system_prompt = (
+            str(data.get("system_prompt") or "").strip() or DEFAULT_TEAMMATE_PROMPT
+        )
+        tool_names = self._normalize_tool_names(data.get("tool_names") or [])
+        forbidden = sorted(set(tool_names) & FORBIDDEN_TEAM_TOOL_NAMES)
+        if forbidden:
+            raise ValueError(
+                f"Teammate '{name}' includes forbidden tools: {', '.join(forbidden)}"
+            )
+        max_turns = int(data.get("max_turns") or DEFAULT_TEAMMATE_MAX_TURNS)
+        max_turns = max(1, max_turns)
+        return TeammateSpec(
+            name=display_teammate_name(name),
+            role=role,
+            description=description,
+            system_prompt=system_prompt,
+            tool_names=tuple(tool_names),
+            max_turns=max_turns,
+        )
+
+    def _normalize_tool_names(
+        self, tool_names: list[str] | tuple[str, ...] | str
+    ) -> list[str]:
+        if isinstance(tool_names, str):
+            parts = tool_names.split(",")
+        else:
+            parts = list(tool_names or [])
+        cleaned = []
+        for part in parts:
+            name = str(part or "").strip()
+            if name and name not in cleaned:
+                cleaned.append(name)
+        return cleaned
+
+    def _rename_member_files(self, old_name: str, new_name: str) -> None:
+        for directory in (self.inbox_dir, self.threads_dir):
+            if directory is None:
+                continue
+            old_path = directory / f"{old_name}.jsonl"
+            new_path = directory / f"{new_name}.jsonl"
+            if not old_path.exists():
+                continue
+            try:
+                if new_path.exists():
+                    new_path.unlink()
+                old_path.rename(new_path)
+            except OSError:
+                continue
+
+    def _delete_member_files(self, name: str) -> None:
+        for directory in (self.inbox_dir, self.threads_dir):
+            if directory is None:
+                continue
+            path = directory / f"{name}.jsonl"
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                continue
+
 
 def _now_iso() -> str:
     import datetime
+
     return datetime.datetime.now().isoformat()
 
 
@@ -525,9 +773,7 @@ class TeamRunner:
             if chunk_type == "content_block_start":
                 content_block = self.parent._get_field(chunk, "content_block")
                 block_type = self.parent._get_field(content_block, "type", "")
-                initial_reasoning = self.parent._anthropic_reasoning_text(
-                    content_block
-                )
+                initial_reasoning = self.parent._anthropic_reasoning_text(content_block)
                 if block_type == "text":
                     if initial_reasoning:
                         blocks.append({

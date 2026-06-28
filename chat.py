@@ -573,7 +573,11 @@ class OmniAgent:
 
     def set_team_mode(self, enabled):
         self.agent_team_enabled = bool(enabled and self.agent_tools.enabled)
+        if self.team_store is None and self.agent_tools.workspace_dir is not None:
+            self.team_store = TeamStore(workspace_dir=self.agent_tools.workspace_dir)
+            self.agent_tools.set_team_executor(self._execute_teammate)
         if self.team_store is not None:
+            self.team_store.reload_specs()
             self.agent_tools.set_team_config(
                 team_store=self.team_store,
                 team_enabled=self.agent_team_enabled,

@@ -277,60 +277,13 @@ Agent 模式类似 Claude Code 的本地工具调用流程：模型可以请求�
 | `read_skill` | 读取匹配 skill 的 `SKILL.md` 和可选附加文件。 |
 | `dispatch_subagent` | 派发独立 history 的子智能体处理阅读、研究、审计或小范围实现任务；结果只以摘要回填主上下文。 |
 
-开启 agent 模式：
-
-```text
-/agent on
-```
-
-关闭 agent 模式：
-
-```text
-/agent off
-```
-
-查看 agent 状态：
+Agent 模式会根据当前是否选中项目自动决定是否可用；相关开关与参数统一在设置页面中调整：
 
 ```text
 /agent
 ```
 
-设置 agent 预算：
-
-```text
-/agent budget 12 40
-```
-
-设置 agent 审批模式：
-
-```text
-/agent approve confirm
-/agent approve auto
-```
-
-设置 agent thinking 显示：
-
-```text
-/agent show-thinking true
-/agent show-thinking false
-/agent plan on
-/agent plan off
-```
-
-查看、批准或恢复 Agent plan：
-
-```text
-/plan
-/plan check
-/plan approve
-/plan reject
-/plan retry <item-id>
-/plan unblock <item-id>
-/plan history
-/plan clear
-```
-
-多步骤任务中，Agent 会先用 `update_plan` 创建计划。`agent_mode.approve=confirm` 时，执行非计划工具前会要求确认；`auto` 会自动批准工作目录内的低风险流程。计划和事件日志保存在 `<workspace>/.omniagent/plans/`，整个 `.omniagent/` 已被 `.gitignore` 忽略。可用 `agent_mode.plan_mode=false` 或 `/agent plan off` 关闭 plan 系统；关闭后 Agent 不会强制计划审批，也不会显示 Plan 面板。
+多步骤任务中，Agent 会先用 `update_plan` 创建内部计划。计划和事件日志保存在 `<workspace>/.omniagent/plans/`，整个 `.omniagent/` 已被 `.gitignore` 忽略。
 
 子智能体在 Agent 模式中默认可用，无需额外配置。主 Agent 可通过 `dispatch_subagent` 派发 `reader`、`researcher`、`auditor` 或 `builder`，也支持别名 `general -> builder`、`investigator -> researcher`。每个子智能体都有独立上下文和工具白名单，不能再派发子智能体，也不能调用 `update_plan` 或 `ask_user`；主 Agent 仍负责维护计划、最终校验和面向用户的结论。`builder` 的写文件和命令能力沿用当前 `agent_mode.approve` 审批策略。
 
@@ -415,56 +368,15 @@ Skills 只提供工作流指导，不会执行 skill 里的脚本，也不能覆
 
 | 命令 | 说明 |
 | --- | --- |
-| `/help` | 显示所有可用命令。 |
+| `/help` | 打开命令帮助页面，左侧显示命令，右侧显示简要介绍。 |
 | `/quit` | 退出程序。 |
 | `/clear` | 清空当前会话上下文。 |
-| `/save` | 将当前会话保存到 `record/`。 |
-| `/load` | 从 `record/` 选择并加载历史会话。 |
-| `/conf` | 重新配置 API 类型、地址、模型、密钥和参数；配置成功后会重新初始化客户端并清空当前上下文。 |
-| `/conf reload` | 从 `config.json` 重新加载配置并应用到当前会话。 |
-| `/token` | 查看当前 `max_tokens`。 |
-| `/token <num>` | 设置 `max_tokens`，例如 `/token 8192`。 |
-| `/temp` | 查看当前 `temperature`。 |
-| `/temp <val>` | 设置 `temperature`，例如 `/temp 0.7`。 |
-| `/mode` | 查看当前输出模式。 |
-| `/mode normal` | 切换到普通输出模式。 |
-| `/mode stream` | 切换到流式输出模式。 |
-| `/think` | 查看当前推理 / 思考内容展示模式。 |
-| `/think on` | 开启推理 / 思考内容展示。 |
-| `/think off` | 关闭推理 / 思考内容展示。 |
 | `/comp` | 立即按当前 auto_compact 配置压缩会话上下文；消息数不超过 `keep_recent_messages` 时会取消压缩。 |
-| `/plan` | 查看当前 Agent plan、审批状态、预算和计划文件路径。 |
-| `/plan check` | 查看当前 plan 质量检查结果。 |
-| `/plan approve [note]` / `/plan reject [reason]` | 手动批准或拒绝当前 Agent 计划。 |
-| `/plan retry <item-id>` / `/plan unblock <item-id>` | 将 failed 或 blocked 的计划项恢复为可继续执行。 |
-| `/plan history [limit]` / `/plan clear` | 查看计划事件日志或清空当前 plan。 |
-| `/memory` | 查看持久记忆文件、记忆模型、debug 状态和主要记忆内容。 |
-| `/memory core` / `/memory prefs` / `/memory today` | 查看核心记忆、偏好记忆或当天情景记忆。 |
-| `/memory date YYYY-MM-DD` / `/memory search <query>` | 查看指定日期情景记忆或搜索情景记忆。 |
-| `/memory history` / `/memory path` | 查看热历史摘要或持久记忆文件路径。 |
-| `/memory prefs tidy` / `/memory prefs remove <text>` / `/memory prefs level <level> <text>` | 整理、删除或调整偏好记忆等级。 |
-| `/search` / `/search status` | 查看网络搜索状态、provider、结果数、深度和 topic。 |
-| `/search on` / `/search off` | 开启或关闭网络搜索。 |
-| `/search key <tavily-api-key>` | 将 Tavily API Key 写入 `config.json`。 |
-| `/search provider tavily` | 设置网络搜索 provider。当前只支持 `tavily`。 |
-| `/search max <1-20>` / `/search depth basic|fast|ultra-fast|advanced` / `/search topic general|news|finance` | 调整网络搜索返回数量、搜索深度和主题。 |
-| `/agent` | 查看当前 agent 状态。 |
-| `/agent on` | 开启 agent 模式。 |
-| `/agent off` | 关闭 agent 模式。 |
-| `/agent stop` | 请求停止当前正在运行的 agent 任务。 |
-| `/agent budget <rounds> <tool-calls>` | 设置每次请求的 agent 工具循环轮数和工具调用次数上限。 |
-| `/agent approve confirm` / `/agent approve auto` | 设置 Agent 写操作审批模式。 |
-| `/agent show-thinking true` / `/agent show-thinking false` | 控制 agent thinking 是否在 UI 中显示，不改变模型 thinking 是否开启。 |
-| `/agent plan on` / `/agent plan off` | 开启或关闭 Agent plan 系统。关闭后不注入 `update_plan`，也不会强制计划审批。 |
-| `/skills` | 查看 agent skills 状态、来源和读取限制。 |
-| `/skills on` / `/skills off` / `/skills reload` | 开启、关闭或重新加载 agent skills。 |
-| `/skills app on` / `/skills app off` | 开启或关闭程序目录 skills 来源。 |
-| `/skills workspace on` / `/skills workspace off` | 开启或关闭工作目录 `.omniagent/skills/` 来源，开启时目录不存在会自动创建。 |
-| `/skills catalog on` / `/skills catalog off` | 控制是否把 skills 摘要自动加入 Agent system prompt。 |
-| `/skills max-chars <num>` | 设置单次读取 skill 文件的最大字符数。 |
-| `/skills search clawhub|skillhub <query>` | 从 ClawHub 或 SkillHub 搜索可安装 skills。 |
-| `/skills inspect clawhub:<slug>` / `/skills inspect skillhub:<owner>/<name>` | 查看远程 skill 元数据、文件列表、警告和安装目标。 |
-| `/skills install clawhub:<slug>` / `/skills install skillhub:<owner>/<name>` | 安装远程 skill，支持 `--workspace`、`--app`、`--dry-run`、`--force`、`--yes`、`--version`、`--registry`。 |
+| `/memory` | 打开独立记忆页面，左侧切换核心记忆、偏好记忆、情景记忆，右侧查看内容。 |
+| `/search` | 打开 Web Search 设置页面。 |
+| `/skills` | 打开 Skills 设置页面。 |
+| `/agent` | 打开 Skills 设置页面。 |
+| `/team` | 打开 Team 页面，查看开关、可用 teammate 和当前活跃 teammate。 |
 | `Ctrl+C` | 中断并退出程序。 |
 
 ## 输出模式
@@ -499,19 +411,13 @@ memory/
     YYYY-MM-DD.md
 ```
 
-`core.md` 保存长期事实、目标和约束，`preferences.md` 保存偏好，`episodes/YYYY-MM-DD.md` 保存按日期归档的情景记忆。使用 `/memory` 可以查看路径和状态，使用 `/memory prefs tidy`、`/memory prefs remove <text>`、`/memory prefs level Critical|High|Medium|Low <text>` 可以整理偏好记忆。会话级原始历史会保存在各自 session 旁边的 `.history.jsonl` 文件中。
+`core.md` 保存长期事实、目标和约束，`preferences.md` 保存偏好，`episodes/YYYY-MM-DD.md` 保存按日期归档的情景记忆。`/memory` 会打开独立记忆页面，左侧切换三类记忆，右侧查看内容；情景记忆按从新到旧显示。会话级原始历史会保存在各自 session 旁边的 `.history.jsonl` 文件中。
 
 全局 `debug` 默认为 `false`。只有开启后，记忆更新才会额外写入 `memory/memory_update_diagnostics.jsonl`，用于排查模型返回的记忆 JSON、解析结果和写入状态。`memory/` 已被 `.gitignore` 忽略，默认不会提交到仓库。
 
 ## 会话记录
 
-使用 `/save` 后，程序会在 `record/` 下生成类似下面的文件：
-
-```text
-record/2026-04-25-22-33.json
-```
-
-记录文件结构：
+会话会自动持久化到 session 目录，对应的快照文件结构如下：
 
 ```json
 {
@@ -610,7 +516,7 @@ ollama run qwen3
 python main.py D:\Code
 ```
 
-未传入工作目录时，`/agent on` 会被拒绝，并显示 `No workspace directory`。
+未传入工作目录时，Agent 相关能力不会激活。
 
 **网络搜索显示 `missing key`**
 

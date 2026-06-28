@@ -12,7 +12,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Button, Input, Label, Static
 
 from chat import OmniAgent
-from commands import process_command
+from commands import COMMANDS, process_command
 from config import (
     API_TYPE_ANTHROPIC,
     API_TYPE_GEMINI,
@@ -28,6 +28,7 @@ from config import (
     save_config_field,
     save_config_fields,
 )
+from memory import MemoryStore
 from main import attach_external_file_references_with_media
 from search import TAVILY_SEARCH_DEPTHS, TAVILY_TOPICS, WEB_SEARCH_PROVIDERS
 from session import (
@@ -52,10 +53,13 @@ from tui.widgets.chat_view import ChatView
 from tui.widgets.choice_modal import ChoiceModal
 from tui.widgets.confirm_modal import ConfirmModal
 from tui.widgets.input_modal import InputModal
+from tui.widgets.memory_modal import MemoryModal
 from tui.widgets.project_modal import ProjectModal
 from tui.widgets.project_picker import ProjectPicker
 from tui.widgets.settings import SettingsModal
 from tui.widgets.sidebar import Sidebar
+from tui.widgets.text_area_modal import TextAreaModal
+from team import TeamStore, display_teammate_name
 from ui import clean_display_text, clean_display_text_preserve_newlines
 
 
@@ -323,7 +327,7 @@ class AgentTUIApp(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self.config = load_config()
+        self._config_cache = load_config()
         self.chat: OmniAgent | None = None
         self.chat_busy = False
         self.current_session_record: dict | None = None
@@ -334,7 +338,15 @@ class AgentTUIApp(App):
         self._message_started_at: float | None = None
         self._thinking_started_at: float | None = None
         self._thinking_elapsed_timer = None
-        self._settings_skills_sources_expanded = False
+
+    @property
+    def config(self):
+        self._config_cache = load_config()
+        return self._config_cache
+
+    @config.setter
+    def config(self, value) -> None:
+        self._config_cache = value
 
     def _model_profile_choices(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = [(AUTO_MODEL_SELECTION, AUTO_MODEL_SELECTION)]
@@ -411,23 +423,28 @@ class AgentTUIApp(App):
             self.add_status_message("[!]", "上一条消息还在处理中。")
             return
 
-        try:
-            self._ensure_ready_for_message()
-        except Exception as error:
-            self.add_status_message("[✗]", f"初始化对话失败: {error}")
-            return
+        is_command = str(event.content or "").startswith("/")
+        if not is_command:
+            try:
+                self._ensure_ready_for_message()
+            except Exception as error:
+                self.add_status_message("[✗]", f"初始化对话失败: {error}")
+                return
 
-        self.start_chat()
         chat_view = self.query_one("#messages-view", ChatView)
-        chat_view.add_message("user", event.content)
+        if not is_command:
+            self.start_chat()
+            chat_view.add_message("user", event.content)
         chat_view.reset_explored()
         self._set_controls_locked(True)
         self._set_input_enabled(False)
         self.chat_busy = True
         self._message_started_at = perf_counter()
         self._thinking_started_at = None
-        new_session = self.current_session_record is not None and (
-            not self.current_session_record.get("conversation")
+        new_session = (
+            (not is_command)
+            and self.current_session_record is not None
+            and (not self.current_session_record.get("conversation"))
         )
         worker = threading.Thread(
             target=self._process_user_message,
@@ -905,8 +922,10 @@ class AgentTUIApp(App):
         widget = self.query_one("#message-input", Input)
         widget.disabled = not enabled
 
-    def _open_settings(self) -> None:
-        self.push_screen(SettingsModal(pages=self._settings_pages(), app=self))
+    def _open_settings(self, page_id: str = "root") -> None:
+        self.push_screen(
+            SettingsModal(pages=self._settings_pages(), app=self, page_id=page_id)
+        )
 
     def _settings_pages(self) -> dict[str, dict]:
         return {
@@ -947,6 +966,20 @@ class AgentTUIApp(App):
                 "title": "Web search",
                 "layout": "list",
                 "rows": self._settings_web_search_rows,
+            },
+            "help": {
+                "title": "Commands",
+                "layout": "list",
+                "show_search": False,
+                "rows": self._help_command_rows,
+            },
+            "team": {
+                "title": "Team",
+                "layout": "model_list",
+                "show_search": False,
+                "add_label": "Add member",
+                "state": self._settings_team_page_state,
+                "on_add_item": self._on_setting_add_team_member,
             },
         }
 
@@ -996,6 +1029,19 @@ class AgentTUIApp(App):
             },
         ]
 
+    def _help_command_rows(self) -> list[dict]:
+        return [
+            {
+                "name": command,
+                "value": description,
+                "keywords": f"{command} {description}",
+                "edit_type": "none",
+            }
+            for command, description in sorted(
+                COMMANDS.items(), key=lambda item: item[0]
+            )
+        ]
+
     def _settings_model_page_state(self, selected_name: str = "") -> dict:
         models = [name for name in self.config.model_list.keys()]
         current_model = (
@@ -1022,6 +1068,13 @@ class AgentTUIApp(App):
             "groups": groups,
             "selected_model": current_model,
             "rows": self._settings_model_rows(),
+            "footer_actions": [
+                {
+                    "label": "Delete",
+                    "disabled": not bool(current_model),
+                    "on_activate": self._on_setting_delete_current_model,
+                }
+            ],
         }
 
     def _settings_model_rows(self) -> list[dict]:
@@ -1127,15 +1180,6 @@ class AgentTUIApp(App):
                     ),
                 },
             )
-        rows.append({"name": "", "value": "", "edit_type": "none"})
-        rows.append({
-            "name": "",
-            "value": "Delete",
-            "keywords": "delete",
-            "edit_type": "action",
-            "show_value": True,
-            "on_activate": self._on_setting_delete_current_model,
-        })
         return rows
 
     def _on_setting_model_name_changed(self, value: str) -> None:
@@ -1196,11 +1240,6 @@ class AgentTUIApp(App):
             },
         ]
 
-    def _toggle_settings_skills_sources(self) -> None:
-        self._settings_skills_sources_expanded = (
-            not self._settings_skills_sources_expanded
-        )
-
     def _settings_skills_rows(self) -> list[dict]:
         bool_choices = [("true", "true"), ("false", "false")]
         rows = [
@@ -1214,10 +1253,29 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Sources",
-                "value": "v" if self._settings_skills_sources_expanded else ">",
+                "value": "",
                 "keywords": "sources app workspace",
-                "edit_type": "action",
-                "on_activate": self._toggle_settings_skills_sources,
+                "edit_type": "none",
+            },
+            {
+                "name": "App",
+                "value": "true" if self.config.skills_source_app else "false",
+                "keywords": "sources app",
+                "edit_type": "toggle",
+                "options": bool_choices,
+                "indented": True,
+                "on_change": lambda v: self._on_setting_skills_source_app_changed(v),
+            },
+            {
+                "name": "Workspace",
+                "value": "true" if self.config.skills_source_workspace else "false",
+                "keywords": "sources workspace",
+                "edit_type": "toggle",
+                "options": bool_choices,
+                "indented": True,
+                "on_change": lambda v: self._on_setting_skills_source_workspace_changed(
+                    v
+                ),
             },
             {
                 "name": "Auto catalog",
@@ -1235,31 +1293,6 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_skills_max_changed(v),
             },
         ]
-        if self._settings_skills_sources_expanded:
-            rows[2:2] = [
-                {
-                    "name": "App",
-                    "value": "true" if self.config.skills_source_app else "false",
-                    "keywords": "sources app",
-                    "edit_type": "toggle",
-                    "options": bool_choices,
-                    "indented": True,
-                    "on_change": lambda v: self._on_setting_skills_source_app_changed(
-                        v
-                    ),
-                },
-                {
-                    "name": "Workspace",
-                    "value": "true" if self.config.skills_source_workspace else "false",
-                    "keywords": "sources workspace",
-                    "edit_type": "toggle",
-                    "options": bool_choices,
-                    "indented": True,
-                    "on_change": lambda v: (
-                        self._on_setting_skills_source_workspace_changed(v)
-                    ),
-                },
-            ]
         return rows
 
     def _settings_auto_compact_rows(self) -> list[dict]:
@@ -1376,6 +1409,507 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_search_topic_changed(v),
             },
         ]
+
+    def _team_store_for_page(self) -> TeamStore | None:
+        project = self._project_from_session(self.current_session_record)
+        workspace_dir = project.path if project is not None else None
+        if self.chat is not None and getattr(self.chat, "team_store", None) is not None:
+            self.chat.team_store.reload_specs()
+            return self.chat.team_store
+        return TeamStore(workspace_dir=workspace_dir)
+
+    def _current_settings_modal(self) -> SettingsModal | None:
+        screen = self.screen
+        if isinstance(screen, SettingsModal):
+            return screen
+        return None
+
+    def _set_settings_selected_item(self, name: str) -> None:
+        modal = self._current_settings_modal()
+        if modal is not None:
+            modal._selected_model_name = str(name or "")
+
+    def _refresh_settings_modal(self) -> None:
+        modal = self._current_settings_modal()
+        if modal is not None:
+            modal._render_current_page(modal._current_query())
+
+    def _team_status_for_page(self) -> dict:
+        store = self._team_store_for_page()
+        roster = store.get_roster() if store is not None else []
+        available_types = store.names() if store is not None else []
+        return {
+            "enabled": bool(self.config.agent_team_enable),
+            "active_count": len(roster),
+            "teammates": roster,
+            "available_types": available_types,
+        }
+
+    def _team_records_for_page(self) -> list[dict]:
+        store = self._team_store_for_page()
+        return store.spec_records() if store is not None else []
+
+    def _team_record_for_page(self, name: str = "") -> dict | None:
+        records = self._team_records_for_page()
+        if not records:
+            return None
+        target = str(name or "").strip().lower()
+        for record in records:
+            if (
+                str(record.get("key") or "") == target
+                or str(record.get("name") or "").strip().lower() == target
+            ):
+                return record
+        return records[0]
+
+    def _settings_team_page_state(self, selected_name: str = "") -> dict:
+        records = self._team_records_for_page()
+        names = [str(record.get("name") or "") for record in records]
+        selected = self._team_record_for_page(selected_name)
+        selected_name = str((selected or {}).get("name") or "")
+        selected_key = str((selected or {}).get("key") or "")
+        source = str((selected or {}).get("source") or "builtin")
+        can_delete = source == "custom"
+        can_reset = bool((selected or {}).get("builtin")) and bool(
+            (selected or {}).get("customized")
+        )
+        return {
+            "models": names,
+            "groups": [{"api_type": "members", "title": "", "models": names}],
+            "selected_model": selected_name,
+            "show_group_titles": False,
+            "allow_group_collapse": False,
+            "item_classes": {},
+            "rows": self._settings_team_member_rows(selected_name),
+            "footer_actions": [
+                {
+                    "label": "Delete",
+                    "disabled": not selected_key or not can_delete,
+                    "on_activate": (
+                        lambda current=selected_key: (
+                            self._on_setting_team_member_deleted(current)
+                        )
+                    ),
+                },
+                {
+                    "label": "Reset",
+                    "disabled": not selected_key or not can_reset,
+                    "on_activate": (
+                        lambda current=selected_key: self._on_setting_team_member_reset(
+                            current
+                        )
+                    ),
+                },
+            ],
+        }
+
+    def _settings_team_member_rows(self, teammate_name: str) -> list[dict]:
+        record = self._team_record_for_page(teammate_name)
+        status = self._team_status_for_page()
+        roster_by_name = {
+            str(self._team_store_for_page().resolve_name(item.get("name"))): item
+            for item in list(status.get("teammates") or [])
+        }
+        record_key = str((record or {}).get("key") or "")
+        teammate = roster_by_name.get(record_key)
+        if record is None:
+            return [{"name": "No members", "value": "", "edit_type": "none"}]
+        can_rename = not bool(record.get("builtin"))
+        source = str(record.get("source") or "builtin")
+        source_label = {
+            "builtin": "Builtin",
+            "override": "Override",
+            "custom": "Custom",
+        }.get(source, source.title())
+        description_text = str(record.get("description") or "").strip() or "(empty)"
+        tools_text = "\n".join(
+            str(tool) for tool in list(record.get("tool_names") or [])
+        )
+        if not tools_text:
+            tools_text = "(empty)"
+        rows = [
+            {
+                "name": "Enable",
+                "value": "true" if self.config.agent_team_enable else "false",
+                "keywords": "team enable",
+                "edit_type": "toggle",
+                "options": [("true", "true"), ("false", "false")],
+                "on_change": lambda v: self._on_setting_team_enabled_changed(v),
+            },
+            {
+                "name": "Name",
+                "value": str(record.get("name") or ""),
+                "keywords": "name teammate name",
+                "edit_type": "input" if can_rename else "none",
+                "on_change": lambda v, current=record_key: (
+                    self._on_setting_team_member_name_changed(current, v)
+                ),
+            },
+            {
+                "name": "Role",
+                "value": str(record.get("role") or ""),
+                "keywords": "role",
+                "edit_type": "input",
+                "on_change": lambda v, current=record_key: (
+                    self._on_setting_team_member_field_changed(current, "role", v)
+                ),
+            },
+            {
+                "name": "Description",
+                "value": "Edit",
+                "keywords": "description",
+                "edit_type": "action",
+                "show_value": True,
+                "long_value": description_text,
+                "on_activate": lambda current=record_key: (
+                    self._open_team_description_editor(current)
+                ),
+            },
+            {
+                "name": "Max turns",
+                "value": str(record.get("max_turns") or ""),
+                "keywords": "max turns rounds",
+                "edit_type": "input",
+                "on_change": lambda v, current=record_key: (
+                    self._on_setting_team_member_field_changed(current, "max_turns", v)
+                ),
+            },
+            {
+                "name": "Tools",
+                "value": "Edit",
+                "keywords": "tools tool names",
+                "edit_type": "action",
+                "show_value": True,
+                "long_value": tools_text,
+                "on_activate": lambda current=record_key: self._open_team_tools_editor(
+                    current
+                ),
+            },
+            {
+                "name": "System prompt",
+                "value": "Edit",
+                "keywords": "system prompt edit",
+                "edit_type": "action",
+                "show_value": True,
+                "on_activate": lambda current=record_key: self._open_team_prompt_editor(
+                    current
+                ),
+            },
+            {
+                "name": "Source",
+                "value": source_label,
+                "keywords": "source builtin custom override",
+                "edit_type": "none",
+            },
+            {
+                "name": "Active",
+                "value": "true" if teammate else "false",
+                "keywords": "active running spawned",
+                "edit_type": "none",
+            },
+            {
+                "name": "Task count",
+                "value": str((teammate or {}).get("task_count") or 0),
+                "keywords": "task count",
+                "edit_type": "none",
+            },
+        ]
+        if teammate:
+            rows.append({
+                "name": "Runtime status",
+                "value": str(teammate.get("status") or "active"),
+                "keywords": "runtime status",
+                "edit_type": "none",
+            })
+            rows.append({
+                "name": "Runtime",
+                "value": "Shutdown",
+                "keywords": "shutdown stop teammate",
+                "edit_type": "action",
+                "show_value": True,
+                "on_activate": lambda current=record_key: (
+                    self._on_setting_team_shutdown(current)
+                ),
+            })
+        return rows
+
+    def _sync_team_store_from_page(self) -> TeamStore | None:
+        store = self._team_store_for_page()
+        if store is not None:
+            store.reload_specs()
+        if self.chat is not None and getattr(self.chat, "team_store", None) is not None:
+            self.chat.team_store.reload_specs()
+        return store
+
+    def _on_setting_team_enabled_changed(self, value: str) -> None:
+        enabled = str(value or "").lower() in ("on", "true", "yes")
+        save_config_field("agent_team_enable", enabled)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_team_mode(enabled)
+        self._apply_config_to_controls()
+
+    def _on_setting_add_team_member(self, _selected_name: str = "") -> str:
+        store = self._sync_team_store_from_page()
+        if store is None or store.config_path is None:
+            self.add_status_message("[!]", "请先选择项目后再创建 team 成员。")
+            return ""
+        try:
+            created = store.create_default_member("member")
+        except Exception as error:
+            self.add_status_message("[✗]", f"新增成员失败: {error}")
+            return ""
+        record = store.get_spec_record(created)
+        selected_name = str(
+            (record or {}).get("name") or display_teammate_name(created)
+        )
+        self._set_settings_selected_item(selected_name)
+        return selected_name
+
+    def _save_team_member_record(self, current_name: str, **changes) -> str:
+        store = self._sync_team_store_from_page()
+        if store is None or store.config_path is None:
+            raise ValueError("请先选择项目后再编辑 team 成员。")
+        record = store.get_spec_record(current_name)
+        if record is None:
+            raise ValueError(f"Unknown teammate: {current_name}")
+        saved_name = store.save_spec(
+            str(changes.get("name", record.get("name")) or ""),
+            old_name=current_name,
+            role=str(changes.get("role", record.get("role")) or ""),
+            description=str(
+                changes.get("description", record.get("description")) or ""
+            ),
+            system_prompt=str(
+                changes.get("system_prompt", record.get("system_prompt")) or ""
+            ),
+            tool_names=changes.get("tool_names", record.get("tool_names") or []),
+            max_turns=int(changes.get("max_turns", record.get("max_turns") or 1)),
+        )
+        self._sync_team_store_from_page()
+        saved_record = store.get_spec_record(saved_name)
+        self._set_settings_selected_item(
+            str((saved_record or {}).get("name") or display_teammate_name(saved_name))
+        )
+        return saved_name
+
+    def _on_setting_team_member_name_changed(
+        self, current_name: str, value: str
+    ) -> None:
+        new_name = str(value or "").strip()
+        if not new_name or new_name == current_name:
+            return
+        try:
+            self._save_team_member_record(current_name, name=new_name)
+        except Exception as error:
+            self.add_status_message("[✗]", f"重命名成员失败: {error}")
+
+    def _on_setting_team_member_field_changed(
+        self, current_name: str, field: str, value: str
+    ) -> None:
+        payload = {}
+        if field == "max_turns":
+            try:
+                payload[field] = max(1, int(str(value or "").strip()))
+            except (TypeError, ValueError):
+                self.add_status_message("[!]", "Max turns 必须是正整数。")
+                return
+        elif field == "tool_names":
+            payload[field] = [
+                part.strip() for part in str(value or "").split(",") if part.strip()
+            ]
+        else:
+            payload[field] = str(value or "").strip()
+        try:
+            self._save_team_member_record(current_name, **payload)
+        except Exception as error:
+            self.add_status_message("[✗]", f"更新成员失败: {error}")
+
+    def _open_team_prompt_editor(self, teammate_name: str) -> None:
+        record = self._team_record_for_page(teammate_name)
+        if record is None:
+            return
+        self.push_screen(
+            TextAreaModal(
+                f"Edit prompt: {record.get('name')}",
+                value=str(record.get("system_prompt") or ""),
+            ),
+            callback=lambda result, current=teammate_name: (
+                self._handle_team_prompt_result(current, result)
+            ),
+        )
+
+    def _open_team_description_editor(self, teammate_name: str) -> None:
+        record = self._team_record_for_page(teammate_name)
+        if record is None:
+            return
+        self.push_screen(
+            TextAreaModal(
+                f"Edit description: {record.get('name')}",
+                value=str(record.get("description") or ""),
+            ),
+            callback=lambda result, current=teammate_name: (
+                self._handle_team_description_result(current, result)
+            ),
+        )
+
+    def _handle_team_description_result(
+        self, teammate_name: str, result: str | None
+    ) -> None:
+        if result is None:
+            return
+        try:
+            self._save_team_member_record(
+                teammate_name, description=str(result).strip()
+            )
+        except Exception as error:
+            self.add_status_message("[✗]", f"保存 description 失败: {error}")
+            return
+        self._refresh_settings_modal()
+
+    def _open_team_tools_editor(self, teammate_name: str) -> None:
+        record = self._team_record_for_page(teammate_name)
+        if record is None:
+            return
+        value = "\n".join(str(tool) for tool in list(record.get("tool_names") or []))
+        self.push_screen(
+            TextAreaModal(
+                f"Edit tools: {record.get('name')}",
+                value=value,
+            ),
+            callback=lambda result, current=teammate_name: (
+                self._handle_team_tools_result(current, result)
+            ),
+        )
+
+    def _handle_team_tools_result(self, teammate_name: str, result: str | None) -> None:
+        if result is None:
+            return
+        tool_names = []
+        for line in str(result).splitlines():
+            for part in line.split(","):
+                name = part.strip()
+                if name and name not in tool_names:
+                    tool_names.append(name)
+        try:
+            self._save_team_member_record(teammate_name, tool_names=tool_names)
+        except Exception as error:
+            self.add_status_message("[✗]", f"保存 tools 失败: {error}")
+            return
+        self._refresh_settings_modal()
+
+    def _handle_team_prompt_result(
+        self, teammate_name: str, result: str | None
+    ) -> None:
+        if result is None or result == "":
+            return
+        try:
+            self._save_team_member_record(teammate_name, system_prompt=str(result))
+        except Exception as error:
+            self.add_status_message("[✗]", f"保存 prompt 失败: {error}")
+            return
+        self._refresh_settings_modal()
+
+    def _on_setting_team_member_deleted(self, name: str) -> None:
+        store = self._sync_team_store_from_page()
+        if store is None:
+            return
+        removed = store.delete_spec(name)
+        if not removed:
+            self.add_status_message(
+                "[!]", f"未找到可删除的成员定义: {display_teammate_name(name)}"
+            )
+            return
+        records = store.spec_records()
+        next_name = str((records[0].get("name") if records else "") or "")
+        self._set_settings_selected_item(next_name)
+        self.add_status_message("[✓]", f"已删除成员定义: {display_teammate_name(name)}")
+
+    def _on_setting_team_member_reset(self, name: str) -> None:
+        store = self._sync_team_store_from_page()
+        if store is None:
+            return
+        record = store.get_spec_record(name)
+        if record is None:
+            return
+        if not bool(record.get("builtin")):
+            self.add_status_message(
+                "[!]", f"仅内置成员支持重置: {display_teammate_name(name)}"
+            )
+            return
+        if not bool(record.get("customized")):
+            self.add_status_message(
+                "[!]", f"成员未被修改，无需重置: {display_teammate_name(name)}"
+            )
+            return
+        removed = store.delete_spec(name)
+        if not removed:
+            self.add_status_message("[!]", f"重置失败: {display_teammate_name(name)}")
+            return
+        refreshed = store.get_spec_record(name)
+        self._set_settings_selected_item(
+            str((refreshed or {}).get("name") or display_teammate_name(name))
+        )
+        self.add_status_message("[✓]", f"已重置成员定义: {display_teammate_name(name)}")
+
+    def _on_setting_team_shutdown(self, name: str) -> None:
+        removed = False
+        if self.chat is not None and getattr(self.chat, "team_store", None) is not None:
+            try:
+                removed = bool(self.chat.team_store.remove_teammate(name))
+            except Exception:
+                removed = False
+        else:
+            store = self._team_store_for_page()
+            if store is not None:
+                try:
+                    removed = bool(store.remove_teammate(name))
+                except Exception:
+                    removed = False
+        if removed:
+            self.add_status_message(
+                "[✓]", f"已关闭 teammate: {display_teammate_name(name)}"
+            )
+        else:
+            self.add_status_message(
+                "[!]", f"未找到 teammate: {display_teammate_name(name)}"
+            )
+
+    def _memory_store_for_page(self) -> MemoryStore:
+        history_path = ""
+        if self.current_session_record is not None:
+            history_path = str(
+                self.current_session_record.get("history_path") or ""
+            ).strip()
+        return MemoryStore(debug=self.config.debug, history_path=history_path or None)
+
+    def _memory_sections(self) -> list[dict]:
+        store = self._memory_store_for_page()
+        episodic_blocks = []
+        for path in sorted(
+            store.episodic_dir.glob("*.md"), key=lambda item: item.stem, reverse=True
+        ):
+            if not path.is_file():
+                continue
+            body = store.episodic_for_date(path.stem)
+            if body:
+                episodic_blocks.append(f"## {path.stem}\n\n{body}")
+        return [
+            {"id": "core", "label": "Core memory", "content": store.read_core_body()},
+            {
+                "id": "prefs",
+                "label": "Preference memory",
+                "content": store.read_preference_body(),
+            },
+            {
+                "id": "episodic",
+                "label": "Episodic memory",
+                "content": "\n\n".join(episodic_blocks),
+            },
+        ]
+
+    def _open_memory(self) -> None:
+        self.push_screen(MemoryModal(self._memory_sections()))
 
     def _sync_chat_from_active_model(self) -> None:
         if self.chat is None:
@@ -1843,11 +2377,23 @@ class AgentTUIApp(App):
 
     def _process_command_message(self, command_text: str) -> None:
         base = command_text.split(maxsplit=1)[0].lower()
-        if base == "/save":
-            self._call_ui(self._finish_save_command)
+        if base == "/help":
+            self._call_ui(self._finish_open_settings_page_command, "help")
             return
-        if base == "/conf" and len(command_text.split()) == 1:
-            self._call_ui(self._finish_open_settings_command)
+        if base == "/memory":
+            self._call_ui(self._finish_open_memory_command)
+            return
+        if base == "/team":
+            self._call_ui(self._finish_open_settings_page_command, "team")
+            return
+        if base == "/search":
+            self._call_ui(self._finish_open_settings_page_command, "web_search")
+            return
+        if base == "/skills":
+            self._call_ui(self._finish_open_settings_page_command, "skills")
+            return
+        if base == "/agent":
+            self._call_ui(self._finish_open_settings_page_command, "agent_mode")
             return
 
         should_continue = process_command(
@@ -1866,20 +2412,22 @@ class AgentTUIApp(App):
         self.chat = self._build_chat(record)
         return self.chat
 
-    def _finish_save_command(self) -> None:
-        self._persist_current_session()
+    def _finish_open_settings_page_command(self, page_id: str) -> None:
         self.chat_busy = False
         self._set_input_enabled(True)
-        self.add_status_message("[✓]", "当前会话已保存。")
+        self._set_controls_locked(False)
+        self._open_settings(page_id)
 
-    def _finish_open_settings_command(self) -> None:
+    def _finish_open_memory_command(self) -> None:
         self.chat_busy = False
         self._set_input_enabled(True)
-        self._open_settings()
+        self._set_controls_locked(False)
+        self._open_memory()
 
     def _after_command(self, base: str, should_continue) -> None:
         self.chat_busy = False
         self._set_input_enabled(True)
+        self._set_controls_locked(False)
         self._apply_config_to_controls()
         if should_continue is False:
             self.exit()
@@ -1888,9 +2436,7 @@ class AgentTUIApp(App):
             self._reset_chat_state()
             self.add_status_message("[✓]", "对话历史已清空。")
             return
-        if base == "/conf":
-            self._sync_chat_view_with_history()
-        self._persist_current_session(refresh_sidebar=base in {"/conf"})
+        self._persist_current_session()
 
     def _finish_response(self, response) -> None:
         self._pause_thinking_elapsed_timer()
