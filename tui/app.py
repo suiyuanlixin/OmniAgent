@@ -9,7 +9,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.widgets import Button, Input, Label, Static
+from textual.widgets import Button, Label, Static, TextArea
 
 from chat import OmniAgent
 from commands import COMMANDS, process_command
@@ -919,7 +919,7 @@ class AgentTUIApp(App):
         self.query_one("#chat-input", ChatInput).set_controls_locked(locked)
 
     def _set_input_enabled(self, enabled: bool) -> None:
-        widget = self.query_one("#message-input", Input)
+        widget = self.query_one("#message-input", TextArea)
         widget.disabled = not enabled
 
     def _open_settings(self, page_id: str = "root") -> None:

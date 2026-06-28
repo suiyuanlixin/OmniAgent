@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import os
+from time import perf_counter
 from textual import events
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, Container, VerticalScroll
-from textual.widgets import Button, Input, Static
+from textual.strip import Strip
+from textual.widgets import Button, Static, TextArea
 from textual.widget import Widget
 from textual.message import Message
 from textual.reactive import reactive
 
+from rich.cells import cell_len
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 
@@ -32,6 +38,10 @@ PLAN_OPTIONS_WIDTH = (
     + OPTION_CONTENT_GUTTER
 )
 COMMAND_MENU_MAX_HEIGHT = 10
+INPUT_MAX_HEIGHT = 10
+MODIFIER_LATCH_WINDOW = 0.12
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
 COMMAND_HINTS = {
     "/agent": "Open agent page",
     "/clear": "Reset chat",
@@ -49,6 +59,11 @@ COMMAND_SUGGESTIONS = [
         COMMANDS.items(), key=lambda item: str(item[0]).lower()
     )
 ]
+
+try:
+    import ctypes
+except ImportError:  # pragma: no cover - only relevant on non-Windows
+    ctypes = None
 
 
 class HalfRowSpacer(Static):
@@ -158,6 +173,129 @@ class CommandMenuRow(Static, can_focus=False):
         event.stop()
 
 
+class MessageTextArea(TextArea):
+    BINDINGS = [
+        Binding(
+            "ctrl+a",
+            "select_all",
+            "Select all",
+            show=False,
+            priority=True,
+        ),
+        Binding(
+            "shift+enter",
+            "chat_insert_newline",
+            "Insert newline",
+            show=False,
+            priority=True,
+        ),
+        Binding(
+            "ctrl+enter",
+            "chat_insert_newline",
+            "Insert newline",
+            show=False,
+            priority=True,
+        ),
+        Binding(
+            "ctrl+shift+enter",
+            "chat_submit",
+            "Submit message",
+            show=False,
+            priority=True,
+        ),
+    ] + TextArea.BINDINGS
+
+    def __init__(self, owner: ChatInput, text: str = "", **kwargs) -> None:
+        super().__init__(text, **kwargs)
+        self._owner = owner
+        self._handling_paste = False
+
+    async def _on_key(self, event: events.Key) -> None:
+        if self._is_undo_granularity_key(event):
+            self.history.checkpoint()
+        if self._owner._handle_message_key(event, self):
+            return
+        await super()._on_key(event)
+
+    async def _on_paste(self, event: events.Paste) -> None:
+        self._handling_paste = True
+        try:
+            await super()._on_paste(event)
+        finally:
+            self._handling_paste = False
+
+    def action_cursor_up(self, select: bool = False) -> None:
+        if self._owner._handle_command_menu_navigation(-1):
+            return
+        super().action_cursor_up(select=select)
+
+    def action_cursor_down(self, select: bool = False) -> None:
+        if self._owner._handle_command_menu_navigation(1):
+            return
+        super().action_cursor_down(select=select)
+
+    def action_chat_insert_newline(self) -> None:
+        self._owner._insert_message_newline(self)
+
+    def action_chat_submit(self) -> None:
+        self._owner._submit_message_input()
+
+    def _replace_via_keyboard(self, insert: str, start, end):
+        if (
+            not self._handling_paste
+            and start == end
+            and len(insert) > 1
+            and "\n" not in insert
+        ):
+            result = None
+            cursor = start
+            for character in insert:
+                self.history.checkpoint()
+                result = self.replace(
+                    character,
+                    cursor,
+                    cursor,
+                    maintain_selection_offset=False,
+                )
+                cursor = result.end_location
+            return result
+        return super()._replace_via_keyboard(insert, start, end)
+
+    def _is_undo_granularity_key(self, event: events.Key) -> bool:
+        if not self.selection.is_empty:
+            return True
+        key = str(event.key or "")
+        if event.is_printable:
+            return True
+        if key in {"enter", "ctrl+j", "ctrl+m"}:
+            return True
+        aliases = {str(alias) for alias in getattr(event, "aliases", []) or []}
+        return "newline" in aliases
+
+    def render_line(self, y: int):
+        if y == 0 and not self.text:
+            width = max(1, self.size.width)
+            hint = "Type a message..."
+            placeholder_style = Style(color=TEXT_MUTED, bgcolor=SURFACE_BACKGROUND)
+            padded_hint = hint[:width].ljust(width)
+            theme = self._theme
+            if theme:
+                theme.apply_css(self)
+                draw_cursor = self.has_focus and (
+                    not self.cursor_blink or self._cursor_visible
+                )
+                if draw_cursor and theme.cursor_style:
+                    return Strip(
+                        [
+                            Segment(padded_hint[:1], theme.cursor_style),
+                            Segment(padded_hint[1:], placeholder_style),
+                        ],
+                        cell_length=width,
+                    )
+            return Strip([Segment(padded_hint, placeholder_style)], cell_length=width)
+        return super().render_line(y)
+
+
 class ChatInput(Widget):
     """Chat input bar with config-driven model/thinking selectors."""
 
@@ -186,7 +324,8 @@ class ChatInput(Widget):
     #message-row {
         width: 100%;
         height: auto;
-        padding-bottom: 1;
+        padding: 0 0 1 0;
+        background: $SURFACE_BACKGROUND;
     }
 
     #command-menu-shell {
@@ -248,10 +387,22 @@ class ChatInput(Widget):
     #message-input {
         width: 100%;
         height: 1;
+        max-height: 10;
         border: none;
-        background: transparent;
+        background: $SURFACE_BACKGROUND;
         color: $TEXT_PRIMARY;
-        padding: 0 0 0 1;
+        padding: 0 1 0 1;
+        scrollbar-size: 0 0;
+        & .text-area--cursor-line {
+            background: $SURFACE_BACKGROUND;
+        }
+        & .text-area--selection {
+            background: $SURFACE_BACKGROUND;
+        }
+    }
+    #message-input:focus {
+        border: none;
+        background: $SURFACE_BACKGROUND;
     }
 
     #input-area Button {
@@ -389,6 +540,9 @@ class ChatInput(Widget):
         super().__init__(*args, **kwargs)
         self._command_selection_index = 0
         self._visible_command_suggestions = list(COMMAND_SUGGESTIONS)
+        self._last_shift_down_at = 0.0
+        self._last_ctrl_down_at = 0.0
+        self._modifier_timer = None
 
     class Send(Message):
         def __init__(self, content: str) -> None:
@@ -429,6 +583,13 @@ class ChatInput(Widget):
         self._fit_trigger_to_label("plan")
         self._set_approval_level(self.selected_approval_value)
         self._update_plan_build()
+        if os.name == "nt":
+            self._modifier_timer = self.set_interval(0.02, self._sample_modifier_keys)
+        self.call_after_refresh(self._update_input_height)
+
+    def on_unmount(self) -> None:
+        if self._modifier_timer is not None:
+            self._modifier_timer.pause()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="command-menu-shell"):
@@ -436,9 +597,12 @@ class ChatInput(Widget):
             yield VerticalScroll(id="command-menu")
         with Vertical(id="input-area"):
             with Horizontal(id="message-row"):
-                yield Input(
-                    placeholder="Type a message...",
+                yield MessageTextArea(
+                    self,
+                    "",
                     id="message-input",
+                    soft_wrap=True,
+                    show_line_numbers=False,
                 )
 
             with Horizontal(id="controls-row"):
@@ -592,36 +756,18 @@ class ChatInput(Widget):
         self._fit_trigger_to_label(prefix)
         self._close_all_dropdowns()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "message-input":
-            if self._is_command_menu_open():
-                self._execute_selected_command()
-                return
-            self._do_send()
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "message-input":
-            self._refresh_command_menu(event.value)
-
-    def on_key(self, event: events.Key) -> None:
-        focused = getattr(self.app, "focused", None)
-        if getattr(focused, "id", None) != "message-input":
+    def on_text_area_changed(self, event) -> None:
+        if getattr(getattr(event, "text_area", None), "id", None) != "message-input":
             return
-        if not self._is_command_menu_open():
-            return
-        if event.key == "up":
-            self._move_command_selection(-1)
-            event.stop()
-        elif event.key == "down":
-            self._move_command_selection(1)
-            event.stop()
+        self._refresh_command_menu(event.text_area.text)
+        self.call_after_refresh(self._update_input_height)
 
     def _do_send(self) -> None:
-        msg_input = self.query_one("#message-input", Input)
-        content = msg_input.value.strip()
+        msg_input = self._message_input()
+        content = msg_input.text.strip()
         if content:
             self.post_message(self.Send(content))
-            msg_input.value = ""
+            msg_input.load_text("")
             self._hide_command_menu()
 
     def watch_plan_mode(self, value: bool) -> None:
@@ -704,7 +850,7 @@ class ChatInput(Widget):
         text = str(value or "")
         if not text.startswith("/"):
             return False
-        return " " not in text.strip()
+        return not any(char.isspace() for char in text[1:])
 
     def _refresh_command_menu(self, value: str) -> None:
         if not self.is_mounted or not self._is_command_mode(value):
@@ -712,7 +858,7 @@ class ChatInput(Widget):
             self._sync_command_rows()
             self._hide_command_menu()
             return
-        token = str(value or "").strip().lower()
+        token = str(value or "").lower()
         self._visible_command_suggestions = [
             (command, description)
             for command, description in COMMAND_SUGGESTIONS
@@ -796,7 +942,7 @@ class ChatInput(Widget):
             )
 
     def _suggested_command_index(self, value: str) -> int:
-        token = str(value or "").strip().lower()
+        token = str(value or "").lower()
         for index, (command, _) in enumerate(self._visible_command_suggestions):
             if command.startswith(token):
                 return index
@@ -806,12 +952,102 @@ class ChatInput(Widget):
         if not self._visible_command_suggestions:
             return
         command = self._visible_command_suggestions[self._command_selection_index][0]
-        msg_input = self.query_one("#message-input", Input)
-        msg_input.value = ""
+        msg_input = self._message_input()
+        msg_input.load_text("")
         self._visible_command_suggestions = list(COMMAND_SUGGESTIONS)
         self._sync_command_rows()
         self._hide_command_menu()
         self.post_message(self.Send(command))
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.call_after_refresh(self._update_input_height)
+
+    def _message_input(self) -> MessageTextArea:
+        return self.query_one("#message-input", MessageTextArea)
+
+    def _handle_command_menu_navigation(self, step: int) -> bool:
+        if not self._is_command_menu_open():
+            return False
+        self._move_command_selection(step)
+        return True
+
+    def _handle_message_key(
+        self, event: events.Key, text_area: MessageTextArea
+    ) -> bool:
+        key = str(event.key or "")
+        aliases = {str(alias) for alias in getattr(event, "aliases", []) or []}
+        parts = key.split("+")
+        normalized_enter = key in {"enter", "ctrl+j", "ctrl+m"} or "newline" in aliases
+        if not normalized_enter and parts[-1] != "enter":
+            return False
+        modifiers = (
+            set()
+            if normalized_enter and key in {"ctrl+j", "ctrl+m"} | aliases
+            else set(parts[:-1])
+        )
+        if os.name == "nt":
+            ctrl_recent = self._ctrl_modifier_active()
+            shift_recent = self._shift_modifier_active(ctrl_recent)
+            if shift_recent:
+                modifiers.add("shift")
+            if ctrl_recent:
+                modifiers.add("ctrl")
+        if modifiers in ({"shift"}, {"ctrl"}):
+            event.stop()
+            event.prevent_default()
+            self._insert_message_newline(text_area)
+            return True
+        if modifiers in (set(), {"ctrl", "shift"}):
+            event.stop()
+            event.prevent_default()
+            self._submit_message_input()
+            return True
+        return False
+
+    def _insert_message_newline(self, text_area: MessageTextArea | None = None) -> None:
+        target = text_area or self._message_input()
+        start, end = target.selection
+        target._replace_via_keyboard("\n", start, end)
+        self.call_after_refresh(self._update_input_height)
+
+    def _submit_message_input(self) -> None:
+        if self._is_command_menu_open():
+            self._execute_selected_command()
+        else:
+            self._do_send()
+
+    def _update_input_height(self) -> None:
+        if not self.is_mounted:
+            return
+        text_area = self._message_input()
+        width = max(1, text_area.content_region.width)
+        lines = str(text_area.text or "").split("\n") or [""]
+        height = 0
+        for line in lines:
+            line_width = max(1, cell_len(line))
+            height += max(1, (line_width + width - 1) // width)
+        text_area.styles.height = max(1, min(INPUT_MAX_HEIGHT, height))
+
+    def _sample_modifier_keys(self) -> None:
+        now = perf_counter()
+        if _windows_key_down(VK_SHIFT):
+            self._last_shift_down_at = now
+        if _windows_key_down(VK_CONTROL):
+            self._last_ctrl_down_at = now
+
+    def _ctrl_modifier_active(self) -> bool:
+        now = perf_counter()
+        return _windows_key_down(VK_CONTROL) or (
+            now - self._last_ctrl_down_at <= MODIFIER_LATCH_WINDOW
+        )
+
+    def _shift_modifier_active(self, ctrl_active: bool = False) -> bool:
+        if _windows_key_down(VK_SHIFT):
+            return True
+        if not ctrl_active:
+            return False
+        now = perf_counter()
+        return now - self._last_shift_down_at <= MODIFIER_LATCH_WINDOW
 
     def _rebuild_dropdown(self, prefix, options, selected_value):
         trigger = self.query_one(f"#{prefix}-trigger", Button)
@@ -862,3 +1098,12 @@ class ChatInput(Widget):
                 break
         trigger.label = selected_label
         self._fit_trigger_to_label(prefix)
+
+
+def _windows_key_down(virtual_key: int) -> bool:
+    if os.name != "nt" or ctypes is None:
+        return False
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(virtual_key) & 0x8000)
+    except Exception:
+        return False
