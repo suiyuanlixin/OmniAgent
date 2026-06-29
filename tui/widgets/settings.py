@@ -1274,6 +1274,16 @@ class SettingsModal(ModalScreen[None]):
 
     def _start_input_edit(self, row_index: int) -> None:
         self._close_select_options()
+        if self._editing_row_index == row_index:
+            try:
+                row_widget = self.query_one(
+                    f"#{self._row_widget_id(row_index)}", Horizontal
+                )
+                input_widget = row_widget.query_one("#settings-edit-input", Input)
+                input_widget.focus()
+                return
+            except Exception:
+                pass
         if self._editing_row_index is not None:
             self._finish_input_edit()
 

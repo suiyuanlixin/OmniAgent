@@ -397,7 +397,8 @@ class ChatInput(Widget):
             background: $SURFACE_BACKGROUND;
         }
         & .text-area--selection {
-            background: $SURFACE_BACKGROUND;
+            background: $TEXT_PRIMARY;
+            color: $SURFACE_BACKGROUND;
         }
     }
     #message-input:focus {
@@ -543,6 +544,8 @@ class ChatInput(Widget):
         self._last_shift_down_at = 0.0
         self._last_ctrl_down_at = 0.0
         self._modifier_timer = None
+        self._model_button_values: dict[str, str] = {}
+        self._model_dropdown_serial = 0
 
     class Send(Message):
         def __init__(self, content: str) -> None:
@@ -664,6 +667,13 @@ class ChatInput(Widget):
             self._set_approval_level(value)
             self._select_dropdown_option("approval", str(event.button.label))
             self.post_message(self.ApprovalChanged(str(event.button.label), value))
+        elif btn_id and btn_id.startswith("model-option-"):
+            value = self._model_button_values.get(btn_id, "")
+            if not value:
+                return
+            self.selected_model_value = value
+            self._select_dropdown_option("model", str(event.button.label))
+            self.post_message(self.ModelChanged(str(event.button.label), value))
         elif btn_id and btn_id.startswith("model-"):
             value = btn_id.removeprefix("model-")
             self.selected_model_value = value
@@ -1065,8 +1075,7 @@ class ChatInput(Widget):
             self._update_dropdown_trigger(prefix, normalized, selected_value)
             return
 
-        for child in list(container.children):
-            child.remove()
+        container.remove_children()
 
         max_width = (
             max(len(label) for label, _ in normalized)
@@ -1075,8 +1084,15 @@ class ChatInput(Widget):
         )
         self._set_options_width(prefix, max_width)
         selected_label = normalized[0][0]
-        for label, value in normalized:
-            button = Button(label, id=f"{prefix}-{value}")
+        if prefix == "model":
+            self._model_dropdown_serial += 1
+            self._model_button_values = {}
+        for index, (label, value) in enumerate(normalized):
+            button_id = f"{prefix}-{value}"
+            if prefix == "model":
+                button_id = f"model-option-{self._model_dropdown_serial}-{index}"
+                self._model_button_values[button_id] = value
+            button = Button(label, id=button_id)
             container.mount(button)
             if value == selected_value:
                 selected_label = label
