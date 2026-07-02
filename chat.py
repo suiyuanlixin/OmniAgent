@@ -9,6 +9,7 @@ from ui import (
     add_explored_entry,
     clean_and_print_stream_response,
     clean_display_text,
+    dbg_event,
     finish_thinking_round,
     print_error,
     print_info,
@@ -62,7 +63,6 @@ from team import (
 
 AGENT_CONTEXT_WARN_CHARS = 180000
 AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
-NORMAL_WEB_SEARCH_MAX_ROUNDS = 3
 COMPACTION_MAX_TOKENS = 2048
 MEMORY_UPDATE_MAX_TOKENS = 4096
 COMPACTION_SUMMARY_PREFIX = "[Compressed conversation summary for continuity]"
@@ -293,6 +293,7 @@ class OmniAgent:
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
+        self._last_tool_display = None
         self.resume_existing_plan = False
         self.configure(
             api_type,
@@ -493,6 +494,9 @@ class OmniAgent:
     def _normal_web_search_available(self):
         return bool(self.agent_tools.web_search_available)
 
+    def _normal_web_search_tool_limit(self):
+        return max(1, int(self.max_agent_tool_calls))
+
     def _normal_tools_available(self):
         return True
 
@@ -637,6 +641,13 @@ class OmniAgent:
         stream_callback_response=None,
         media_references=None,
     ):
+        dbg_event(
+            "chat.send.start",
+            api_type=self.api_type,
+            stream_mode=bool(self.stream_mode),
+            thinking_mode=bool(self.thinking_mode),
+            agent_mode=bool(self.agent_mode),
+        )
         user_content = self._user_message_content(user_message, media_references)
         self.conversation_history.append({"role": "user", "content": user_content})
         self._record_preference_signal(user_message)
@@ -651,17 +662,21 @@ class OmniAgent:
                 self.agent_mode = False
 
             if self.agent_mode:
+                dbg_event("chat.send.branch", branch="agent")
                 response = self._agent_response()
             elif self._normal_tools_available():
+                dbg_event("chat.send.branch", branch="normal_tools")
                 response = self._normal_web_search_response(
                     stream_callback_thinking,
                     stream_callback_response,
                 )
             elif self.stream_mode:
+                dbg_event("chat.send.branch", branch="stream")
                 response = self._stream_response(
                     stream_callback_thinking, stream_callback_response, self.model
                 )
             elif self.api_type == API_TYPE_ANTHROPIC:
+                dbg_event("chat.send.branch", branch="anthropic")
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=self.max_tokens,
@@ -672,16 +687,27 @@ class OmniAgent:
                 )
                 response = self._parse_anthropic_response(response)
             elif self.api_type == API_TYPE_OLLAMA:
+                dbg_event("chat.send.branch", branch="ollama")
                 response = self.client.chat(
                     **self._ollama_chat_kwargs(messages=self.conversation_history)
                 )
                 response = self._parse_ollama_response(response)
             else:
+                dbg_event("chat.send.branch", branch="openai-nonstream")
                 response = self.client.chat.completions.create(
                     **self._chat_completion_kwargs(messages=self.conversation_history)
                 )
                 response = self._parse_response(response)
 
+            dbg_event(
+                "chat.send.done",
+                has_response=bool(response is not None),
+                agent_stopped=bool((response or {}).get("agent_stopped")),
+                thinking_streamed=(response or {}).get("thinking_streamed"),
+                response_streamed=(response or {}).get("response_streamed"),
+            )
+            if response and not response.get("agent_stopped"):
+                self._record_hot_history(user_message_index)
             if response is None:
                 self._restore_history(original_history)
             elif response.get("agent_stopped"):
@@ -689,7 +715,6 @@ class OmniAgent:
             elif self.agent_mode:
                 self._compact_agent_history(user_message_index, response)
             if response and not response.get("agent_stopped"):
-                self._record_hot_history(user_message, response)
                 self._auto_compact_context()
             return response
 
@@ -836,8 +861,10 @@ class OmniAgent:
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_use.get("id", ""),
+                    "tool_name": tool_use.get("name", ""),
                     "content": tool_result,
                     "is_error": tool_result.startswith("ERROR:"),
+                    "display": self._consume_last_tool_display(),
                 })
             self.conversation_history.append({"role": "user", "content": tool_results})
             finish_thinking_round()
@@ -1060,7 +1087,7 @@ class OmniAgent:
         full_thinking = ""
         final_response = ""
 
-        for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+        for _ in range(self._normal_web_search_tool_limit()):
             response = self.client.chat.completions.create(
                 **self._chat_completion_kwargs(
                     messages=self.conversation_history,
@@ -1107,7 +1134,7 @@ class OmniAgent:
         full_thinking = ""
         final_response = ""
 
-        for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+        for _ in range(self._normal_web_search_tool_limit()):
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
                     messages=self.conversation_history,
@@ -1154,7 +1181,7 @@ class OmniAgent:
         full_thinking = ""
         final_response = ""
 
-        for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+        for _ in range(self._normal_web_search_tool_limit()):
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -1208,10 +1235,26 @@ class OmniAgent:
                 tool_call.get("name", ""),
                 tool_call.get("arguments", {}),
             )
+            display = self._tool_display_for_result(
+                tool_call.get("name", ""),
+                tool_call.get("arguments", {}),
+                tool_result,
+            )
+            # #region debug-point D:normal-websearch-tool-result
+            dbg_event(
+                "debug.normal_websearch.tool_result",
+                provider=provider,
+                tool_name=str(tool_call.get("name", "") or ""),
+                has_error=str(tool_result or "").startswith("ERROR:"),
+                display_kind=str((display or {}).get("kind") or ""),
+            )
+            # #endregion
             if provider == "ollama":
                 self.conversation_history.append(
                     self._ollama_tool_result_message(
-                        tool_call.get("name", ""), tool_result
+                        tool_call.get("name", ""),
+                        tool_result,
+                        display=display,
                     )
                 )
             else:
@@ -1220,6 +1263,7 @@ class OmniAgent:
                         tool_call.get("id", ""),
                         tool_call.get("name", ""),
                         tool_result,
+                        display=display,
                     )
                 )
 
@@ -1231,10 +1275,8 @@ class OmniAgent:
             return self.agent_tools.execute(name, arguments)
         if name != "web_search":
             return _error_text(f"Tool is not available in normal mode: {name}")
-        query = str(arguments.get("query") or "").strip()
-        kwargs = {key: value for key, value in arguments.items() if key != "query"}
         try:
-            return self.agent_tools.search_web(query, **kwargs)
+            return self.agent_tools.execute(name, arguments)
         except Exception as error:
             return _error_text(str(error))
 
@@ -1282,21 +1324,31 @@ class OmniAgent:
             )
             full_thinking = ""
             final_response = ""
+            response_started = False
 
-            for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+            for _ in range(self._normal_web_search_tool_limit()):
                 (
                     assistant_message,
                     thinking,
                     text,
                     tool_calls,
-                    _response_started,
+                    response_started,
                 ) = self._stream_chat_completion_normal_web_search_turn(
                     full_thinking,
-                    False,
+                    response_started,
                     tracked_callback_thinking,
                     stream_callback_response,
                     emit_response=True,
                 )
+                # #region debug-point A:normal-websearch-chat-round
+                dbg_event(
+                    "debug.normal_websearch.chat.round",
+                    response_started=response_started,
+                    tool_call_count=len(tool_calls or []),
+                    text_len=len(str(text or "")),
+                    thinking_len=len(str(thinking or "")),
+                )
+                # #endregion
                 full_thinking += thinking
 
                 if not tool_calls:
@@ -1307,16 +1359,20 @@ class OmniAgent:
                         stream_callback_response,
                         tracked_callback_thinking,
                         thinking_streamed["streamed"],
-                        _response_started=_response_started,
+                        _response_started=response_started,
                     )
 
                 self.conversation_history.append(assistant_message)
+                if self.thinking_mode:
+                    finish_thinking_round()
                 self._append_normal_web_search_tool_results(tool_calls, provider="chat")
+                if self.thinking_mode:
+                    print_stream_thinking("")
 
             return self._stream_normal_web_search_round_limit_response(
                 full_thinking,
                 final_response,
-                False,
+                response_started,
                 stream_callback_response,
                 tracked_callback_thinking,
                 thinking_streamed["streamed"],
@@ -1517,21 +1573,31 @@ class OmniAgent:
             )
             full_thinking = ""
             final_response = ""
+            response_started = False
 
-            for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+            for _ in range(self._normal_web_search_tool_limit()):
                 (
                     assistant_message,
                     thinking,
                     text,
                     tool_calls,
-                    _response_started,
+                    response_started,
                 ) = self._stream_ollama_normal_web_search_turn(
                     full_thinking,
-                    False,
+                    response_started,
                     tracked_callback_thinking,
                     stream_callback_response,
                     emit_response=True,
                 )
+                # #region debug-point A:normal-websearch-ollama-round
+                dbg_event(
+                    "debug.normal_websearch.ollama.round",
+                    response_started=response_started,
+                    tool_call_count=len(tool_calls or []),
+                    text_len=len(str(text or "")),
+                    thinking_len=len(str(thinking or "")),
+                )
+                # #endregion
                 full_thinking += thinking
 
                 if not tool_calls:
@@ -1542,7 +1608,7 @@ class OmniAgent:
                         stream_callback_response,
                         tracked_callback_thinking,
                         thinking_streamed["streamed"],
-                        _response_started=_response_started,
+                        _response_started=response_started,
                     )
 
                 self.conversation_history.append(assistant_message)
@@ -1553,7 +1619,7 @@ class OmniAgent:
             return self._stream_normal_web_search_round_limit_response(
                 _clean_reasoning_text(full_thinking),
                 final_response,
-                False,
+                response_started,
                 stream_callback_response,
                 tracked_callback_thinking,
                 thinking_streamed["streamed"],
@@ -1723,21 +1789,31 @@ class OmniAgent:
             )
             full_thinking = ""
             final_response = ""
+            response_started = False
 
-            for _ in range(NORMAL_WEB_SEARCH_MAX_ROUNDS):
+            for _ in range(self._normal_web_search_tool_limit()):
                 (
                     blocks,
                     thinking,
                     text,
                     tool_uses,
-                    _response_started,
+                    response_started,
                 ) = self._stream_anthropic_normal_web_search_turn(
                     full_thinking,
-                    False,
+                    response_started,
                     tracked_callback_thinking,
                     stream_callback_response,
                     emit_response=True,
                 )
+                # #region debug-point A:normal-websearch-anthropic-round
+                dbg_event(
+                    "debug.normal_websearch.anthropic.round",
+                    response_started=response_started,
+                    tool_use_count=len(tool_uses or []),
+                    text_len=len(str(text or "")),
+                    thinking_len=len(str(thinking or "")),
+                )
+                # #endregion
                 full_thinking += thinking
 
                 if not tool_uses:
@@ -1751,7 +1827,7 @@ class OmniAgent:
                         stream_callback_response,
                         tracked_callback_thinking,
                         thinking_streamed["streamed"],
-                        _response_started=_response_started,
+                        _response_started=response_started,
                     )
 
                 self.conversation_history.append({
@@ -1767,8 +1843,14 @@ class OmniAgent:
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_use.get("id", ""),
+                        "tool_name": tool_use.get("name", ""),
                         "content": tool_result,
                         "is_error": tool_result.startswith("ERROR:"),
+                        "display": self._tool_display_for_result(
+                            tool_use.get("name", ""),
+                            tool_use.get("input", {}),
+                            tool_result,
+                        ),
                     })
                 self.conversation_history.append({
                     "role": "user",
@@ -1778,7 +1860,7 @@ class OmniAgent:
             return self._stream_normal_web_search_round_limit_response(
                 full_thinking,
                 final_response,
-                False,
+                response_started,
                 stream_callback_response,
                 tracked_callback_thinking,
                 thinking_streamed["streamed"],
@@ -2006,6 +2088,12 @@ class OmniAgent:
     def _start_normal_stream_response(self, response_started, thinking):
         if response_started:
             return True
+        # #region debug-point E:normal-response-start
+        dbg_event(
+            "debug.normal_websearch.response_start",
+            thinking_len=len(str(thinking or "")),
+        )
+        # #endregion
         print_stream_response_start(self.model)
         return True
 
@@ -2049,7 +2137,10 @@ class OmniAgent:
         stream_callback_thinking=None,
         thinking_streamed=False,
     ):
-        message = "Normal-mode tools stopped after reaching the round limit."
+        message = (
+            "Normal-mode tools stopped after "
+            f"{self._normal_web_search_tool_limit()} tool calls."
+        )
         thinking_printed_now, thinking_streamed = (
             self._stream_normal_thinking_if_needed(
                 thinking,
@@ -2057,6 +2148,16 @@ class OmniAgent:
                 thinking_streamed,
             )
         )
+        # #region debug-point B:normal-websearch-round-limit
+        dbg_event(
+            "debug.normal_websearch.round_limit",
+            response_started=response_started,
+            thinking_len=len(str(thinking or "")),
+            response_len=len(str(response or "")),
+            thinking_printed_now=thinking_printed_now,
+            thinking_streamed=thinking_streamed,
+        )
+        # #endregion
         if response_started or thinking:
             if not thinking_printed_now:
                 pass
@@ -2115,7 +2216,10 @@ class OmniAgent:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
-        message = "Normal-mode tools stopped after reaching the round limit."
+        message = (
+            "Normal-mode tools stopped after "
+            f"{self._normal_web_search_tool_limit()} tool calls."
+        )
         print_error(message)
         if not response:
             return {
@@ -2453,6 +2557,14 @@ class OmniAgent:
         self.agent_thinking_needs_separator = False
 
     def _before_agent_visible_output(self):
+        # #region debug-point C:agent-visible-output
+        dbg_event(
+            "debug.agent.visible_output",
+            agent_thinking_needs_separator=bool(self.agent_thinking_needs_separator),
+            agent_response_started=bool(self.agent_response_started),
+        )
+        # #endregion
+        finish_thinking_round()
         self._separate_after_agent_thinking()
 
     def _warn_agent_context_if_needed(self):
@@ -2959,19 +3071,27 @@ class OmniAgent:
         except Exception as error:
             print_warn(f"Failed to record preference memory: {error}")
 
-    def _record_hot_history(self, user_message, response):
+    def _record_hot_history(self, history_start):
         try:
+            history_start = max(0, int(history_start or 0))
             extra = {
                 "model": self.model,
                 "api_type": self.api_type,
                 "agent_mode": self.agent_mode,
             }
-            self.memory_store.append_history("user", user_message, extra=extra)
-            self.memory_store.append_history(
-                "assistant",
-                response.get("response", "") if isinstance(response, dict) else "",
-                extra=extra,
-            )
+            for message in self.conversation_history[history_start:]:
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "")
+                if not role:
+                    continue
+                message_extra = dict(extra)
+                message_extra["message"] = self._plain_data(message)
+                self.memory_store.append_history(
+                    role,
+                    message.get("content", ""),
+                    extra=message_extra,
+                )
         except Exception as error:
             print_warn(f"Failed to record hot history: {error}")
 
@@ -3280,8 +3400,36 @@ class OmniAgent:
         ):
             self.agent_final_check_done = False
         self._track_explored_tool(name, tool_input)
+        self._last_tool_display = self.agent_tools.consume_display_payload()
         context_result = _compact_tool_result_for_context(tool_result)
         return context_result
+
+    def _consume_last_tool_display(self):
+        display = self._last_tool_display
+        self._last_tool_display = None
+        return display
+
+    @staticmethod
+    def _tool_display_for_result(name, tool_input, tool_result):
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        if name == "web_fetch":
+            url = str(tool_input.get("url") or "").strip()
+            if url:
+                return {
+                    "kind": "web_fetch",
+                    "url": url,
+                }
+        if name == "web_search":
+            query = str(tool_input.get("query") or "").strip()
+            if query:
+                return {
+                    "kind": "web_search",
+                    "content": query,
+                }
+        if str(tool_result or "").startswith("ERROR:"):
+            return None
+        return None
 
     def _track_explored_tool(self, name, tool_input):
         if name not in _EXPLORED_TOOLS:
@@ -3807,13 +3955,9 @@ class OmniAgent:
                 self._get_field(response, "content", [])
             )
             full_thinking, full_response, _ = self._parse_anthropic_blocks(blocks)
-            history_content = (
-                blocks if self._uses_minimax_anthropic_compat() else full_response
-            )
-
             self.conversation_history.append({
                 "role": "assistant",
-                "content": history_content,
+                "content": blocks,
             })
             return {"thinking": full_thinking, "response": full_response}
         except (AttributeError, TypeError) as error:
@@ -3897,6 +4041,8 @@ class OmniAgent:
             "role": "assistant",
             "content": self._chat_assistant_content_for_history(raw_content, text),
         }
+        if thinking_content:
+            assistant_message["thinking"] = thinking_content
         reasoning_details = self._get_field(message, "reasoning_details", None)
         if reasoning_details:
             assistant_message["reasoning_details"] = self._plain_data(reasoning_details)
@@ -4509,23 +4655,29 @@ class OmniAgent:
             for definition in definitions
         ]
 
-    def _chat_tool_result_message(self, tool_call_id, name, content):
+    def _chat_tool_result_message(self, tool_call_id, name, content, display=None):
         message = {
             "role": "tool",
             "tool_call_id": tool_call_id,
+            "tool_name": name,
             "content": content,
         }
-        if self.api_type == API_TYPE_GLM and name:
+        if name:
             message["name"] = name
+        if display:
+            message["display"] = display
         return message
 
     @staticmethod
-    def _ollama_tool_result_message(name, content):
-        return {
+    def _ollama_tool_result_message(name, content, display=None):
+        message = {
             "role": "tool",
             "tool_name": name,
             "content": content,
         }
+        if display:
+            message["display"] = display
+        return message
 
     def _chat_stream_assistant_message(
         self,
@@ -4538,6 +4690,8 @@ class OmniAgent:
         if self._uses_minimax_openai_compat() and raw_content is not None:
             history_content = raw_content
         message = {"role": "assistant", "content": history_content}
+        if thinking:
+            message["thinking"] = thinking
         if self._uses_minimax_openai_compat():
             details = reasoning_details or []
             if details:

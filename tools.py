@@ -17,6 +17,10 @@ from pathlib import Path
 from planning import TodoStore
 from skills import SkillRegistry
 from ui import (
+    add_question_entry,
+    add_web_fetch_entry,
+    add_web_search_entry,
+    dbg_event,
     get_agent_confirmation,
     get_agent_choice,
     get_agent_diff_confirmation,
@@ -65,7 +69,7 @@ WEB_FETCH_DEFAULT_MAX_CHARS = 8000
 WEB_FETCH_MAX_CHARS = 60000
 WEB_FETCH_MAX_RESPONSE_BYTES = 1000000
 WEB_FETCH_MAX_REDIRECTS = 5
-NO_WORKSPACE_TOOLS = {"read_program_docs", "web_fetch"}
+NO_WORKSPACE_TOOLS = {"read_program_docs", "web_fetch", "web_search"}
 
 SKIP_DIRS = {
     ".git",
@@ -844,6 +848,7 @@ class AgentTools:
             web_search_depth,
             web_search_topic,
         )
+        self._display_payload = None
         self.begin_agent_session(clear_todos=False)
 
     @property
@@ -1383,6 +1388,7 @@ class AgentTools:
             return _error_result("No workspace directory")
 
         try:
+            self._display_payload = None
             if isinstance(tool_input, str):
                 tool_input = json.loads(tool_input or "{}")
             if not isinstance(tool_input, dict):
@@ -1428,6 +1434,11 @@ class AgentTools:
         except Exception as error:
             return _error_result(str(error))
 
+    def consume_display_payload(self):
+        payload = self._display_payload
+        self._display_payload = None
+        return payload
+
     def _update_plan(self, tool_input):
         items = tool_input.get("items")
         self.todo_store.update(items)
@@ -1452,6 +1463,12 @@ class AgentTools:
             options,
             default_index=default_index,
         )
+        add_question_entry(question, selected_text)
+        self._display_payload = {
+            "kind": "ask_user",
+            "question": question,
+            "answer": selected_text,
+        }
         return f"User selected option {selected_index}: {selected_text}"
 
     def _read_file(self, tool_input):
@@ -1539,7 +1556,28 @@ class AgentTools:
             WEB_FETCH_MAX_CHARS,
             "max_chars",
         )
-        return _fetch_public_webpage(url, extract_mode, max_chars)
+        dbg_event(
+            "tool.web_fetch.start", url=url, mode=extract_mode, max_chars=max_chars
+        )
+        self._before_visible_output()
+        add_web_fetch_entry(url)
+        dbg_event("tool.web_fetch.ui_entry", url=url)
+        self._display_payload = {
+            "kind": "web_fetch",
+            "url": url,
+        }
+        try:
+            result = _fetch_public_webpage(url, extract_mode, max_chars)
+        except Exception as error:
+            dbg_event("tool.web_fetch.error", url=url, error=str(error))
+            self._display_payload = {
+                "kind": "web_fetch",
+                "url": url,
+                "error": str(error),
+            }
+            return _error_result(str(error))
+        dbg_event("tool.web_fetch.done", url=url, result_chars=len(str(result or "")))
+        return result
 
     def _list_dir(self, tool_input):
         root = self._resolve_path(str(tool_input.get("path") or "."))
@@ -2082,6 +2120,12 @@ class AgentTools:
             )
 
         query = _required_string(tool_input, "query")
+        self._before_visible_output()
+        add_web_search_entry(query)
+        self._display_payload = {
+            "kind": "web_search",
+            "content": query,
+        }
         max_results = (
             _optional_positive_int(tool_input, "max_results")
             or self.web_search_max_results

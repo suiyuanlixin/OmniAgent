@@ -209,6 +209,8 @@ class MessageTextArea(TextArea):
         super().__init__(text, **kwargs)
         self._owner = owner
         self._handling_paste = False
+        self._last_paste_text = ""
+        self._last_paste_at = 0.0
 
     async def _on_key(self, event: events.Key) -> None:
         if self._is_undo_granularity_key(event):
@@ -218,11 +220,22 @@ class MessageTextArea(TextArea):
         await super()._on_key(event)
 
     async def _on_paste(self, event: events.Paste) -> None:
+        if self._is_duplicate_paste(event.text):
+            event.stop()
+            return
         self._handling_paste = True
         try:
             await super()._on_paste(event)
+            self._remember_paste(event.text)
         finally:
             self._handling_paste = False
+
+    def action_paste(self) -> None:
+        clipboard = str(self.app.clipboard or "")
+        if self._is_duplicate_paste(clipboard):
+            return
+        super().action_paste()
+        self._remember_paste(clipboard)
 
     def action_cursor_up(self, select: bool = False) -> None:
         if self._owner._handle_command_menu_navigation(-1):
@@ -241,6 +254,12 @@ class MessageTextArea(TextArea):
         self._owner._submit_message_input()
 
     def _replace_via_keyboard(self, insert: str, start, end):
+        if (
+            not self._handling_paste
+            and start == end
+            and self._is_duplicate_paste(insert)
+        ):
+            return None
         if (
             not self._handling_paste
             and start == end
@@ -271,6 +290,19 @@ class MessageTextArea(TextArea):
             return True
         aliases = {str(alias) for alias in getattr(event, "aliases", []) or []}
         return "newline" in aliases
+
+    def _remember_paste(self, text: str) -> None:
+        self._last_paste_text = str(text or "")
+        self._last_paste_at = perf_counter()
+
+    def _is_duplicate_paste(self, text: str) -> bool:
+        text = str(text or "")
+        if not text:
+            return False
+        return (
+            text == self._last_paste_text
+            and (perf_counter() - self._last_paste_at) <= 0.3
+        )
 
     def render_line(self, y: int):
         if y == 0 and not self.text:

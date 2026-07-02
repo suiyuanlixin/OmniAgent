@@ -683,10 +683,17 @@ class SettingsModal(ModalScreen[None]):
             return
 
         if control_id.startswith("settings-opt-"):
-            payload = control_id[len("settings-opt-") :]
-            opt_value, sep, row_text = payload.rpartition("-")
-            if sep:
-                self._commit_select(int(row_text), opt_value)
+            parsed = self._parse_option_indices(control_id)
+            if parsed is None:
+                return
+            row_index, option_index = parsed
+            rows = self._visible_rows()
+            if row_index < 0 or row_index >= len(rows):
+                return
+            row = rows[row_index]
+            options = list(row.get("options") or [])
+            if 0 <= option_index < len(options):
+                self._commit_select(row_index, str(options[option_index][1]))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "settings-search":
@@ -808,6 +815,9 @@ class SettingsModal(ModalScreen[None]):
     def _options_id(self, row_index: int) -> str:
         return f"settings-options-{self._render_generation}-{row_index}"
 
+    def _option_id(self, row_index: int, option_index: int) -> str:
+        return f"settings-opt-{self._render_generation}-{row_index}-{option_index}"
+
     def _model_item_id(self, item_index: int) -> str:
         return f"settings-model-item-{self._render_generation}-{item_index}"
 
@@ -825,6 +835,17 @@ class SettingsModal(ModalScreen[None]):
             return None
         try:
             return int(control_id.rsplit("-", 1)[1])
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_option_indices(self, control_id: str) -> tuple[int, int] | None:
+        prefix = "settings-opt-"
+        if not control_id.startswith(prefix):
+            return None
+        payload = control_id[len(prefix) :]
+        try:
+            _generation, row_text, option_text = payload.split("-", 2)
+            return int(row_text), int(option_text)
         except (TypeError, ValueError):
             return None
 
@@ -1158,11 +1179,11 @@ class SettingsModal(ModalScreen[None]):
                 default=0,
             )
             option_width = max(option_width, len(display_value)) + 2
-            for label, opt_value in row.get("options") or []:
+            for option_index, (label, opt_value) in enumerate(row.get("options") or []):
                 option_buttons.append(
                     _OptionItem(
                         str(label),
-                        id=f"settings-opt-{str(opt_value)}-{row_index}",
+                        id=self._option_id(row_index, option_index),
                         classes="settings-option-btn",
                     )
                 )

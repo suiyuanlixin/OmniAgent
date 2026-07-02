@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 import threading
 from time import perf_counter
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from textual import events
 from textual.app import App, ComposeResult
@@ -11,7 +13,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import Button, Label, Static, TextArea
 
-from chat import OmniAgent
+from chat import OmniAgent, USER_PROMPT_FILE, USER_PROMPT_TEMPLATE
 from commands import COMMANDS, process_command
 from config import (
     API_TYPE_ANTHROPIC,
@@ -58,9 +60,13 @@ from tui.widgets.project_modal import ProjectModal
 from tui.widgets.project_picker import ProjectPicker
 from tui.widgets.settings import SettingsModal
 from tui.widgets.sidebar import Sidebar
-from tui.widgets.text_area_modal import TextAreaModal
+from tui.widgets.text_area_modal import PromptFileModal, TextAreaModal
 from team import TeamStore, display_teammate_name
-from ui import clean_display_text, clean_display_text_preserve_newlines
+from ui import (
+    clean_display_text,
+    clean_display_text_preserve_newlines,
+    dbg_event,
+)
 
 
 from textual.widgets._toast import Toast
@@ -353,6 +359,14 @@ class AgentTUIApp(App):
         options.extend((name, name) for name in self.config.model_list.keys())
         return options
 
+    def _valid_optional_model_selection(self, value: str) -> str:
+        normalized = normalize_optional_model_selection(value)
+        if normalized == AUTO_MODEL_SELECTION:
+            return AUTO_MODEL_SELECTION
+        if normalized in self.config.model_list:
+            return normalized
+        return AUTO_MODEL_SELECTION
+
     def _api_type_title(self, api_type: str) -> str:
         api_type = str(api_type or "").strip().lower()
         titles = {
@@ -403,6 +417,8 @@ class AgentTUIApp(App):
         self._set_input_enabled(True)
 
     def on_unmount(self) -> None:
+        self._pause_thinking_elapsed_timer()
+        self._thinking_started_at = None
         clear_bridge()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -435,7 +451,7 @@ class AgentTUIApp(App):
         if not is_command:
             self.start_chat()
             chat_view.add_message("user", event.content)
-        chat_view.reset_explored()
+        chat_view.reset_turn_summaries()
         self._set_controls_locked(True)
         self._set_input_enabled(False)
         self.chat_busy = True
@@ -587,6 +603,14 @@ class AgentTUIApp(App):
 
     def action_dismiss(self) -> None:
         if self.chat_busy and self.chat is not None:
+            dbg_event("ui.interrupt.esc")
+            self._pause_thinking_elapsed_timer()
+            self._call_ui(
+                self._finish_thought_stream_widget,
+                self._elapsed_since_thinking(),
+            )
+            self._thinking_started_at = None
+            self._stream_kind = None
             self.chat.request_agent_stop()
             return
         if self.sidebar_visible:
@@ -648,21 +672,30 @@ class AgentTUIApp(App):
         )
 
     def start_stream_thinking(self) -> None:
-        pass
+        dbg_event(
+            "bridge.start_stream_thinking",
+            thinking_started=bool(self._thinking_started_at is not None),
+            stream_kind=self._stream_kind,
+        )
 
     def start_thinking_timer(self) -> None:
         if self._thinking_started_at is None:
             self._thinking_started_at = perf_counter()
         self._resume_thinking_elapsed_timer()
+        dbg_event("bridge.start_thinking_timer")
 
     def append_stream_thinking(self, content) -> None:
+        first = self._thinking_started_at is None
         if self._thinking_started_at is None:
             self._thinking_started_at = perf_counter()
         self._resume_thinking_elapsed_timer()
+        if first:
+            dbg_event("bridge.thinking.first_chunk")
         self._call_ui(self._append_thought_stream_widget, str(content or ""))
 
     def finish_thinking_round(self) -> None:
         elapsed = self._elapsed_since_thinking()
+        dbg_event("bridge.thinking.finish", elapsed=elapsed)
         self._call_ui(self._finish_thought_stream_widget, elapsed)
         self._thinking_started_at = None
         self._call_ui(self._reset_explored_widget)
@@ -671,6 +704,10 @@ class AgentTUIApp(App):
         self.query_one("#messages-view", ChatView).reset_explored()
 
     def start_stream_response(self, model_name) -> None:
+        dbg_event(
+            "bridge.response.start",
+            thinking_started=bool(self._thinking_started_at is not None),
+        )
         self._pause_thinking_elapsed_timer()
         self._call_ui(
             self._finish_thought_stream_widget,
@@ -758,6 +795,12 @@ class AgentTUIApp(App):
         self.query_one("#messages-view", ChatView).add_status(text)
         self._stream_kind = None
 
+    def append_status_text(self, text: str) -> None:
+        value = str(text or "").rstrip()
+        if not value:
+            return
+        self._call_ui(self._append_status_text, value)
+
     def _append_thought_message(self, text: str, elapsed_seconds: float) -> None:
         self.query_one("#messages-view", ChatView).add_thought(
             text, elapsed_seconds=elapsed_seconds
@@ -788,6 +831,24 @@ class AgentTUIApp(App):
         self.query_one("#messages-view", ChatView).add_explored_entry(
             tool_name, description
         )
+
+    def add_question_entry(self, question: str, answer: str) -> None:
+        self._call_ui(self._append_question_entry, question, answer)
+
+    def _append_question_entry(self, question: str, answer: str) -> None:
+        self.query_one("#messages-view", ChatView).add_question_entry(question, answer)
+
+    def add_web_fetch_entry(self, url: str) -> None:
+        self._call_ui(self._append_web_fetch_entry, url)
+
+    def _append_web_fetch_entry(self, url: str) -> None:
+        self.query_one("#messages-view", ChatView).add_web_fetch_entry(url)
+
+    def add_web_search_entry(self, content: str) -> None:
+        self._call_ui(self._append_web_search_entry, content)
+
+    def _append_web_search_entry(self, content: str) -> None:
+        self.query_one("#messages-view", ChatView).add_web_search_entry(content)
 
     def _start_stream_widget(self, role: str, prefix: str) -> None:
         self.query_one("#messages-view", ChatView).start_stream(
@@ -927,6 +988,34 @@ class AgentTUIApp(App):
             SettingsModal(pages=self._settings_pages(), app=self, page_id=page_id)
         )
 
+    def _open_user_prompt_editor(self) -> None:
+        prompt_path = Path(USER_PROMPT_FILE)
+        if not prompt_path.exists():
+            try:
+                prompt_path.write_text(USER_PROMPT_TEMPLATE, encoding="utf-8")
+            except OSError as error:
+                self.add_status_message("[✗]", f"创建 {USER_PROMPT_FILE} 失败: {error}")
+                return
+        try:
+            value = prompt_path.read_text(encoding="utf-8")
+        except OSError as error:
+            self.add_status_message("[✗]", f"读取 {USER_PROMPT_FILE} 失败: {error}")
+            return
+        self.push_screen(
+            PromptFileModal("System prompt", value=value),
+            callback=self._handle_user_prompt_result,
+        )
+
+    def _handle_user_prompt_result(self, result: str | None) -> None:
+        if result is None:
+            return
+        try:
+            Path(USER_PROMPT_FILE).write_text(str(result), encoding="utf-8")
+        except OSError as error:
+            self.add_status_message("[✗]", f"保存 {USER_PROMPT_FILE} 失败: {error}")
+            return
+        self.add_status_message("[✓]", f"已保存 {USER_PROMPT_FILE}")
+
     def _settings_pages(self) -> dict[str, dict]:
         return {
             "root": {
@@ -1019,6 +1108,13 @@ class AgentTUIApp(App):
                 "keywords": "memory system memory_system",
                 "edit_type": "nav",
                 "target_page": "memory_system",
+            },
+            {
+                "name": "System prompt",
+                "value": "",
+                "keywords": "system prompt prompt.md edit",
+                "edit_type": "action",
+                "on_activate": self._open_user_prompt_editor,
             },
             {
                 "name": "Web search",
@@ -1323,7 +1419,7 @@ class AgentTUIApp(App):
             },
             {
                 "name": "Compact model",
-                "value": normalize_optional_model_selection(
+                "value": self._valid_optional_model_selection(
                     self.config.compaction_compact_model
                 ),
                 "keywords": "compact_model",
@@ -1338,7 +1434,7 @@ class AgentTUIApp(App):
         return [
             {
                 "name": "Memory model",
-                "value": normalize_optional_model_selection(self.config.memory_model),
+                "value": self._valid_optional_model_selection(self.config.memory_model),
                 "keywords": "memory_model",
                 "edit_type": "select",
                 "options": model_choices,
@@ -2497,9 +2593,14 @@ class AgentTUIApp(App):
     def _refresh_thought_elapsed(self) -> None:
         if self._thinking_started_at is None:
             return
-        self.query_one("#messages-view", ChatView).update_thought_stream_elapsed(
-            self._elapsed_since_thinking()
-        )
+        try:
+            self.query_one("#messages-view", ChatView).update_thought_stream_elapsed(
+                self._elapsed_since_thinking()
+            )
+        except NoMatches:
+            # The timer can tick during shutdown after the chat view is already gone.
+            self._pause_thinking_elapsed_timer()
+            self._thinking_started_at = None
 
     def _resume_thinking_elapsed_timer(self) -> None:
         if self._thinking_elapsed_timer is not None:
@@ -2542,13 +2643,191 @@ class AgentTUIApp(App):
         view = self.query_one("#messages-view", ChatView)
         view.clear()
         for message in history:
-            role = str(message.get("role") or "")
-            content = clean_display_text_preserve_newlines(message.get("content", ""))
-            if role in {"user", "assistant"}:
-                view.add_message(role, content)
-            elif content:
-                view.add_status(f"{role.upper()}: {content}")
+            self._replay_history_message(view, message)
         self.query_one("#chat-input", ChatInput).chat_active = True
+
+    def _replay_history_message(self, view: ChatView, message: dict) -> None:
+        if not isinstance(message, dict):
+            return
+        role = str(message.get("role") or "")
+        content = message.get("content", "")
+
+        if role == "assistant":
+            self._replay_assistant_history(view, message)
+            return
+
+        if role == "tool":
+            self._replay_tool_result_message(view, message)
+            return
+
+        if role == "user" and self._is_tool_result_content(content):
+            for block in list(content or []):
+                self._replay_tool_result_block(view, block)
+            return
+
+        text = clean_display_text_preserve_newlines(content)
+        if role == "user":
+            view.reset_turn_summaries()
+            if text:
+                view.add_message("user", text)
+            return
+        if text:
+            view.add_status(f"{role.upper()}: {text}")
+
+    def _replay_assistant_history(self, view: ChatView, message: dict) -> None:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                self._replay_assistant_block(view, block)
+            return
+
+        thinking = clean_display_text_preserve_newlines(
+            message.get("thinking")
+            or message.get("reasoning")
+            or message.get("reasoning_content")
+            or message.get("reasoning_details")
+            or ""
+        )
+        if thinking:
+            view.add_thought(thinking)
+
+        text_content = content
+        if thinking and isinstance(content, str):
+            text_content = self._strip_think_tags(content)
+        text = clean_display_text_preserve_newlines(text_content)
+        if text:
+            view.add_message("assistant", text)
+
+        for tool_call in list(message.get("tool_calls") or []):
+            self._replay_tool_call(view, tool_call)
+
+    def _replay_assistant_block(self, view: ChatView, block: dict) -> None:
+        if not isinstance(block, dict):
+            text = clean_display_text_preserve_newlines(block)
+            if text:
+                view.add_message("assistant", text)
+            return
+
+        block_type = str(block.get("type") or "")
+        if block_type == "thinking":
+            thinking = clean_display_text_preserve_newlines(
+                block.get("thinking") or block.get("text") or block.get("content") or ""
+            )
+            if thinking:
+                view.add_thought(thinking)
+            return
+        if block_type == "text":
+            text = clean_display_text_preserve_newlines(block.get("text") or "")
+            if text:
+                view.add_message("assistant", text)
+            return
+        if block_type == "tool_use":
+            self._replay_tool_call(view, block)
+            return
+
+        text = clean_display_text_preserve_newlines(block)
+        if text:
+            view.add_status(text)
+
+    def _replay_tool_call(self, view: ChatView, tool_call: dict) -> None:
+        if not isinstance(tool_call, dict):
+            return
+        function = tool_call.get("function") or {}
+        name = str(
+            tool_call.get("name")
+            or function.get("name")
+            or tool_call.get("tool_name")
+            or ""
+        )
+        if name in {"update_plan", "ask_user", "web_fetch", "web_search"}:
+            return
+        arguments = (
+            tool_call.get("input")
+            if "input" in tool_call
+            else function.get("arguments", tool_call.get("arguments", ""))
+        )
+        detail = clean_display_text_preserve_newlines(arguments)
+        label = f"Tool call: {name}".strip()
+        if detail:
+            label = f"{label}\n{detail}"
+        view.add_status(label)
+
+    def _replay_tool_result_message(self, view: ChatView, message: dict) -> None:
+        name = str(message.get("tool_name") or message.get("name") or "")
+        if name == "update_plan":
+            return
+        if self._replay_tool_result_display(view, message.get("display")):
+            return
+        content = clean_display_text_preserve_newlines(message.get("content", ""))
+        label = f"Tool result: {name}".strip()
+        if content:
+            label = f"{label}\n{content}"
+        view.add_status(label)
+
+    def _replay_tool_result_block(self, view: ChatView, block: dict) -> None:
+        if not isinstance(block, dict):
+            return
+        name = str(block.get("tool_name") or "")
+        if name == "update_plan":
+            return
+        if self._replay_tool_result_display(view, block.get("display")):
+            return
+        content = clean_display_text_preserve_newlines(block.get("content", ""))
+        tool_use_id = str(block.get("tool_use_id") or "")
+        is_error = bool(block.get("is_error"))
+        label = "Tool result"
+        if tool_use_id:
+            label += f": {tool_use_id}"
+        if is_error:
+            label += " [error]"
+        if content:
+            label = f"{label}\n{content}"
+        view.add_status(label)
+
+    @staticmethod
+    def _replay_tool_result_display(view: ChatView, display) -> bool:
+        if not isinstance(display, dict):
+            return False
+        kind = str(display.get("kind") or "")
+        if kind == "ask_user":
+            question = clean_display_text_preserve_newlines(display.get("question", ""))
+            answer = clean_display_text_preserve_newlines(display.get("answer", ""))
+            if question or answer:
+                view.add_question_entry(question, answer)
+                return True
+            return False
+        if kind == "web_fetch":
+            url = clean_display_text_preserve_newlines(display.get("url", ""))
+            if url:
+                view.add_web_fetch_entry(url)
+                return True
+        if kind == "web_search":
+            content = clean_display_text_preserve_newlines(display.get("content", ""))
+            if content:
+                view.add_web_search_entry(content)
+                return True
+        return False
+
+    @staticmethod
+    def _is_tool_result_content(content) -> bool:
+        if not isinstance(content, list) or not content:
+            return False
+        return all(
+            isinstance(block, dict) and str(block.get("type") or "") == "tool_result"
+            for block in content
+        )
+
+    @staticmethod
+    def _strip_think_tags(content: str) -> str:
+        text = str(content or "")
+        text = re.sub(
+            r"<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"<\s*/?\s*think\s*>", "", text, flags=re.IGNORECASE)
+        return text
 
     def _load_session_record(self, record: dict) -> None:
         self.current_session_record = record

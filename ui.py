@@ -1,5 +1,9 @@
 import json
 import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 
 from rich.console import Console
 
@@ -42,6 +46,66 @@ class _ConsoleProxy:
 
 
 console = _ConsoleProxy()
+
+# region debug-point openai-thought-missing
+_DBG_SESSION_ID = "openai-thought-missing"
+_DBG_URL = None
+_DBG_SEQ = 0
+
+
+def _dbg_load_url():
+    global _DBG_URL
+    if _DBG_URL:
+        return _DBG_URL
+    env_path = Path(__file__).resolve().parent / ".dbg" / f"{_DBG_SESSION_ID}.env"
+    try:
+        text = env_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        _DBG_URL = None
+        return None
+    for line in text.splitlines():
+        if line.startswith("DEBUG_SERVER_URL="):
+            _DBG_URL = line.split("=", 1)[1].strip()
+            return _DBG_URL
+    _DBG_URL = None
+    return None
+
+
+def dbg_event(event: str, **data) -> None:
+    global _DBG_SEQ
+    if event in {"ui.thinking.chunk", "ui.response.chunk"}:
+        return
+    url = _dbg_load_url()
+    if not url:
+        return
+    _DBG_SEQ += 1
+    payload = {
+        "sessionId": _DBG_SESSION_ID,
+        "ts": time.time(),
+        "seq": _DBG_SEQ,
+        "event": str(event or ""),
+        "thread": threading.current_thread().name,
+        "data": data,
+    }
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=1.5) as _:
+            return
+    except (OSError, urllib.error.URLError):
+        return
+
+
+def dbg_enabled() -> bool:
+    return bool(_dbg_load_url())
+
+
+# endregion
 
 
 def clean_display_text(text):
@@ -86,6 +150,15 @@ def print_message(symbol, content, color=None):
         bridge.add_status_message(symbol, content)
 
 
+def append_chat_status(text: str) -> None:
+    bridge = get_bridge()
+    if bridge is None:
+        return
+    if not hasattr(bridge, "append_status_text"):
+        return
+    bridge.append_status_text(text)
+
+
 def print_success(content):
     print_message("[✓]", content)
 
@@ -111,20 +184,24 @@ def print_thinking(content):
 def print_stream_thinking(content, leading_newline=True):
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.thinking.stream_start", has_content=bool(content))
         bridge.start_stream_thinking()
         if content:
+            dbg_event("ui.thinking.chunk", chars=len(str(content or "")))
             bridge.append_stream_thinking(content)
 
 
 def append_stream_thinking(content):
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.thinking.chunk", chars=len(str(content or "")))
         bridge.append_stream_thinking(content)
 
 
 def start_thinking_timer():
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.thinking.timer_start")
         bridge.start_thinking_timer()
 
 
@@ -135,12 +212,14 @@ def print_stream_thinking_continue(content):
         return
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.thinking.chunk", chars=len(str(content or "")))
         bridge.append_stream_thinking(content)
 
 
 def finish_thinking_round():
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.thinking.finish_round")
         bridge.finish_thinking_round()
 
 
@@ -162,15 +241,38 @@ def add_explored_entry(tool_name, description):
         bridge.add_explored_entry(tool_name, description)
 
 
+def add_question_entry(question, answer):
+    bridge = get_bridge()
+    if bridge is not None:
+        dbg_event("ui.question.entry")
+        bridge.add_question_entry(question, answer)
+
+
+def add_web_fetch_entry(url):
+    bridge = get_bridge()
+    if bridge is not None:
+        dbg_event("ui.web_fetch.entry", url=str(url or ""))
+        bridge.add_web_fetch_entry(url)
+
+
+def add_web_search_entry(content):
+    bridge = get_bridge()
+    if bridge is not None:
+        dbg_event("ui.web_search.entry", content=str(content or ""))
+        bridge.add_web_search_entry(content)
+
+
 def print_stream_response_start(model_name):
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.response.start", model=str(model_name or ""))
         bridge.start_stream_response(model_name)
 
 
 def clean_and_print_stream_response(content):
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.response.chunk", chars=len(str(content or "")))
         while "\n\n" in content:
             content = content.replace("\n\n", "\n")
         if content.startswith("\n"):
@@ -181,6 +283,7 @@ def clean_and_print_stream_response(content):
 def print_stream_response_continue(content):
     bridge = get_bridge()
     if bridge is not None:
+        dbg_event("ui.response.chunk", chars=len(str(content or "")))
         bridge.append_stream_response(content)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Container
+from rich.cells import cell_len
 from textual.widgets import Button, Input, Static
 from textual.widget import Widget
 from textual.message import Message
@@ -11,9 +12,8 @@ from tui.theme import render_css
 from tui.widgets.chat_input import HalfRowSpacer
 
 OPTION_HORIZONTAL_PADDING = 1
-OPTION_CONTENT_GUTTER = 2  # safety margin
 _MORE_LABELS = ["Add new project", "Don't work in a project"]
-PROJECT_OPTIONS_WIDTH = 28
+_SEARCH_PLACEHOLDER = "Search projects..."
 
 
 class ProjectOptionButton(Button, can_focus=False):
@@ -175,8 +175,9 @@ class ProjectPicker(Widget):
 
     def on_mount(self) -> None:
         options = self.query_one("#project-options", Container)
-        options.styles.width = PROJECT_OPTIONS_WIDTH
-        options.styles.min_width = PROJECT_OPTIONS_WIDTH
+        width = self._measure_dropdown_width()
+        options.styles.width = width
+        options.styles.min_width = width
         self._fit_trigger()
         self.set_projects(self._all_projects)
 
@@ -185,11 +186,11 @@ class ProjectPicker(Widget):
             yield Button("Work in a project", id="project-trigger")
             with Container(id="project-options"):
                 yield HalfRowSpacer(id="project-top-edge")
-                yield Input(placeholder="Search projects...", id="project-search-input")
+                yield Input(placeholder=_SEARCH_PLACEHOLDER, id="project-search-input")
                 yield Container(id="project-list")
                 with Container(id="project-separator"):
                     yield Static(
-                        "\u2500" * (PROJECT_OPTIONS_WIDTH - 4),
+                        "\u2500" * max(1, self._measure_dropdown_width() - 2),
                         id="project-separator-line",
                     )
                 yield Static("Add new project", id="add-project-btn")
@@ -199,9 +200,15 @@ class ProjectPicker(Widget):
     def _fit_trigger(self) -> None:
         drop = self.query_one("#project-drop", Container)
         trigger = self.query_one("#project-trigger", Button)
-        label_width = len(str(trigger.label)) + 2
+        label_width = cell_len(str(trigger.label)) + 2
         drop.styles.width = label_width
         trigger.styles.width = label_width
+
+    def _measure_dropdown_width(self) -> int:
+        labels = [*_MORE_LABELS, _SEARCH_PLACEHOLDER, *self._all_projects]
+        return max(cell_len(label) for label in labels) + (
+            OPTION_HORIZONTAL_PADDING * 2
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id
@@ -267,14 +274,7 @@ class ProjectPicker(Widget):
         self._all_projects = [
             str(name) for name in project_names or [] if str(name).strip()
         ]
-        width = (
-            max(
-                [len(label) for label in self._all_projects + _MORE_LABELS]
-                or [PROJECT_OPTIONS_WIDTH]
-            )
-            + (OPTION_HORIZONTAL_PADDING * 2)
-            + OPTION_CONTENT_GUTTER
-        )
+        width = self._measure_dropdown_width()
         options = self.query_one("#project-options", Container)
         options.styles.width = width
         options.styles.min_width = width
