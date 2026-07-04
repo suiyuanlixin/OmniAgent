@@ -17,9 +17,11 @@ from pathlib import Path
 from planning import TodoStore
 from skills import SkillRegistry
 from ui import (
+    add_edit_entry,
     add_question_entry,
     add_web_fetch_entry,
     add_web_search_entry,
+    add_write_entry,
     dbg_event,
     get_agent_confirmation,
     get_agent_choice,
@@ -849,6 +851,7 @@ class AgentTools:
             web_search_topic,
         )
         self._display_payload = None
+        self._session_original_contents = {}
         self.begin_agent_session(clear_todos=False)
 
     @property
@@ -1230,6 +1233,7 @@ class AgentTools:
             self.todo_store.clear()
         self.session_changed_files = []
         self._session_changed_file_set = set()
+        self._session_original_contents = {}
         self.session_mutating_commands = []
         self.output_needs_separator = False
 
@@ -1336,6 +1340,26 @@ class AgentTools:
                 )
             )
         return "\n".join(parts)
+
+    def changed_files_summary(self):
+        result = []
+        for display_path in self.session_changed_files:
+            file_path = self._resolve_path(display_path)
+            if not file_path.exists():
+                continue
+            current = file_path.read_text(encoding="utf-8", errors="replace")
+            original = self._session_original_contents.get(display_path, "")
+            if original == current:
+                continue
+            diff = _unified_diff_text(original, current, display_path)
+            additions, deletions = _diff_stats(diff)
+            result.append({
+                "file_path": display_path,
+                "additions": additions,
+                "deletions": deletions,
+                "diff": diff,
+            })
+        return result
 
     def final_check(self):
         if not self.enabled:
@@ -1651,7 +1675,17 @@ class AgentTools:
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
-        self._record_changed_file(file_path)
+        self._record_changed_file(file_path, old_content)
+        additions, deletions = _diff_stats(diff)
+        self._display_payload = {
+            "kind": "file_write",
+            "file_path": self._display_path(file_path),
+            "additions": additions,
+            "deletions": deletions,
+            "diff": diff,
+        }
+        self._before_visible_output()
+        add_write_entry(self._display_path(file_path), additions, deletions, diff)
         return f"Wrote {len(content)} characters to {self._display_path(file_path)}."
 
     def _edit_file(self, tool_input):
@@ -1687,7 +1721,17 @@ class AgentTools:
             return _error_result("User rejected edit_file.")
 
         file_path.write_text(updated, encoding="utf-8")
-        self._record_changed_file(file_path)
+        self._record_changed_file(file_path, content)
+        additions, deletions = _diff_stats(diff)
+        self._display_payload = {
+            "kind": "file_edit",
+            "file_path": self._display_path(file_path),
+            "additions": additions,
+            "deletions": deletions,
+            "diff": diff,
+        }
+        self._before_visible_output()
+        add_edit_entry(self._display_path(file_path), additions, deletions, diff)
         return (
             f"Edited {self._display_path(file_path)} ({replace_count} replacement(s))."
         )
@@ -1738,7 +1782,17 @@ class AgentTools:
             return _error_result("User rejected apply_patch.")
 
         file_path.write_text(updated, encoding="utf-8")
-        self._record_changed_file(file_path)
+        self._record_changed_file(file_path, content)
+        additions, deletions = _diff_stats(diff)
+        self._display_payload = {
+            "kind": "file_edit",
+            "file_path": self._display_path(file_path),
+            "additions": additions,
+            "deletions": deletions,
+            "diff": diff,
+        }
+        self._before_visible_output()
+        add_edit_entry(self._display_path(file_path), additions, deletions, diff)
         return (
             f"Patched {self._display_path(file_path)} (lines {start_line}-{end_line})."
         )
@@ -1765,7 +1819,17 @@ class AgentTools:
             return _error_result("User rejected apply_unified_patch.")
 
         file_path.write_text(updated, encoding="utf-8")
-        self._record_changed_file(file_path)
+        self._record_changed_file(file_path, content)
+        additions, deletions = _diff_stats(diff)
+        self._display_payload = {
+            "kind": "file_edit",
+            "file_path": self._display_path(file_path),
+            "additions": additions,
+            "deletions": deletions,
+            "diff": diff,
+        }
+        self._before_visible_output()
+        add_edit_entry(self._display_path(file_path), additions, deletions, diff)
         return f"Applied unified patch to {self._display_path(file_path)}."
 
     def _bash(self, tool_input):
@@ -2191,11 +2255,16 @@ class AgentTools:
         except ValueError:
             return str(path)
 
-    def _record_changed_file(self, file_path):
+    def _record_changed_file(self, file_path, original_content=None):
         display_path = self._display_path(file_path)
         if display_path not in self._session_changed_file_set:
             self._session_changed_file_set.add(display_path)
             self.session_changed_files.append(display_path)
+        if (
+            original_content is not None
+            and display_path not in self._session_original_contents
+        ):
+            self._session_original_contents[display_path] = original_content
 
     def _record_mutating_command(self, command):
         self.session_mutating_commands.append(command)
@@ -2623,6 +2692,19 @@ def _unified_diff_text(old_content, new_content, display_path):
         lineterm="",
     )
     return "\n".join(diff_lines)
+
+
+def _diff_stats(diff_text):
+    additions = 0
+    deletions = 0
+    for line in (diff_text or "").splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return additions, deletions
 
 
 def _apply_unified_diff_to_content(content, patch):

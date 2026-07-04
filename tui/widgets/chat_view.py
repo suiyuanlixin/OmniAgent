@@ -1,17 +1,34 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
+from rich.cells import cell_len
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
+from textual.strip import Strip
 from textual.widgets import Static
 from textual.widget import Widget
 
-from tui.theme import PAGE_BACKGROUND, SURFACE_BACKGROUND, render_css
+from tui.theme import (
+    DIFF_ADD_BG,
+    DIFF_ADD_FG,
+    DIFF_DEL_BG,
+    DIFF_DEL_FG,
+    INFO_BAR_BACKGROUND,
+    PAGE_BACKGROUND,
+    SURFACE_BACKGROUND,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    render_css,
+)
+from tui.widgets.chat_input import HalfRowSpacer, BottomHalfRowSpacer
 
 
 class ChatView(Widget):
@@ -215,6 +232,203 @@ class ChatView(Widget):
         background: transparent;
         color: $TEXT_MUTED;
     }
+
+    EditedBlock {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    WrittenBlock {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    DiffFileRow {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    DiffFileRow > .diff-row-header {
+        width: 100%;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+    DiffFileRow > .diff-row-header > .diff-row-label {
+        width: auto;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: $TEXT_PRIMARY;
+        text-align: left;
+        content-align: left middle;
+    }
+    DiffFileRow > .diff-row-header > .diff-row-path {
+        width: auto;
+        height: 1;
+        margin: 0;
+        padding: 0 0 0 1;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+        overflow: hidden;
+    }
+    DiffFileRow > .diff-row-header > .diff-row-stats {
+        width: auto;
+        height: 1;
+        margin: 0;
+        padding: 0 0 0 1;
+        background: transparent;
+        text-align: left;
+        content-align: left middle;
+    }
+
+    DiffFileRow > DiffContent {
+        width: 100%;
+        height: auto;
+        margin-top: 0;
+        padding: 0;
+        background: $INFO_BAR_BACKGROUND;
+    }
+    DiffFileRow > DiffContent.hidden {
+        display: none;
+    }
+
+    DiffFileRow > .diff-file-row-wrap {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+    DiffFileRow > .diff-file-row-wrap.hidden {
+        display: none;
+    }
+    DiffFileRow > .diff-file-row-wrap > .diff-file-row-top-spacer {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $PAGE_BACKGROUND;
+    }
+    DiffFileRow > .diff-file-row-wrap > .diff-file-row-container {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0 1;
+        background: $INFO_BAR_BACKGROUND;
+    }
+    DiffFileRow > .diff-file-row-wrap > .diff-file-row-container > ChangedFileRow {
+        background: $INFO_BAR_BACKGROUND;
+    }
+    DiffFileRow > .diff-file-row-wrap > .diff-file-row-bottom-spacer {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $PAGE_BACKGROUND;
+    }
+
+    ChangedFilesBlock {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    ChangedFilesBlock > .changed-files-toggle {
+        width: 100%;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: $TEXT_PRIMARY;
+        text-align: left;
+        content-align: left middle;
+    }
+
+    ChangedFilesBlock > .changed-files-top-spacer {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $PAGE_BACKGROUND;
+    }
+
+    ChangedFilesBlock > .changed-files-rows {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0 1;
+        background: $INFO_BAR_BACKGROUND;
+    }
+    ChangedFilesBlock > .changed-files-rows.hidden {
+        display: none;
+    }
+
+    ChangedFilesBlock > .changed-files-bottom-spacer {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $PAGE_BACKGROUND;
+    }
+
+    ChangedFileRow {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    ChangedFileRow > .changed-file-row-header {
+        width: 100%;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+    ChangedFileRow > .changed-file-row-header > .changed-file-row-path {
+        width: 1fr;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: $TEXT_PRIMARY;
+        text-align: left;
+        content-align: left middle;
+        overflow: hidden;
+    }
+    ChangedFileRow > .changed-file-row-header > .changed-file-row-stats {
+        width: auto;
+        height: 1;
+        margin: 0;
+        padding: 0 0 0 1;
+        background: transparent;
+        text-align: right;
+        content-align: right middle;
+    }
+
+    ChangedFileRow > DiffContent {
+        width: 100%;
+        height: auto;
+        margin-top: 0;
+        padding: 0;
+        background: $INFO_BAR_BACKGROUND;
+    }
+    ChangedFileRow > DiffContent.hidden {
+        display: none;
+    }
     """
     )
 
@@ -224,15 +438,19 @@ class ChatView(Widget):
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._active_output_kind: str | None = None
         self._thought_stream_target: ThoughtBlock | None = None
         self._thought_stream_content = ""
         self._explored_block: ExploredBlock | None = None
+        self._edited_block: EditedBlock | None = None
+        self._write_block: WrittenBlock | None = None
         self._questions_block: QuestionsBlock | None = None
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
 
     def add_message(self, role: str, content: str) -> None:
+        self._activate_message_output()
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
@@ -250,6 +468,7 @@ class ChatView(Widget):
             self._stream_content = str(content or "")
 
     def add_status(self, content: str) -> None:
+        self._activate_message_output()
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
@@ -258,6 +477,7 @@ class ChatView(Widget):
         self.call_after_refresh(self._scroll_end)
 
     def start_stream(self, role: str = "assistant", prefix: str = "") -> None:
+        self._activate_message_output()
         if self._stream_target is not None and self._stream_role == role:
             return
         if role == "status":
@@ -291,6 +511,7 @@ class ChatView(Widget):
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._active_output_kind = None
 
     def clear(self) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
@@ -299,29 +520,27 @@ class ChatView(Widget):
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._active_output_kind = None
         self._thought_stream_target = None
         self._thought_stream_content = ""
         self._explored_block = None
+        self._edited_block = None
+        self._write_block = None
         self._questions_block = None
 
     def _scroll_end(self) -> None:
         self.query_one("#chat-log", VerticalScroll).scroll_end(animate=False)
 
     def add_thought(self, content: str, elapsed_seconds: float = 0.0) -> None:
+        self._activate_aux_output("thought")
         block = ThoughtBlock(content=content, elapsed_seconds=elapsed_seconds)
         self.query_one("#chat-log", VerticalScroll).mount(block)
         self.call_after_refresh(self._scroll_end)
 
     def start_thought_stream(self, elapsed_seconds: float = 0.0) -> None:
+        self._activate_aux_output("thought")
         if self._thought_stream_target is not None:
             return
-        if self._stream_role == "assistant":
-            # GLM may interleave thinking and visible text multiple times in one turn.
-            # Once a new thought block starts, the next assistant text must mount into
-            # a fresh response block instead of reusing the first one.
-            self._stream_target = None
-            self._stream_role = None
-            self._stream_content = ""
         block = ThoughtBlock(content="", elapsed_seconds=elapsed_seconds)
         self.query_one("#chat-log", VerticalScroll).mount(block)
         self.call_after_refresh(self._scroll_end)
@@ -360,6 +579,7 @@ class ChatView(Widget):
         self.call_after_refresh(self._scroll_end)
 
     def add_explored_entry(self, tool_name: str, description: str) -> None:
+        self._activate_aux_output("explored")
         if self._explored_block is None:
             block = ExploredBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
@@ -371,7 +591,44 @@ class ChatView(Widget):
     def reset_explored(self) -> None:
         self._explored_block = None
 
+    def add_edit_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
+        self._activate_aux_output("edit")
+        if self._edited_block is None:
+            block = EditedBlock()
+            self.query_one("#chat-log", VerticalScroll).mount(block)
+            self.call_after_refresh(self._scroll_end)
+            self._edited_block = block
+        self._edited_block.add_entry(file_path, additions, deletions, diff)
+        self.call_after_refresh(self._scroll_end)
+
+    def add_write_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
+        self._activate_aux_output("write")
+        if self._write_block is None:
+            block = WrittenBlock()
+            self.query_one("#chat-log", VerticalScroll).mount(block)
+            self.call_after_refresh(self._scroll_end)
+            self._write_block = block
+        self._write_block.add_entry(file_path, additions, deletions, diff)
+        self.call_after_refresh(self._scroll_end)
+
+    def reset_edited(self) -> None:
+        self._edited_block = None
+        self._write_block = None
+
+    def add_changed_files_entry(self, files: list[dict]) -> None:
+        if not files:
+            return
+        self._activate_aux_output("changed_files")
+        block = ChangedFilesBlock(files)
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self.call_after_refresh(self._scroll_end)
+
     def add_question_entry(self, question: str, answer: str) -> None:
+        self._activate_aux_output("questions")
         if self._questions_block is None:
             block = QuestionsBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
@@ -386,7 +643,7 @@ class ChatView(Widget):
         self._stream_content = ""
 
     def add_web_fetch_entry(self, url: str) -> None:
-        self._reset_message_stream()
+        self._activate_aux_output("web_fetch")
         content = f"→ [white]Webfetch[/white] [gray]{_escape_markup(url)}[/gray]"
         self.query_one("#chat-log", VerticalScroll).mount(
             Static(content, classes="web-summary-entry", markup=True)
@@ -394,7 +651,7 @@ class ChatView(Widget):
         self.call_after_refresh(self._scroll_end)
 
     def add_web_search_entry(self, content: str) -> None:
-        self._reset_message_stream()
+        self._activate_aux_output("web_search")
         summary = _escape_markup(content)
         self.query_one("#chat-log", VerticalScroll).mount(
             Static(
@@ -407,7 +664,32 @@ class ChatView(Widget):
 
     def reset_turn_summaries(self) -> None:
         self._explored_block = None
+        self._edited_block = None
+        self._write_block = None
         self._questions_block = None
+        self._active_output_kind = None
+
+    def _activate_message_output(self) -> None:
+        if self._active_output_kind == "message":
+            return
+        self._clear_auxiliary_group_refs()
+        self._active_output_kind = "message"
+
+    def _activate_aux_output(self, kind: str) -> None:
+        if self._active_output_kind != kind:
+            self._reset_message_stream()
+            self._clear_auxiliary_group_refs(except_kind=kind)
+            self._active_output_kind = kind
+
+    def _clear_auxiliary_group_refs(self, except_kind: str | None = None) -> None:
+        if except_kind != "explored":
+            self._explored_block = None
+        if except_kind != "edit":
+            self._edited_block = None
+        if except_kind != "write":
+            self._write_block = None
+        if except_kind != "questions":
+            self._questions_block = None
 
 
 def _build_message_widgets(role: str, content: str):
@@ -786,7 +1068,7 @@ class QuestionsBlock(Vertical):
     def _header_label(self) -> str:
         count = len(self.entries)
         suffix = "answered" if count == 1 else "answered"
-        return f"[white]Questions[/white] [gray]{count} {suffix}[/gray]"
+        return f"[gray]#[/] [white]Questions[/white] [gray]{count} {suffix}[/gray]"
 
     def _content_text(self) -> str:
         parts = []
@@ -808,6 +1090,290 @@ class QuestionsBlock(Vertical):
             content.remove_class("hidden")
         else:
             content.add_class("hidden")
+
+
+class EditedBlock(Vertical):
+    def __init__(self):
+        super().__init__()
+
+    def add_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
+        row = DiffFileRow(
+            "[gray]#[/] Edit", file_path, additions, deletions, diff, show_stats=True
+        )
+        self.mount(row)
+
+
+class WrittenBlock(Vertical):
+    def __init__(self):
+        super().__init__()
+
+    def add_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
+        row = DiffFileRow(
+            "[gray]#[/] Write", file_path, additions, deletions, diff, show_stats=False
+        )
+        self.mount(row)
+
+
+class DiffFileRow(Vertical):
+    """A write/edit row with two-level expansion.
+    First click shows a file-row container with half-row spacers.
+    Second click on the file-row shows the diff.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        show_stats: bool = True,
+    ):
+        super().__init__()
+        self.label = str(label or "")
+        self.file_path = str(file_path or "")
+        self.additions = int(additions or 0)
+        self.deletions = int(deletions or 0)
+        self.diff = str(diff or "")
+        self.show_stats = bool(show_stats)
+        self._row_expanded = False
+        self._row_container: Vertical | None = None
+        self._file_row: ChangedFileRow | None = None
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="diff-row-header"):
+            yield Static(
+                self.label, classes="diff-row-label", markup=True, expand=False
+            )
+            yield Static(
+                _escape_markup(self.file_path),
+                classes="diff-row-path",
+                markup=True,
+                expand=False,
+            )
+            if self.show_stats:
+                yield Static(
+                    self._stats_text(),
+                    classes="diff-row-stats",
+                    markup=True,
+                    expand=False,
+                )
+        self._file_row = ChangedFileRow({
+            "file_path": self.file_path,
+            "additions": self.additions,
+            "deletions": self.deletions,
+            "diff": self.diff,
+        })
+        with Vertical(classes="diff-file-row-wrap hidden"):
+            yield HalfRowSpacer(classes="diff-file-row-top-spacer")
+            with Vertical(classes="diff-file-row-container"):
+                yield self._file_row
+            yield BottomHalfRowSpacer(classes="diff-file-row-bottom-spacer")
+
+    def on_mount(self) -> None:
+        pass
+
+    def on_click(self, event: events.Click) -> None:
+        if self._file_row is None:
+            return
+        try:
+            wrap = self.query_one(".diff-file-row-wrap", Vertical)
+        except NoMatches:
+            return
+        self._row_expanded = not self._row_expanded
+        if self._row_expanded:
+            wrap.remove_class("hidden")
+        else:
+            wrap.add_class("hidden")
+            self._file_row.expanded = False
+            if self._file_row._content_widget:
+                self._file_row._content_widget.add_class("hidden")
+        event.stop()
+
+    def _stats_text(self) -> str:
+        parts = []
+        if self.additions:
+            parts.append(f"[#7fd97f]+{self.additions}[/]")
+        if self.deletions:
+            parts.append(f"[#d97f7f]-{self.deletions}[/]")
+        return " ".join(parts)
+
+
+class ChangedFilesBlock(Vertical):
+    def __init__(self, files: list[dict]):
+        super().__init__()
+        self.files = list(files or [])
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._header_label(), classes="changed-files-toggle", markup=True)
+        yield HalfRowSpacer(classes="changed-files-top-spacer")
+        with Vertical(classes="changed-files-rows"):
+            for f in self.files:
+                yield ChangedFileRow(f)
+        yield BottomHalfRowSpacer(classes="changed-files-bottom-spacer")
+
+    def _header_label(self) -> str:
+        count = len(self.files)
+        total_add = sum(int(f.get("additions", 0) or 0) for f in self.files)
+        total_del = sum(int(f.get("deletions", 0) or 0) for f in self.files)
+        label = f"{count} Changed file" if count == 1 else f"{count} Changed files"
+        return (
+            f"[white]{label}[/white] [#7fd97f]+{total_add}[/] [#d97f7f]-{total_del}[/]"
+        )
+
+
+class ChangedFileRow(Vertical):
+    def __init__(self, file_info: dict):
+        super().__init__()
+        self.file_path = str((file_info or {}).get("file_path") or "")
+        self.additions = int((file_info or {}).get("additions", 0) or 0)
+        self.deletions = int((file_info or {}).get("deletions", 0) or 0)
+        self.diff = str((file_info or {}).get("diff") or "")
+        self.expanded = False
+        self._path_widget: Static | None = None
+        self._stats_widget: Static | None = None
+        self._content_widget: DiffContent | None = None
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="changed-file-row-header"):
+            self._path_widget = Static(
+                _escape_markup(self.file_path),
+                classes="changed-file-row-path",
+                markup=True,
+                expand=False,
+            )
+            self._stats_widget = Static(
+                f"[#7fd97f]+{self.additions}[/] [#d97f7f]-{self.deletions}[/]",
+                classes="changed-file-row-stats",
+                markup=True,
+                expand=False,
+            )
+            yield self._path_widget
+            yield self._stats_widget
+        self._content_widget = DiffContent(self.diff)
+        yield self._content_widget
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def on_click(self, event: events.Click) -> None:
+        self.expanded = not self.expanded
+        self._refresh()
+        event.stop()
+
+    def _refresh(self) -> None:
+        content = self._content_widget
+        if content is None:
+            return
+        if self.expanded and self.diff:
+            content.remove_class("hidden")
+        else:
+            content.add_class("hidden")
+
+
+class DiffContent(Static):
+    """Renders diff content with full-width colored backgrounds and line numbers."""
+
+    def __init__(self, diff_text: str, **kwargs):
+        self._diff_lines = _parse_diff_lines(diff_text)
+        max_num = max((ln for _, ln, _ in self._diff_lines), default=0)
+        self._num_width = max(1, len(str(max_num)))
+        super().__init__("", markup=False, **kwargs)
+
+    def on_mount(self) -> None:
+        self.styles.height = max(1, len(self._diff_lines))
+
+    def render_line(self, y: int) -> Strip:
+        width = self.size.width
+        if width <= 0:
+            return Strip.blank(1)
+        if y < 0 or y >= len(self._diff_lines):
+            return Strip.blank(width)
+        line_type, line_num, content = self._diff_lines[y]
+        return _build_diff_strip(line_type, line_num, content, width, self._num_width)
+
+
+_DIFF_HUNK_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _parse_diff_lines(diff_text: str) -> list[tuple[str, int, str]]:
+    """Parse a unified diff into (type, line_number, content) tuples.
+
+    type is 'add', 'del', or 'ctx'. line_number is the old line for del/ctx,
+    new line for add.
+    """
+    result: list[tuple[str, int, str]] = []
+    old_line = 0
+    new_line = 0
+    for line in (diff_text or "").splitlines():
+        m = _DIFF_HUNK_RE.match(line)
+        if m:
+            old_line = int(m.group(1))
+            new_line = int(m.group(2))
+            continue
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("+"):
+            result.append(("add", new_line, line[1:]))
+            new_line += 1
+        elif line.startswith("-"):
+            result.append(("del", old_line, line[1:]))
+            old_line += 1
+        else:
+            content = line[1:] if line.startswith(" ") else line
+            result.append(("ctx", old_line, content))
+            old_line += 1
+            new_line += 1
+    return result
+
+
+def _build_diff_strip(
+    line_type: str, line_num: int, content: str, width: int, num_width: int = 3
+) -> Strip:
+    """Build a single Strip for a diff line with full-width colored background."""
+    if width <= 0:
+        return Strip.blank(1)
+
+    gap = 1
+    content_start = num_width + gap
+    content_width = max(0, width - content_start)
+
+    if line_type == "add":
+        fg = DIFF_ADD_FG
+        bg = DIFF_ADD_BG
+    elif line_type == "del":
+        fg = DIFF_DEL_FG
+        bg = DIFF_DEL_BG
+    else:
+        fg = TEXT_MUTED
+        bg = INFO_BAR_BACKGROUND
+
+    segments: list[Segment] = []
+
+    num_str = str(line_num) if line_num else ""
+    num_text = num_str.rjust(num_width)
+    num_style = Style(
+        color=fg,
+        bgcolor=INFO_BAR_BACKGROUND,
+    )
+    segments.append(Segment(num_text, num_style))
+
+    if gap > 0:
+        segments.append(Segment(" " * gap, Style(bgcolor=INFO_BAR_BACKGROUND)))
+
+    if content_width > 0:
+        display = content[:content_width]
+        pad_count = content_width - cell_len(display)
+        if pad_count > 0:
+            display = display + " " * pad_count
+        content_style = Style(color=fg, bgcolor=bg)
+        segments.append(Segment(display, content_style))
+
+    return Strip(segments)
 
 
 def _escape_markup(text: str) -> str:

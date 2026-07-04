@@ -241,6 +241,24 @@ def add_explored_entry(tool_name, description):
         bridge.add_explored_entry(tool_name, description)
 
 
+def add_edit_entry(file_path, additions, deletions, diff):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_edit_entry(file_path, additions, deletions, diff)
+
+
+def add_write_entry(file_path, additions, deletions, diff):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_write_entry(file_path, additions, deletions, diff)
+
+
+def add_changed_files_entry(files):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_changed_files_entry(files)
+
+
 def add_question_entry(question, answer):
     bridge = get_bridge()
     if bridge is not None:

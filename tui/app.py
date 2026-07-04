@@ -832,6 +832,28 @@ class AgentTUIApp(App):
             tool_name, description
         )
 
+    def add_edit_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+        self._call_ui(self._append_edit_entry, file_path, additions, deletions, diff)
+
+    def _append_edit_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+        self.query_one("#messages-view", ChatView).add_edit_entry(
+            file_path, additions, deletions, diff
+        )
+
+    def add_write_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+        self._call_ui(self._append_write_entry, file_path, additions, deletions, diff)
+
+    def _append_write_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+        self.query_one("#messages-view", ChatView).add_write_entry(
+            file_path, additions, deletions, diff
+        )
+
+    def add_changed_files_entry(self, files: list[dict]) -> None:
+        self._call_ui(self._append_changed_files_entry, files)
+
+    def _append_changed_files_entry(self, files: list[dict]) -> None:
+        self.query_one("#messages-view", ChatView).add_changed_files_entry(files)
+
     def add_question_entry(self, question: str, answer: str) -> None:
         self._call_ui(self._append_question_entry, question, answer)
 
@@ -2543,9 +2565,21 @@ class AgentTUIApp(App):
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._display_response(response)
+        self._maybe_show_changed_files()
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
+
+    def _maybe_show_changed_files(self) -> None:
+        if self.chat is None:
+            return
+        try:
+            summary = self.chat.agent_tools.changed_files_summary()
+        except Exception:
+            return
+        if not summary:
+            return
+        self.query_one("#messages-view", ChatView).add_changed_files_entry(summary)
 
     def _finish_with_error(self, error: Exception) -> None:
         self._pause_thinking_elapsed_timer()
@@ -2805,6 +2839,22 @@ class AgentTUIApp(App):
             content = clean_display_text_preserve_newlines(display.get("content", ""))
             if content:
                 view.add_web_search_entry(content)
+                return True
+        if kind == "file_edit":
+            file_path = clean_display_text_preserve_newlines(display.get("file_path", ""))
+            additions = int(display.get("additions", 0) or 0)
+            deletions = int(display.get("deletions", 0) or 0)
+            diff = display.get("diff", "")
+            if file_path:
+                view.add_edit_entry(file_path, additions, deletions, diff)
+                return True
+        if kind == "file_write":
+            file_path = clean_display_text_preserve_newlines(display.get("file_path", ""))
+            additions = int(display.get("additions", 0) or 0)
+            deletions = int(display.get("deletions", 0) or 0)
+            diff = display.get("diff", "")
+            if file_path:
+                view.add_write_entry(file_path, additions, deletions, diff)
                 return True
         return False
 

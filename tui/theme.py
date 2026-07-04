@@ -15,6 +15,11 @@ FULL_ACCESS = "#fe8549"
 INFO_BAR_BACKGROUND = "#1e1e1e"
 OVERLAY_BACKGROUND = "rgba(0, 0, 0, 0.6)"
 
+DIFF_ADD_BG = "#1e3a1e"
+DIFF_ADD_FG = "#7fd97f"
+DIFF_DEL_BG = "#3a1e1e"
+DIFF_DEL_FG = "#d97f7f"
+
 
 def render_css(template: str) -> str:
     return Template(template).substitute(
@@ -28,4 +33,8 @@ def render_css(template: str) -> str:
         FULL_ACCESS=FULL_ACCESS,
         INFO_BAR_BACKGROUND=INFO_BAR_BACKGROUND,
         OVERLAY_BACKGROUND=OVERLAY_BACKGROUND,
+        DIFF_ADD_BG=DIFF_ADD_BG,
+        DIFF_ADD_FG=DIFF_ADD_FG,
+        DIFF_DEL_BG=DIFF_DEL_BG,
+        DIFF_DEL_FG=DIFF_DEL_FG,
     )
