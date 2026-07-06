@@ -253,6 +253,12 @@ def add_write_entry(file_path, additions, deletions, diff):
         bridge.add_write_entry(file_path, additions, deletions, diff)
 
 
+def add_shell_entry(command, output):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_shell_entry(command, output)
+
+
 def add_changed_files_entry(files):
     bridge = get_bridge()
     if bridge is not None:

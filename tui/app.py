@@ -848,6 +848,12 @@ class AgentTUIApp(App):
             file_path, additions, deletions, diff
         )
 
+    def add_shell_entry(self, command: str, output: str) -> None:
+        self._call_ui(self._append_shell_entry, command, output)
+
+    def _append_shell_entry(self, command: str, output: str) -> None:
+        self.query_one("#messages-view", ChatView).add_shell_entry(command, output)
+
     def add_changed_files_entry(self, files: list[dict]) -> None:
         self._call_ui(self._append_changed_files_entry, files)
 
@@ -2855,6 +2861,12 @@ class AgentTUIApp(App):
             diff = display.get("diff", "")
             if file_path:
                 view.add_write_entry(file_path, additions, deletions, diff)
+                return True
+        if kind == "shell":
+            command = clean_display_text_preserve_newlines(display.get("command", ""))
+            output = display.get("output", "")
+            if command:
+                view.add_shell_entry(command, output)
                 return True
         return False
 

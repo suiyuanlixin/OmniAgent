@@ -19,6 +19,7 @@ from skills import SkillRegistry
 from ui import (
     add_edit_entry,
     add_question_entry,
+    add_shell_entry,
     add_web_fetch_entry,
     add_web_search_entry,
     add_write_entry,
@@ -1870,7 +1871,15 @@ class AgentTools:
                 and risk_reason != "script or shell execution detected"
             ):
                 self._record_mutating_command(command)
-            return _timeout_result(command, error, COMMAND_TIMEOUT_SECONDS)
+            result = _timeout_result(command, error, COMMAND_TIMEOUT_SECONDS)
+            self._display_payload = {
+                "kind": "shell",
+                "command": command,
+                "output": result,
+            }
+            self._before_visible_output()
+            add_shell_entry(command, result)
+            return result
         if (
             risk_level == "confirm"
             and risk_reason != "script or shell execution detected"
@@ -1888,7 +1897,15 @@ class AgentTools:
         if not combined:
             combined = "(no output)"
         combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
-        return f"Exit code: {completed.returncode}\n{combined}"
+        result = f"Exit code: {completed.returncode}\n{combined}"
+        self._display_payload = {
+            "kind": "shell",
+            "command": command,
+            "output": result,
+        }
+        self._before_visible_output()
+        add_shell_entry(command, result)
+        return result
 
     def _local_http_check(self, tool_input):
         root = self._resolve_path(str(tool_input.get("root") or "."))
@@ -1952,13 +1969,33 @@ class AgentTools:
                     lines.append(f"{suffix} {url_path} -> {status_text}")
             result = "\n".join(lines)
             if not passed:
-                return _error_result(result)
-            return "Local HTTP check passed.\n" + result
+                result = _error_result(result)
+            else:
+                result = "Local HTTP check passed.\n" + result
+            cmd_str = " ".join(command) + f" (serving {self._display_path(root)})"
+            self._display_payload = {
+                "kind": "shell",
+                "command": cmd_str,
+                "output": result,
+            }
+            self._before_visible_output()
+            add_shell_entry(cmd_str, result)
+            return result
         finally:
             _terminate_process(process)
 
     def _git_status(self, tool_input):
-        return self._run_git_command(["status", "--short"], "(working tree clean)")
+        args = ["status", "--short"]
+        result = self._run_git_command(args, "(working tree clean)")
+        cmd_str = "git " + " ".join(args)
+        self._display_payload = {
+            "kind": "shell",
+            "command": cmd_str,
+            "output": result,
+        }
+        self._before_visible_output()
+        add_shell_entry(cmd_str, result)
+        return result
 
     def _git_diff(self, tool_input):
         cached = _optional_bool(tool_input, "cached", False)
@@ -1984,7 +2021,16 @@ class AgentTools:
             resolved = self._resolve_path(file_path)
             args.extend(["--", str(resolved.relative_to(self.workspace_dir))])
 
-        return self._run_git_command(args, empty_message)
+        result = self._run_git_command(args, empty_message)
+        cmd_str = "git " + " ".join(args)
+        self._display_payload = {
+            "kind": "shell",
+            "command": cmd_str,
+            "output": result,
+        }
+        self._before_visible_output()
+        add_shell_entry(cmd_str, result)
+        return result
 
     def _grep(self, tool_input):
         pattern = _required_string(tool_input, "pattern")

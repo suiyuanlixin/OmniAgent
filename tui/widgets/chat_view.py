@@ -339,6 +339,110 @@ class ChatView(Widget):
         color: $PAGE_BACKGROUND;
     }
 
+    ShellBlock {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    ShellRow {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    ShellRow > .shell-row-header {
+        width: 100%;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+    ShellRow > .shell-row-header > .shell-row-label {
+        width: auto;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+    }
+    ShellRow > .shell-row-header > .shell-row-shell-label {
+        width: auto;
+        height: 1;
+        margin: 0;
+        padding: 0 0 0 1;
+        background: transparent;
+        color: $TEXT_PRIMARY;
+        text-align: left;
+        content-align: left middle;
+    }
+    ShellRow > .shell-row-header > .shell-row-command {
+        width: 1fr;
+        height: 1;
+        margin: 0;
+        padding: 0 0 0 1;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+        overflow: hidden;
+    }
+    ShellRow > .shell-row-header > .shell-row-command.hidden {
+        display: none;
+    }
+
+    ShellRow > .shell-row-wrap {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+    ShellRow > .shell-row-wrap.hidden {
+        display: none;
+    }
+    ShellRow > .shell-row-wrap > .shell-row-top-spacer {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $PAGE_BACKGROUND;
+    }
+    ShellRow > .shell-row-wrap > .shell-row-container {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0 1;
+        background: $INFO_BAR_BACKGROUND;
+    }
+    ShellRow > .shell-row-wrap > .shell-row-container > .shell-command-display {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        color: $TEXT_PRIMARY;
+        background: transparent;
+    }
+    ShellRow > .shell-row-wrap > .shell-row-container > .shell-output-display {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        padding: 0;
+        color: $TEXT_MUTED;
+        background: transparent;
+    }
+    ShellRow > .shell-row-wrap > .shell-row-bottom-spacer {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $PAGE_BACKGROUND;
+    }
+
     ChangedFilesBlock {
         width: 100%;
         height: auto;
@@ -444,6 +548,7 @@ class ChatView(Widget):
         self._explored_block: ExploredBlock | None = None
         self._edited_block: EditedBlock | None = None
         self._write_block: WrittenBlock | None = None
+        self._shell_block: ShellBlock | None = None
         self._questions_block: QuestionsBlock | None = None
 
     def compose(self) -> ComposeResult:
@@ -526,6 +631,7 @@ class ChatView(Widget):
         self._explored_block = None
         self._edited_block = None
         self._write_block = None
+        self._shell_block = None
         self._questions_block = None
 
     def _scroll_end(self) -> None:
@@ -618,6 +724,17 @@ class ChatView(Widget):
     def reset_edited(self) -> None:
         self._edited_block = None
         self._write_block = None
+        self._shell_block = None
+
+    def add_shell_entry(self, command: str, output: str) -> None:
+        self._activate_aux_output("shell")
+        if self._shell_block is None:
+            block = ShellBlock()
+            self.query_one("#chat-log", VerticalScroll).mount(block)
+            self.call_after_refresh(self._scroll_end)
+            self._shell_block = block
+        self._shell_block.add_entry(command, output)
+        self.call_after_refresh(self._scroll_end)
 
     def add_changed_files_entry(self, files: list[dict]) -> None:
         if not files:
@@ -666,6 +783,7 @@ class ChatView(Widget):
         self._explored_block = None
         self._edited_block = None
         self._write_block = None
+        self._shell_block = None
         self._questions_block = None
         self._active_output_kind = None
 
@@ -688,6 +806,8 @@ class ChatView(Widget):
             self._edited_block = None
         if except_kind != "write":
             self._write_block = None
+        if except_kind != "shell":
+            self._shell_block = None
         if except_kind != "questions":
             self._questions_block = None
 
@@ -1116,6 +1236,81 @@ class WrittenBlock(Vertical):
             "[gray]#[/] Write", file_path, additions, deletions, diff, show_stats=False
         )
         self.mount(row)
+
+
+class ShellBlock(Vertical):
+    def __init__(self):
+        super().__init__()
+
+    def add_entry(self, command: str, output: str) -> None:
+        row = ShellRow(command, output)
+        self.mount(row)
+
+
+class ShellRow(Vertical):
+    """A shell command row with single-level expansion.
+    Collapsed: shows '$ Shell command' (truncated).
+    Expanded: shows full command + output in a dark container.
+    """
+
+    def __init__(self, command: str, output: str):
+        super().__init__()
+        self.command = str(command or "")
+        self.output = str(output or "")
+        self._expanded = False
+        self._header_command: Static | None = None
+        self._output_widget: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        truncated = self.command
+        if len(truncated) > 60:
+            truncated = truncated[:57] + "..."
+        with Horizontal(classes="shell-row-header"):
+            yield Static("$", classes="shell-row-label", markup=True, expand=False)
+            yield Static("Shell", classes="shell-row-shell-label", markup=True, expand=False)
+            self._header_command = Static(_escape_markup(truncated), classes="shell-row-command", markup=True, expand=False)
+            yield self._header_command
+        self._output_widget = Static(
+            _escape_markup(self.output.rstrip()),
+            classes="shell-output-display",
+            markup=True,
+            expand=False,
+        )
+        with Vertical(classes="shell-row-wrap hidden"):
+            yield HalfRowSpacer(classes="shell-row-top-spacer")
+            with Vertical(classes="shell-row-container"):
+                yield Static(
+                    _escape_markup(self.command),
+                    classes="shell-command-display",
+                    markup=True,
+                    expand=False,
+                )
+                yield self._output_widget
+            yield BottomHalfRowSpacer(classes="shell-row-bottom-spacer")
+
+    def on_mount(self) -> None:
+        self._update_state()
+
+    def on_click(self, event: events.Click) -> None:
+        self._expanded = not self._expanded
+        self._update_state()
+        event.stop()
+
+    def _update_state(self) -> None:
+        try:
+            wrap = self.query_one(".shell-row-wrap", Vertical)
+        except NoMatches:
+            return
+        if self._expanded:
+            wrap.remove_class("hidden")
+        else:
+            wrap.add_class("hidden")
+        hc = self._header_command
+        if hc is not None:
+            if self._expanded:
+                hc.add_class("hidden")
+            else:
+                hc.remove_class("hidden")
 
 
 class DiffFileRow(Vertical):
