@@ -38,20 +38,20 @@ PRIORITY_RANK = {
     TODO_PRIORITY_P3: 3,
 }
 
-PLAN_APPROVAL_NOT_REQUIRED = "not_required"
-PLAN_APPROVAL_PENDING = "pending"
-PLAN_APPROVAL_APPROVED = "approved"
-PLAN_APPROVAL_REJECTED = "rejected"
-VALID_PLAN_APPROVAL_STATES = {
-    PLAN_APPROVAL_NOT_REQUIRED,
-    PLAN_APPROVAL_PENDING,
-    PLAN_APPROVAL_APPROVED,
-    PLAN_APPROVAL_REJECTED,
+TODO_APPROVAL_NOT_REQUIRED = "not_required"
+TODO_APPROVAL_PENDING = "pending"
+TODO_APPROVAL_APPROVED = "approved"
+TODO_APPROVAL_REJECTED = "rejected"
+VALID_TODO_APPROVAL_STATES = {
+    TODO_APPROVAL_NOT_REQUIRED,
+    TODO_APPROVAL_PENDING,
+    TODO_APPROVAL_APPROVED,
+    TODO_APPROVAL_REJECTED,
 }
 
 FINAL_VERIFICATION_TODO_ID = "final-verification"
-CURRENT_PLAN_FILE = "current.json"
-PLAN_EVENTS_FILE = "events.jsonl"
+CURRENT_TODO_FILE = "current.json"
+TODO_EVENTS_FILE = "events.jsonl"
 
 CRITERION_TYPE_MANUAL = "manual"
 VALID_CRITERION_TYPES = {
@@ -134,27 +134,27 @@ class TodoItem:
 
 
 class TodoStore:
-    def __init__(self, on_change=None, plan_dir=None):
+    def __init__(self, on_change=None, todo_dir=None):
         self.items = []
         self.revision = 0
         self.on_change = on_change
-        self.plan_dir = None
-        self.current_plan_path = None
+        self.todo_dir = None
+        self.current_todo_path = None
         self.events_path = None
-        self.approval_state = PLAN_APPROVAL_NOT_REQUIRED
+        self.approval_state = TODO_APPROVAL_NOT_REQUIRED
         self.approval_note = ""
-        self.plan_signature = ""
+        self.todo_signature = ""
         self._loading = False
-        self.set_plan_dir(plan_dir, load=True)
+        self.set_todo_dir(todo_dir, load=True)
 
-    def set_plan_dir(self, plan_dir, load=False):
-        if plan_dir:
-            self.plan_dir = Path(plan_dir)
-            self.current_plan_path = self.plan_dir / CURRENT_PLAN_FILE
-            self.events_path = self.plan_dir / PLAN_EVENTS_FILE
+    def set_todo_dir(self, todo_dir, load=False):
+        if todo_dir:
+            self.todo_dir = Path(todo_dir)
+            self.current_todo_path = self.todo_dir / CURRENT_TODO_FILE
+            self.events_path = self.todo_dir / TODO_EVENTS_FILE
         else:
-            self.plan_dir = None
-            self.current_plan_path = None
+            self.todo_dir = None
+            self.current_todo_path = None
             self.events_path = None
 
         if load:
@@ -165,16 +165,16 @@ class TodoStore:
         self._notify()
 
     def clear(self):
-        if not self.items and self.approval_state == PLAN_APPROVAL_NOT_REQUIRED:
+        if not self.items and self.approval_state == TODO_APPROVAL_NOT_REQUIRED:
             return
         old_items = self._copy_items()
         self.items = []
-        self.approval_state = PLAN_APPROVAL_NOT_REQUIRED
+        self.approval_state = TODO_APPROVAL_NOT_REQUIRED
         self.approval_note = ""
-        self.plan_signature = ""
+        self.todo_signature = ""
         self.revision += 1
         self._record_event(
-            "plan_cleared",
+            "todo_cleared",
             {"removed": [item.id for item in old_items]},
         )
         self._persist()
@@ -183,9 +183,8 @@ class TodoStore:
     def update(self, todos):
         old_items = self._copy_items()
         old_approval_state = self.approval_state
-        old_signature = self.plan_signature or _plan_signature(self.items)
         items = self._items_from_todos(todos)
-        items = _preserve_approved_plan_items(
+        items = _preserve_approved_todo_items(
             items,
             old_items,
             old_approval_state,
@@ -197,93 +196,47 @@ class TodoStore:
                 if item.system and item.id not in existing_ids:
                     items.append(copy.deepcopy(item))
         _validate_single_in_progress(items)
-
-        new_signature = _plan_signature(items)
-        structure_changed = new_signature != old_signature
-        approval_required = _requires_plan_approval(
-            old_items,
-            items,
-            old_approval_state,
-            structure_changed,
-        )
-        _hold_unapproved_progress(
-            items,
-            old_items,
-            old_approval_state,
-            approval_required,
-        )
         _validate_dependencies(items)
 
         self.items = items
-        self.plan_signature = new_signature
-        self._refresh_approval_state(approval_required)
+        self.todo_signature = _todo_signature(items)
+        self._refresh_approval_state(False)
         self.revision += 1
         self._record_update_events(old_items, old_approval_state)
         self._persist()
         self._notify()
 
-    def approve_plan(self, note="", source="user"):
-        if not self.items or self.all_completed():
-            self.approval_state = PLAN_APPROVAL_NOT_REQUIRED
-            self.approval_note = ""
-            self._persist()
-            self._notify()
-            return False
-        if self.approval_state == PLAN_APPROVAL_APPROVED:
-            return False
-        self.approval_state = PLAN_APPROVAL_APPROVED
-        self.approval_note = _single_line(
-            note or f"Plan approved by {source}.",
-            240,
-        )
-        self.revision += 1
-        self._record_event(
-            "plan_approved",
-            {"source": source, "note": self.approval_note},
-        )
-        self._persist()
-        self._notify()
-        return True
+    def approve_todos(self, note="", source="user"):
+        return False
 
-    def reject_plan(self, reason="", source="user"):
-        if not self.items:
-            return False
-        self.approval_state = PLAN_APPROVAL_REJECTED
-        self.approval_note = _single_line(
-            reason or f"Plan rejected by {source}.",
-            240,
-        )
-        self.revision += 1
-        self._record_event(
-            "plan_rejected",
-            {"source": source, "reason": self.approval_note},
-        )
-        self._persist()
-        self._notify()
-        return True
+    def reject_todos(self, reason="", source="user"):
+        return False
 
     def retry_todo(self, todo_id, reason=""):
         item = self._find_item(todo_id)
         if item is None:
-            raise ValueError(f"Unknown plan item id: {todo_id}")
-        if item.status not in {TODO_STATUS_BLOCKED, TODO_STATUS_FAILED, TODO_STATUS_COMPLETED}:
+            raise ValueError(f"Unknown todo item id: {todo_id}")
+        if item.status not in {
+            TODO_STATUS_BLOCKED,
+            TODO_STATUS_FAILED,
+            TODO_STATUS_COMPLETED,
+        }:
             raise ValueError(
-                f"Plan item '{todo_id}' is {item.status}; only blocked, failed, "
-                "or completed plan items can be retried."
+                f"Todo item '{todo_id}' is {item.status}; only blocked, failed, "
+                "or completed todo items can be retried."
             )
         previous = item.status
         item.status = TODO_STATUS_PENDING
         item.reason = ""
         item.verified = False
         item.verification_note = ""
-        self.approval_state = PLAN_APPROVAL_PENDING
         self.approval_note = _single_line(
-            reason or f"Plan item '{todo_id}' retried from {previous}.",
+            reason or f"Todo item '{todo_id}' retried from {previous}.",
             240,
         )
         self.revision += 1
         self._record_event(
-            "plan_item_retried",
+            "todo_item_retried",
             {
                 "id": item.id,
                 "from_status": previous,
@@ -298,19 +251,18 @@ class TodoStore:
     def unblock_todo(self, todo_id, reason=""):
         item = self._find_item(todo_id)
         if item is None:
-            raise ValueError(f"Unknown plan item id: {todo_id}")
+            raise ValueError(f"Unknown todo item id: {todo_id}")
         if item.status != TODO_STATUS_BLOCKED:
-            raise ValueError(f"Plan item '{todo_id}' is {item.status}, not blocked.")
+            raise ValueError(f"Todo item '{todo_id}' is {item.status}, not blocked.")
         item.status = TODO_STATUS_PENDING
         item.reason = ""
-        self.approval_state = PLAN_APPROVAL_PENDING
         self.approval_note = _single_line(
-            reason or f"Plan item '{todo_id}' unblocked.",
+            reason or f"Todo item '{todo_id}' unblocked.",
             240,
         )
         self.revision += 1
         self._record_event(
-            "plan_item_unblocked",
+            "todo_item_unblocked",
             {"id": item.id, "to_status": item.status, "reason": self.approval_note},
         )
         self._persist()
@@ -322,8 +274,6 @@ class TodoStore:
 
     def ui_items(self):
         if not self.items or self.all_completed():
-            return []
-        if self.approval_state != PLAN_APPROVAL_APPROVED:
             return []
         return self.to_dicts()
 
@@ -345,8 +295,6 @@ class TodoStore:
         return None
 
     def requires_active_todo(self):
-        if self.approval_state != PLAN_APPROVAL_APPROVED:
-            return False
         return any(
             item.status in ACTIONABLE_TODO_STATUSES and not item.system
             for item in self.items
@@ -361,28 +309,13 @@ class TodoStore:
         )
 
     def needs_action_approval(self):
-        if not self.items or self.all_completed():
-            return False
-        if not self.has_actionable_incomplete():
-            return False
-        return self.approval_state in {
-            PLAN_APPROVAL_PENDING,
-            PLAN_APPROVAL_REJECTED,
-        }
+        return False
 
     def incomplete_items(self):
-        return [
-            item
-            for item in self.items
-            if item.status != TODO_STATUS_COMPLETED
-        ]
+        return [item for item in self.items if item.status != TODO_STATUS_COMPLETED]
 
     def actionable_items(self):
-        return [
-            item
-            for item in self.items
-            if item.status in ACTIONABLE_TODO_STATUSES
-        ]
+        return [item for item in self.items if item.status in ACTIONABLE_TODO_STATUSES]
 
     def recommended_next_items(self, limit=3):
         by_id = {item.id: item for item in self.items}
@@ -407,8 +340,8 @@ class TodoStore:
             "revision": self.revision,
             "approval_state": self.approval_state,
             "approval_note": self.approval_note,
-            "plan_path": str(self.current_plan_path) if self.current_plan_path else "",
-            "events_path": str(self.events_path) if self.events_path else "",
+            "todo_path": str(self._snapshot_source_path() or ""),
+            "events_path": str(self._events_source_path() or ""),
             "quality_warnings": self.quality_warnings(
                 max_tool_calls=max_tool_calls,
                 used_tool_calls=used_tool_calls,
@@ -419,7 +352,7 @@ class TodoStore:
     def summary(self, include_completed=True):
         items = self.items if include_completed else self.incomplete_items()
         if not items:
-            return "(no plan items)"
+            return "(no todo items)"
         return "\n".join(_format_todo_line(item) for item in items)
 
     def incomplete_summary(self):
@@ -428,15 +361,11 @@ class TodoStore:
     def actionable_summary(self):
         items = self.actionable_items()
         if not items:
-            return "(no pending or in-progress plan items)"
+            return "(no pending or in-progress todo items)"
         return "\n".join(_format_todo_line(item) for item in items)
 
     def approval_summary(self):
-        state = self.approval_state.replace("_", " ")
-        note = f": {self.approval_note}" if self.approval_note else ""
-        if not self.items:
-            return "Plan approval: not required (no plan items)."
-        return f"Plan approval: {state}{note}."
+        return "Todo list approval: not required."
 
     def budget_status(self, max_tool_calls=None, used_tool_calls=0):
         if max_tool_calls is None:
@@ -469,10 +398,9 @@ class TodoStore:
         lines = [f"Tool budget: {remaining}/{max_calls} calls remaining."]
         if status["next"]:
             next_text = ", ".join(
-                f"{item['priority'].upper()} {item['id']}"
-                for item in status["next"]
+                f"{item['priority'].upper()} {item['id']}" for item in status["next"]
             )
-            lines.append(f"Next recommended plan items: {next_text}.")
+            lines.append(f"Next recommended todo items: {next_text}.")
         actionable_count = len(self.actionable_items())
         if actionable_count and remaining <= actionable_count:
             lines.append(
@@ -487,23 +415,25 @@ class TodoStore:
             return warnings
 
         non_system = [item for item in self.items if not item.system]
-        actionable = [item for item in non_system if item.status in ACTIONABLE_TODO_STATUSES]
+        actionable = [
+            item for item in non_system if item.status in ACTIONABLE_TODO_STATUSES
+        ]
         in_progress = [
             item for item in non_system if item.status == TODO_STATUS_IN_PROGRESS
         ]
         if (
             actionable
-            and self.approval_state == PLAN_APPROVAL_APPROVED
+            and self.approval_state == TODO_APPROVAL_APPROVED
             and not in_progress
         ):
-            warnings.append("Approved active plan has no in_progress item.")
+            warnings.append("Approved active todo list has no in_progress item.")
 
         generated_ids = [
             item.id for item in non_system if item.id.startswith(("step-", "todo-"))
         ]
         if generated_ids:
             warnings.append(
-                "Some plan items use generated ids; stable semantic ids make dependencies "
+                "Some todo items use generated ids; stable semantic ids make dependencies "
                 f"and recovery safer: {', '.join(generated_ids[:5])}."
             )
 
@@ -515,7 +445,7 @@ class TodoStore:
         ]
         if high_without_criteria:
             warnings.append(
-                "High-priority plan items should include observable completion_criteria: "
+                "High-priority todo items should include observable completion_criteria: "
                 + ", ".join(high_without_criteria[:5])
                 + "."
             )
@@ -529,7 +459,7 @@ class TodoStore:
         ]
         if unverified:
             warnings.append(
-                "Completed plan items with criteria still need verification evidence: "
+                "Completed todo items with criteria still need verification evidence: "
                 + ", ".join(unverified[:5])
                 + "."
             )
@@ -542,7 +472,7 @@ class TodoStore:
         ]
         if vague_blockers:
             warnings.append(
-                "Blocked/failed plan items should have specific reasons: "
+                "Blocked/failed todo items should have specific reasons: "
                 + ", ".join(vague_blockers[:5])
                 + "."
             )
@@ -550,16 +480,9 @@ class TodoStore:
         p0_items = [item.id for item in non_system if item.priority == TODO_PRIORITY_P0]
         if len(p0_items) > 2:
             warnings.append(
-                "More than two P0 plan items usually means priorities are not selective: "
+                "More than two P0 todo items usually means priorities are not selective: "
                 + ", ".join(p0_items[:5])
                 + "."
-            )
-
-        if self.approval_state == PLAN_APPROVAL_PENDING:
-            warnings.append("Plan is waiting for approval before action tools can run.")
-        elif self.approval_state == PLAN_APPROVAL_REJECTED:
-            warnings.append(
-                "Plan was rejected; revise it or approve/retry before action tools can run."
             )
 
         if max_tool_calls is not None:
@@ -568,7 +491,7 @@ class TodoStore:
             if actionable and remaining <= len(actionable):
                 warnings.append(
                     f"Only {remaining} tool calls remain for {len(actionable)} actionable "
-                    "plan items; prioritize ready P0/P1 items."
+                    "todo items; prioritize ready P0/P1 items."
                 )
 
         return warnings
@@ -576,15 +499,18 @@ class TodoStore:
     def quality_report(self, max_tool_calls=None, used_tool_calls=0):
         warnings = self.quality_warnings(max_tool_calls, used_tool_calls)
         if not warnings:
-            return "Plan quality: OK."
-        return "Plan quality warnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
+            return "Todo quality: OK."
+        return "Todo quality warnings:\n" + "\n".join(
+            f"- {warning}" for warning in warnings
+        )
 
     def history_tail(self, limit=20):
         limit = max(1, int(limit or 20))
-        if not self.events_path or not self.events_path.is_file():
+        history_path = self._events_source_path()
+        if not history_path or not history_path.is_file():
             return []
         try:
-            lines = self.events_path.read_text(
+            lines = history_path.read_text(
                 encoding="utf-8",
                 errors="replace",
             ).splitlines()
@@ -613,7 +539,9 @@ class TodoStore:
                     and not item.verified
                 ):
                     item.verified = True
-                    item.verification_note = note or "Automatic final verification passed."
+                    item.verification_note = (
+                        note or "Automatic final verification passed."
+                    )
                     changed = True
             if changed:
                 self._record_event(
@@ -637,12 +565,12 @@ class TodoStore:
     def tool_result(self, max_tool_calls=None, used_tool_calls=0):
         parts = []
         if not self.items:
-            parts.append("Plan cleared. Plan panel hidden.")
+            parts.append("Todo list cleared. Todo panel hidden.")
         elif self.all_completed():
-            parts.append("All plan items completed. Plan panel hidden.")
+            parts.append("All todo items completed. Todo panel hidden.")
             parts.append(self.summary())
         else:
-            parts.append("Plan updated:")
+            parts.append("Todo list updated:")
             parts.append(self.summary())
 
         if self.items:
@@ -665,17 +593,14 @@ class TodoStore:
             if not isinstance(todo, dict):
                 raise ValueError(f"items[{index}] must be an object.")
             content = str(
-                todo.get("content")
-                or todo.get("task")
-                or todo.get("title")
-                or ""
+                todo.get("content") or todo.get("task") or todo.get("title") or ""
             ).strip()
             if not content:
                 continue
 
             item_id = str(todo.get("id") or f"step-{index}").strip()
             if item_id in seen_ids:
-                raise ValueError(f"Duplicate plan item id: {item_id}")
+                raise ValueError(f"Duplicate todo item id: {item_id}")
             seen_ids.add(item_id)
 
             status = _normalize_todo_status(todo.get("status"))
@@ -687,7 +612,9 @@ class TodoStore:
                 or ""
             ).strip()
             if status in {TODO_STATUS_BLOCKED, TODO_STATUS_FAILED} and not reason:
-                raise ValueError(f"{status} plan item '{item_id}' must include a reason.")
+                raise ValueError(
+                    f"{status} todo item '{item_id}' must include a reason."
+                )
 
             completion_criteria = _normalize_completion_criteria(
                 todo.get("completion_criteria")
@@ -698,7 +625,7 @@ class TodoStore:
             verification_note = str(todo.get("verification_note") or "").strip()
             if verified and completion_criteria and not verification_note:
                 raise ValueError(
-                    f"Verified plan item '{item_id}' must include verification_note."
+                    f"Verified todo item '{item_id}' must include verification_note."
                 )
 
             items.append(
@@ -720,18 +647,8 @@ class TodoStore:
         return items
 
     def _refresh_approval_state(self, structure_changed):
-        if not self.items or self.all_completed():
-            self.approval_state = PLAN_APPROVAL_NOT_REQUIRED
-            self.approval_note = ""
-            return
-        if not self.has_actionable_incomplete():
-            return
-        if structure_changed:
-            self.approval_state = PLAN_APPROVAL_PENDING
-            self.approval_note = "Plan changed and needs approval before acting."
-        elif self.approval_state not in VALID_PLAN_APPROVAL_STATES:
-            self.approval_state = PLAN_APPROVAL_PENDING
-            self.approval_note = "Plan needs approval before acting."
+        self.approval_state = TODO_APPROVAL_NOT_REQUIRED
+        self.approval_note = ""
 
     def _remove_final_verification_todo(self):
         next_items = [
@@ -799,6 +716,12 @@ class TodoStore:
     def _copy_items(self):
         return [copy.deepcopy(item) for item in self.items]
 
+    def _snapshot_source_path(self):
+        return self.current_todo_path
+
+    def _events_source_path(self):
+        return self.events_path
+
     def _notify(self):
         if self.on_change is None:
             return
@@ -806,55 +729,56 @@ class TodoStore:
 
     def _snapshot(self):
         return {
-            "version": 1,
+            "version": 2,
             "updated_at": _utc_now(),
             "revision": self.revision,
             "approval_state": self.approval_state,
             "approval_note": self.approval_note,
-            "plan_signature": self.plan_signature,
+            "todo_signature": self.todo_signature,
             "items": self.to_dicts(),
             "quality_warnings": self.quality_warnings(),
         }
 
     def _persist(self):
-        if self._loading or not self.current_plan_path:
+        if self._loading or not self.current_todo_path:
             return
         try:
-            self.plan_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.current_plan_path.with_suffix(".json.tmp")
+            self.todo_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.current_todo_path.with_suffix(".json.tmp")
             tmp_path.write_text(
                 json.dumps(self._snapshot(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            tmp_path.replace(self.current_plan_path)
+            tmp_path.replace(self.current_todo_path)
         except OSError:
             return
 
     def _load_snapshot(self):
-        if not self.current_plan_path or not self.current_plan_path.is_file():
+        snapshot_path = self._snapshot_source_path()
+        if not snapshot_path or not snapshot_path.is_file():
             return
         self._loading = True
         try:
             data = json.loads(
-                self.current_plan_path.read_text(encoding="utf-8", errors="replace")
+                snapshot_path.read_text(encoding="utf-8", errors="replace")
             )
             items = self._items_from_todos(data.get("items") or [])
             _validate_dependencies(items)
             self.items = items
             self.revision = int(data.get("revision") or 0)
-            self.approval_state = _normalize_approval_state(
-                data.get("approval_state")
-            )
-            self.approval_note = str(data.get("approval_note") or "").strip()
-            self.plan_signature = str(
-                data.get("plan_signature") or _plan_signature(items)
+            self.approval_state = TODO_APPROVAL_NOT_REQUIRED
+            self.approval_note = ""
+            self.todo_signature = str(
+                data.get("todo_signature")
+                or data.get("plan_signature")
+                or _todo_signature(items)
             )
         except Exception:
             self.items = []
             self.revision = 0
-            self.approval_state = PLAN_APPROVAL_NOT_REQUIRED
+            self.approval_state = TODO_APPROVAL_NOT_REQUIRED
             self.approval_note = ""
-            self.plan_signature = ""
+            self.todo_signature = ""
         finally:
             self._loading = False
         self._notify()
@@ -866,15 +790,15 @@ class TodoStore:
         for item in self.items:
             old = old_by_id.get(item.id)
             if old is None:
-                self._record_event("plan_item_added", {"item": item.to_dict()})
+                self._record_event("todo_item_added", {"item": item.to_dict()})
                 continue
             changes = _item_changes(old, item)
             if not changes:
                 continue
             event_type = (
-                "plan_item_status_changed"
+                "todo_item_status_changed"
                 if set(changes) == {"status"}
-                else "plan_item_updated"
+                else "todo_item_updated"
             )
             payload = {"id": item.id, "changes": changes}
             if "status" in changes:
@@ -884,11 +808,14 @@ class TodoStore:
 
         for item in old_items:
             if item.id not in new_by_id:
-                self._record_event("plan_item_removed", {"id": item.id, "item": item.to_dict()})
+                self._record_event(
+                    "todo_item_removed",
+                    {"id": item.id, "item": item.to_dict()},
+                )
 
         if old_approval_state != self.approval_state:
             self._record_event(
-                "plan_approval_changed",
+                "todo_approval_changed",
                 {
                     "from": old_approval_state,
                     "to": self.approval_state,
@@ -906,7 +833,7 @@ class TodoStore:
             "payload": payload or {},
         }
         try:
-            self.plan_dir.mkdir(parents=True, exist_ok=True)
+            self.todo_dir.mkdir(parents=True, exist_ok=True)
             with self.events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         except OSError:
@@ -918,10 +845,10 @@ def _validate_dependencies(items):
     for item in items:
         for dependency in item.depends_on:
             if dependency == item.id:
-                raise ValueError(f"Plan item '{item.id}' cannot depend on itself.")
+                raise ValueError(f"Todo item '{item.id}' cannot depend on itself.")
             if dependency not in by_id:
                 raise ValueError(
-                    f"Plan item '{item.id}' depends on unknown plan item '{dependency}'."
+                    f"Todo item '{item.id}' depends on unknown todo item '{dependency}'."
                 )
 
     visiting = set()
@@ -931,7 +858,7 @@ def _validate_dependencies(items):
         if item.id in visited:
             return
         if item.id in visiting:
-            raise ValueError("Plan item dependencies cannot contain cycles.")
+            raise ValueError("Todo item dependencies cannot contain cycles.")
         visiting.add(item.id)
         for dependency_id in item.depends_on:
             visit(by_id[dependency_id])
@@ -951,25 +878,21 @@ def _validate_dependencies(items):
         ]
         if unmet:
             raise ValueError(
-                f"Plan item '{item.id}' cannot be {item.status} until dependencies "
+                f"Todo item '{item.id}' cannot be {item.status} until dependencies "
                 f"are completed: {', '.join(unmet)}"
             )
 
 
-def _requires_plan_approval(
+def _requires_todo_approval(
     old_items,
     new_items,
     old_approval_state,
     structure_changed,
 ):
-    if not structure_changed:
-        return False
-    return old_approval_state != PLAN_APPROVAL_APPROVED
+    return False
 
 
-def _preserve_approved_plan_items(items, old_items, old_approval_state):
-    if old_approval_state != PLAN_APPROVAL_APPROVED:
-        return items
+def _preserve_approved_todo_items(items, old_items, old_approval_state):
     if not any(
         item.status in ACTIONABLE_TODO_STATUSES and not item.system
         for item in old_items
@@ -981,9 +904,7 @@ def _preserve_approved_plan_items(items, old_items, old_approval_state):
         return [copy.deepcopy(item) for item in old_non_system]
 
     new_by_id = {item.id: item for item in items if not item.system}
-    old_positions = {
-        item.id: index for index, item in enumerate(old_non_system)
-    }
+    old_positions = {item.id: index for index, item in enumerate(old_non_system)}
     incoming_active_id = ""
     for item in items:
         if not item.system and item.status == TODO_STATUS_IN_PROGRESS:
@@ -1038,11 +959,9 @@ def _incoming_indicates_completed(items, omitted_id, old_positions):
 
 
 def _validate_single_in_progress(items):
-    in_progress = [
-        item.id for item in items if item.status == TODO_STATUS_IN_PROGRESS
-    ]
+    in_progress = [item.id for item in items if item.status == TODO_STATUS_IN_PROGRESS]
     if len(in_progress) > 1:
-        raise ValueError("Only one plan item can be in_progress at a time.")
+        raise ValueError("Only one todo item can be in_progress at a time.")
 
 
 def _hold_unapproved_progress(
@@ -1064,7 +983,7 @@ def _hold_unapproved_progress(
 
         old_item = old_by_id.get(item.id)
         if (
-            old_approval_state == PLAN_APPROVAL_APPROVED
+            old_approval_state == TODO_APPROVAL_APPROVED
             and old_item is not None
             and old_item.status == TODO_STATUS_COMPLETED
         ):
@@ -1092,9 +1011,9 @@ def _normalize_todo_priority(priority):
 
 
 def _normalize_approval_state(state):
-    value = str(state or PLAN_APPROVAL_NOT_REQUIRED).strip().lower()
-    if value not in VALID_PLAN_APPROVAL_STATES:
-        return PLAN_APPROVAL_NOT_REQUIRED
+    value = str(state or TODO_APPROVAL_NOT_REQUIRED).strip().lower()
+    if value not in VALID_TODO_APPROVAL_STATES:
+        return TODO_APPROVAL_NOT_REQUIRED
     return value
 
 
@@ -1114,34 +1033,35 @@ def _normalize_completion_criteria(value):
             text = raw.strip()
             if not text:
                 continue
-            criteria.append(
-                {
-                    "type": CRITERION_TYPE_MANUAL,
-                    "target": "",
-                    "expected": text,
-                }
-            )
+            criteria.append({
+                "type": CRITERION_TYPE_MANUAL,
+                "target": "",
+                "expected": text,
+            })
             continue
         if not isinstance(raw, dict):
             text = str(raw).strip()
             if text:
-                criteria.append(
-                    {
-                        "type": CRITERION_TYPE_MANUAL,
-                        "target": "",
-                        "expected": text,
-                    }
-                )
+                criteria.append({
+                    "type": CRITERION_TYPE_MANUAL,
+                    "target": "",
+                    "expected": text,
+                })
             continue
 
-        criterion_type = str(
-            raw.get("type") or raw.get("kind") or CRITERION_TYPE_MANUAL
-        ).strip().lower().replace("-", "_")
+        criterion_type = (
+            str(raw.get("type") or raw.get("kind") or CRITERION_TYPE_MANUAL)
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
         if criterion_type not in VALID_CRITERION_TYPES:
             raise ValueError(
                 f"completion_criteria[{index}].type is invalid: {criterion_type}"
             )
-        target = str(raw.get("target") or raw.get("command") or raw.get("file") or "").strip()
+        target = str(
+            raw.get("target") or raw.get("command") or raw.get("file") or ""
+        ).strip()
         expected = str(
             raw.get("expected")
             or raw.get("expect")
@@ -1221,22 +1141,20 @@ def _format_criteria(criteria):
     return "; ".join(parts)
 
 
-def _plan_signature(items):
+def _todo_signature(items):
     structural = []
     for item in items:
         if item.system:
             continue
-        structural.append(
-            {
-                "id": item.id,
-                "content": item.content,
-                "priority": item.priority,
-                "depends_on": list(item.depends_on),
-                "completion_criteria": [
-                    dict(criterion) for criterion in item.completion_criteria
-                ],
-            }
-        )
+        structural.append({
+            "id": item.id,
+            "content": item.content,
+            "priority": item.priority,
+            "depends_on": list(item.depends_on),
+            "completion_criteria": [
+                dict(criterion) for criterion in item.completion_criteria
+            ],
+        })
     encoded = json.dumps(structural, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

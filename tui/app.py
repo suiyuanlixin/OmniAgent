@@ -61,6 +61,7 @@ from tui.widgets.project_picker import ProjectPicker
 from tui.widgets.settings import SettingsModal
 from tui.widgets.sidebar import Sidebar
 from tui.widgets.text_area_modal import PromptFileModal, TextAreaModal
+from tui.widgets.todos_panel import TodosPanel
 from team import TeamStore, display_teammate_name
 from ui import (
     clean_display_text,
@@ -212,6 +213,9 @@ class AgentTUIApp(App):
         padding: 1 1 0 1;
         align-horizontal: center;
     }
+    #chat-input-wrap.with-todos {
+        padding-top: 0;
+    }
     #chat-input-wrap > #chat-input {
         margin: 0;
     }
@@ -338,7 +342,7 @@ class AgentTUIApp(App):
         self.chat_busy = False
         self.current_session_record: dict | None = None
         self.current_project_name = ""
-        self.plan_items: list[dict] = []
+        self.todo_items: list[dict] = []
         self._stream_kind: str | None = None
         self._worker_lock = threading.Lock()
         self._message_started_at: float | None = None
@@ -393,6 +397,7 @@ class AgentTUIApp(App):
             with Vertical(id="input-wrapper", classes="welcome"):
                 with Container(id="project-title-wrap"):
                     yield Static(PROJECT_LOGO, id="project-title")
+                yield TodosPanel(id="todos-panel-wrap")
                 with Container(id="chat-input-wrap"):
                     yield ChatInput(id="chat-input")
                 with Container(id="info-bar-wrap"):
@@ -506,7 +511,7 @@ class AgentTUIApp(App):
         save_config_field("agent_plan_enable", event.enabled)
         self._reload_config()
         if self.chat is not None:
-            self.chat.set_agent_plan_enabled(event.enabled)
+            self.chat.set_plan_mode(event.enabled)
         self._apply_config_to_controls()
 
     def on_chat_input_approval_changed(self, event: ChatInput.ApprovalChanged) -> None:
@@ -719,8 +724,17 @@ class AgentTUIApp(App):
     def append_stream_response(self, content) -> None:
         self._call_ui(self._append_stream_widget, "assistant", str(content or ""), "")
 
-    def set_plan_items(self, items) -> None:
-        self.plan_items = [item for item in items or [] if isinstance(item, dict)]
+    def set_todo_items(self, items) -> None:
+        self.todo_items = [item for item in items or [] if isinstance(item, dict)]
+        self._call_ui(self._set_todo_panel_items, self.todo_items)
+
+    def _set_todo_panel_items(self, items) -> None:
+        has_items = bool(items)
+        self.query_one("#todos-panel-wrap", TodosPanel).set_items(items)
+        self.query_one("#chat-input-wrap", Container).set_class(
+            has_items,
+            "with-todos",
+        )
 
     def set_context_usage(self, input_tokens, context_window_tokens) -> None:
         self._call_ui(self._set_context_label, input_tokens, context_window_tokens)
@@ -832,18 +846,26 @@ class AgentTUIApp(App):
             tool_name, description
         )
 
-    def add_edit_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+    def add_edit_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
         self._call_ui(self._append_edit_entry, file_path, additions, deletions, diff)
 
-    def _append_edit_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+    def _append_edit_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
         self.query_one("#messages-view", ChatView).add_edit_entry(
             file_path, additions, deletions, diff
         )
 
-    def add_write_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+    def add_write_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
         self._call_ui(self._append_write_entry, file_path, additions, deletions, diff)
 
-    def _append_write_entry(self, file_path: str, additions: int, deletions: int, diff: str) -> None:
+    def _append_write_entry(
+        self, file_path: str, additions: int, deletions: int, diff: str
+    ) -> None:
         self.query_one("#messages-view", ChatView).add_write_entry(
             file_path, additions, deletions, diff
         )
@@ -2188,7 +2210,7 @@ class AgentTUIApp(App):
         save_config_field("agent_plan_enable", enabled)
         self._reload_config()
         if self.chat is not None:
-            self.chat.set_agent_plan_enabled(enabled)
+            self.chat.set_plan_mode(enabled)
         self._apply_config_to_controls()
 
     def _on_setting_agent_team_changed(self, value: str) -> None:
@@ -2388,7 +2410,8 @@ class AgentTUIApp(App):
         self.chat = None
         self.chat_busy = False
         self.current_session_record = None
-        self.plan_items = []
+        self.todo_items = []
+        self._set_todo_panel_items([])
         self._stream_kind = None
         self._set_input_enabled(True)
         self._set_context_label(0, self.config.context_window_tokens)
@@ -2779,7 +2802,7 @@ class AgentTUIApp(App):
             or tool_call.get("tool_name")
             or ""
         )
-        if name in {"update_plan", "ask_user", "web_fetch", "web_search"}:
+        if name in {"update_todo", "ask_user", "web_fetch", "web_search"}:
             return
         arguments = (
             tool_call.get("input")
@@ -2794,7 +2817,7 @@ class AgentTUIApp(App):
 
     def _replay_tool_result_message(self, view: ChatView, message: dict) -> None:
         name = str(message.get("tool_name") or message.get("name") or "")
-        if name == "update_plan":
+        if name == "update_todo":
             return
         if self._replay_tool_result_display(view, message.get("display")):
             return
@@ -2808,7 +2831,7 @@ class AgentTUIApp(App):
         if not isinstance(block, dict):
             return
         name = str(block.get("tool_name") or "")
-        if name == "update_plan":
+        if name == "update_todo":
             return
         if self._replay_tool_result_display(view, block.get("display")):
             return
@@ -2847,7 +2870,9 @@ class AgentTUIApp(App):
                 view.add_web_search_entry(content)
                 return True
         if kind == "file_edit":
-            file_path = clean_display_text_preserve_newlines(display.get("file_path", ""))
+            file_path = clean_display_text_preserve_newlines(
+                display.get("file_path", "")
+            )
             additions = int(display.get("additions", 0) or 0)
             deletions = int(display.get("deletions", 0) or 0)
             diff = display.get("diff", "")
@@ -2855,7 +2880,9 @@ class AgentTUIApp(App):
                 view.add_edit_entry(file_path, additions, deletions, diff)
                 return True
         if kind == "file_write":
-            file_path = clean_display_text_preserve_newlines(display.get("file_path", ""))
+            file_path = clean_display_text_preserve_newlines(
+                display.get("file_path", "")
+            )
             additions = int(display.get("additions", 0) or 0)
             deletions = int(display.get("deletions", 0) or 0)
             diff = display.get("diff", "")

@@ -16,7 +16,7 @@ DEFAULT_TEAMMATE_PROMPT = "You are a teammate in OmniAgent's team."
 FORBIDDEN_TEAM_TOOL_NAMES = {
     "dispatch_subagent",
     "spawn_teammate",
-    "update_plan",
+    "update_todo",
     "ask_user",
 }
 

@@ -18,7 +18,7 @@ from ui import (
     print_stream_response_continue,
     print_stream_response_start,
     print_warn,
-    set_plan_panel,
+    set_todo_panel,
     set_context_usage,
 )
 from config import (
@@ -113,23 +113,22 @@ Rules:
 - Stop when the task is complete and summarize what changed."""
 
 
-AGENT_PLAN_RULES = """
-Plan rules:
-- For multi-step tasks, create and maintain a task plan with update_plan before acting.
-- Call update_plan with the full current plan item list whenever task status changes.
-- After a plan is approved, keep existing plan item ids in later update_plan calls until they are completed, blocked, or failed; do not drop or replace approved items just to revise the plan.
-- Give each plan item a stable id when dependencies matter. Use depends_on to block later work until prerequisites are completed.
+AGENT_TODO_RULES = """
+Todo rules:
+- For multi-step tasks, create and maintain a task todo list with update_todo before acting.
+- Call update_todo with the full current todo item list whenever task status changes.
+- Keep existing todo item ids in later update_todo calls until they are completed, blocked, or failed; do not drop or replace active items just to revise the todo list.
+- Give each todo item a stable id when dependencies matter. Use depends_on to block later work until prerequisites are completed.
 - Use priority p0/p1/p2/p3 to reflect urgency. Prefer p0/p1 tasks when budget is tight.
-- Treat planning and acting as separate phases. A new plan requires approval before non-planning tools run; approved plans can be updated in place while work continues.
-- Before plan approval, leave planned work pending; do not mark a plan item in_progress or completed until tools have actually run after approval.
-- Keep at most one plan item in_progress. Mark the active step in_progress before working on it.
+- Todo updates take effect immediately; do not pause for todo approval before continuing the work.
+- Keep at most one todo item in_progress. Mark the active step in_progress before working on it.
 - Use structured completion_criteria for tasks that need observable proof. Prefer objects like {"type":"test","target":"pytest path","expected":"exit code 0"}.
 - Set verified=true with a verification_note only after tool output proves the criteria.
 - Use blocked with a clear reason when progress requires user input or an external change.
 - Use failed with a clear reason when verification fails or an attempted approach is invalid; do not mark it completed just to finish.
-- Keep the plan high quality: avoid vague items, avoid too many P0 items, include criteria for P0/P1 work, and keep dependencies explicit.
-- Mark completed steps completed, and do not give the final answer while any plan item is pending or in_progress.
-- Skip update_plan for simple one-step answers or direct questions that do not need a plan."""
+- Keep the todo list high quality: avoid vague items, avoid too many P0 items, include criteria for P0/P1 work, and keep dependencies explicit.
+- Mark completed steps completed, and do not give the final answer while any todo item is pending or in_progress.
+- Skip update_todo for simple one-step answers or direct questions that do not need a todo list."""
 
 
 COMPACTION_SYSTEM_PROMPT = """你负责压缩聊天上下文。
@@ -269,13 +268,14 @@ class OmniAgent:
             web_search_max_results=web_search_max_results,
             web_search_depth=web_search_depth,
             web_search_topic=web_search_topic,
-            todo_update_callback=set_plan_panel,
-            todos_enabled=agent_plan_enabled,
+            todo_update_callback=set_todo_panel,
+            todos_enabled=True,
             skills_enabled=skills_enabled,
             skills_app_enabled=skills_source_app,
             skills_workspace_enabled=skills_source_workspace,
             skills_auto_catalog=skills_auto_catalog,
             skills_max_chars=skills_max_chars,
+            plan_mode=agent_plan_enabled,
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
         self.agent_show_thinking = bool(agent_show_thinking)
@@ -444,8 +444,8 @@ class OmniAgent:
     def set_agent_show_thinking(self, enabled):
         self.agent_show_thinking = bool(enabled)
 
-    def set_agent_plan_enabled(self, enabled):
-        self.agent_tools.set_todos_enabled(enabled)
+    def set_plan_mode(self, enabled):
+        self.agent_tools.set_plan_mode(enabled)
         self.agent_final_check_done = False
 
     def set_agent_skills(self, enabled):
@@ -569,7 +569,8 @@ class OmniAgent:
             "max_tool_calls": self.max_agent_tool_calls,
             "approval_mode": self.agent_tools.approval_mode,
             "show_thinking": bool(self.agent_show_thinking),
-            "plan_enabled": self.agent_tools.todos_enabled,
+            "plan_enabled": self.agent_tools.plan_mode,
+            "plan_mode": self.agent_tools.plan_mode,
             "skills": self.agent_tools.skills_status(),
             "plan": self.agent_tools.todo_status(),
             "team_enabled": self.agent_team_enabled,
@@ -598,40 +599,40 @@ class OmniAgent:
             "available_types": available_types,
         }
 
-    def get_plan_status(self):
+    def get_todo_status(self):
         return self.agent_tools.todo_status()
 
-    def clear_plan(self):
+    def clear_todos(self):
         self.agent_tools.clear_todos()
         self.resume_existing_plan = False
 
-    def approve_plan(self, note=""):
+    def approve_todos(self, note=""):
         changed = self.agent_tools.approve_todos(note)
         if changed:
             self.resume_existing_plan = True
         return changed
 
-    def reject_plan(self, reason=""):
+    def reject_todos(self, reason=""):
         return self.agent_tools.reject_todos(reason)
 
-    def retry_plan_item(self, todo_id, reason=""):
+    def retry_todo(self, todo_id, reason=""):
         changed = self.agent_tools.retry_todo(todo_id, reason)
         if changed:
             self.agent_final_check_done = False
             self.resume_existing_plan = True
         return changed
 
-    def unblock_plan_item(self, todo_id, reason=""):
+    def unblock_todo(self, todo_id, reason=""):
         changed = self.agent_tools.unblock_todo(todo_id, reason)
         if changed:
             self.agent_final_check_done = False
             self.resume_existing_plan = True
         return changed
 
-    def get_plan_quality_report(self):
+    def get_todo_quality_report(self):
         return self.agent_tools.todo_quality_report()
 
-    def get_plan_history(self, limit=20):
+    def get_todo_history(self, limit=20):
         return self.agent_tools.todo_history(limit)
 
     def send_message(
@@ -2244,6 +2245,7 @@ class OmniAgent:
                     self.agent_tools.todos_enabled,
                     extra_definitions=self.agent_tools.subagent_tool_definitions()
                     + self.agent_tools.team_tool_definitions(),
+                    plan_mode=self.agent_tools.plan_mode,
                 ),
                 stream=True,
             )
@@ -2391,6 +2393,7 @@ class OmniAgent:
                 self.agent_tools.todos_enabled,
                 extra_definitions=self.agent_tools.subagent_tool_definitions()
                 + self.agent_tools.team_tool_definitions(),
+                plan_mode=self.agent_tools.plan_mode,
             ),
             stream=True,
             **self._anthropic_request_options(),
@@ -3295,13 +3298,12 @@ class OmniAgent:
             self.conversation_history.append({
                 "role": "user",
                 "content": (
-                    "Automatic task plan check for this local agent run:\n\n"
-                    f"{self.agent_tools.todo_actionable_summary()}\n\n"
-                    "There are still pending or in-progress plan items. Continue using tools "
+                    "Automatic task todo list check for this local agent run:\n\n"
+                    f"{self.agent_tools.todo_incomplete_summary()}\n\n"
+                    "There are still non-completed todo items. Continue using tools "
                     "to finish the remaining work. Respect depends_on before starting later "
-                    "items, and update the plan as each item changes. Only provide the "
-                    "final response after all pending/in-progress plan items are completed, blocked, "
-                    "or failed with a clear reason."
+                    "items, and update the todo list as each item changes. Only provide the "
+                    "final response after every todo item is completed."
                     f"{extra_guidance}"
                 ),
             })
@@ -3323,25 +3325,16 @@ class OmniAgent:
         )
 
         if verification_passed:
-            if self.agent_tools.todos_enabled:
-                verification_instruction = (
-                    "Automatic final verification passed. Completed plan items with completion criteria "
-                    "are now tied to this verification result. "
-                )
-            else:
-                verification_instruction = "Automatic final verification passed. "
+            verification_instruction = (
+                "Automatic final verification passed. Completed todo items with completion criteria "
+                "are now tied to this verification result. "
+            )
         else:
-            if self.agent_tools.todos_enabled:
-                verification_instruction = (
-                    "Automatic final verification failed, and the Plan now includes a failed "
-                    "automatic verification item. Continue using tools to fix the failure and update "
-                    "the plan; if you cannot proceed, mark the relevant plan item blocked with a clear reason. "
-                )
-            else:
-                verification_instruction = (
-                    "Automatic final verification failed. Continue using tools to fix the failure; "
-                    "the plan is disabled, so do not call update_plan. "
-                )
+            verification_instruction = (
+                "Automatic final verification failed, and the todo list now includes a failed "
+                "automatic verification item. Continue using tools to fix the failure and update "
+                "the todo list; if you cannot proceed, mark the relevant todo item blocked with a clear reason. "
+            )
         self.conversation_history.append({
             "role": "user",
             "content": (
@@ -3365,12 +3358,12 @@ class OmniAgent:
         )
 
     def _agent_plan_check_exit_note(self):
-        summary = self.agent_tools.todo_actionable_summary()
+        summary = self.agent_tools.todo_incomplete_summary()
         return (
             "OmniAgent stopped the automatic plan check to avoid a repeat loop. "
             "The model returned a final response without using tools after the same "
-            "plan check had already been sent, and the plan still has pending or "
-            "in-progress items:\n\n"
+            "plan check had already been sent, and the plan still has non-completed "
+            "items:\n\n"
             f"{summary}"
         )
 
@@ -4294,13 +4287,25 @@ class OmniAgent:
 
     def _agent_system_prompt(self):
         prompt = AGENT_SYSTEM_PROMPT
-        if self.agent_tools.todos_enabled:
-            prompt += "\n\n" + AGENT_PLAN_RULES
-        else:
+        prompt += "\n\n" + AGENT_TODO_RULES
+        if self.agent_tools.plan_mode:
             prompt += (
-                "\n\nAgent plan is disabled for this session. Do not call update_plan, "
-                "do not wait for plan approval, and do not refer to plan state as required "
-                "for completion."
+                "\n\nYou are in Plan mode. This is a planning and clarification workflow "
+                "for 'think it through before touching code'. Stay read-only: you may "
+                "inspect the workspace and use only read/search tools plus ask_user and "
+                "update_todo. Do NOT modify files or run commands."
+                "\n- Use Plan mode when the request is still ambiguous, the change is risky, "
+                "the user wants design/options/roadmap first, or key decisions still need "
+                "confirmation."
+                "\n- ask_user is available only in Plan mode. Use it for up to 3 short, "
+                "high-impact clarification questions, one question at a time."
+                "\n- Your final output in Plan mode does not need a rigid format, but it "
+                "should usually make clear: the recommendation or conclusion, why it is "
+                "recommended, concrete implementation steps or a task list, and any points "
+                "that still need user confirmation."
+                "\n- update_todo is optional in Plan mode. Use it when a concrete execution "
+                "todo list would help the later Build phase; otherwise a clear plan, design, "
+                "or roadmap is enough."
             )
         prompt += (
             "\n- Use web_fetch when the user provides a specific public webpage URL "
@@ -4319,14 +4324,15 @@ class OmniAgent:
                 "dispatch_subagent calls in the same assistant tool-use turn; OmniAgent "
                 "will execute them safely in order for terminal v1."
             )
-        prompt += (
-            "\n- Use ask_user only for an important uncertainty that materially affects "
-            "the goal, scope, tradeoffs, or acceptance criteria and cannot be resolved "
-            "from local files, tools, or web facts. Ask one multiple-choice question at a time."
-            "\n- When you need the user to choose among options during an Agent task, "
-            "call ask_user instead of writing a numbered or bulleted choice list in normal "
-            "assistant text. After ask_user returns, continue the task with the selected option."
-        )
+        if self.agent_tools.plan_mode:
+            prompt += (
+                "\n- Use ask_user only for an important uncertainty that materially affects "
+                "the goal, scope, tradeoffs, or acceptance criteria and cannot be resolved "
+                "from local files, tools, or web facts. Ask one multiple-choice question at a time."
+                "\n- When you need the user to choose among options during planning, "
+                "call ask_user instead of writing a numbered or bulleted choice list in normal "
+                "assistant text. After ask_user returns, continue the planning work."
+            )
         if self.agent_tools.web_search_available:
             prompt += (
                 "\n- Use web_search for recent, unstable, or external facts when local files "
@@ -4528,6 +4534,7 @@ class OmniAgent:
         include_web_search = self.agent_tools.web_search_available
         include_skills = self.agent_tools.skills_available
         include_plan = self.agent_tools.todos_enabled
+        plan_mode = self.agent_tools.plan_mode
         extra_definitions = (
             self.agent_tools.subagent_tool_definitions()
             + self.agent_tools.team_tool_definitions()
@@ -4538,12 +4545,14 @@ class OmniAgent:
                 include_skills,
                 include_plan,
                 extra_definitions=extra_definitions,
+                plan_mode=plan_mode,
             )
         return glm_tool_schemas(
             include_web_search,
             include_skills,
             include_plan,
             extra_definitions=extra_definitions,
+            plan_mode=plan_mode,
         )
 
     def _subagent_tool_schemas(self, spec):
@@ -5009,14 +5018,14 @@ class OmniAgent:
         self.conversation_history = []
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
-        self.clear_plan()
+        self.clear_todos()
         self._clear_context_usage()
 
     def set_history(self, history):
         self.conversation_history = list(history or [])
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
-        self.clear_plan()
+        self.clear_todos()
         self._clear_context_usage()
 
     def get_history(self):

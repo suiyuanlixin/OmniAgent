@@ -14,7 +14,7 @@ import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 
-from planning import TodoStore
+from todo import TodoStore
 from skills import SkillRegistry
 from ui import (
     add_edit_entry,
@@ -27,7 +27,6 @@ from ui import (
     get_agent_confirmation,
     get_agent_choice,
     get_agent_diff_confirmation,
-    get_agent_plan_confirmation,
 )
 from search import (
     DEFAULT_WEB_SEARCH_DEPTH,
@@ -73,6 +72,22 @@ WEB_FETCH_MAX_CHARS = 60000
 WEB_FETCH_MAX_RESPONSE_BYTES = 1000000
 WEB_FETCH_MAX_REDIRECTS = 5
 NO_WORKSPACE_TOOLS = {"read_program_docs", "web_fetch", "web_search"}
+
+PLAN_MODE_ALLOWED_TOOLS = frozenset({
+    "update_todo",
+    "ask_user",
+    "read_file",
+    "read_program_docs",
+    "list_dir",
+    "grep",
+    "glob",
+    "git_status",
+    "git_diff",
+    "web_fetch",
+    "web_search",
+    "list_skills",
+    "read_skill",
+})
 
 SKIP_DIRS = {
     ".git",
@@ -137,8 +152,8 @@ ASK_USER_TOOL_DEFINITION = {
     "name": "ask_user",
     "description": (
         "Ask the user one important multiple-choice question and return the selected option. "
-        "In Agent mode, use this tool instead of asking the user to choose from options "
-        "in normal assistant text. "
+        "This tool is available only in Plan mode. Use it instead of asking the user to "
+        "choose from options in normal assistant text. "
         "Use only for uncertainty that materially affects goal, scope, tradeoffs, or acceptance "
         "criteria and cannot be resolved from local files, tools, or web facts."
     ),
@@ -165,12 +180,12 @@ ASK_USER_TOOL_DEFINITION = {
 
 TOOL_DEFINITIONS = [
     {
-        "name": "update_plan",
+        "name": "update_todo",
         "description": (
-            "Replace the current task plan with a full list of plan items. "
+            "Replace the current task todo list with a full list of todo items. "
             "Use this for multi-step agent work. Supports dependencies, priorities, "
-            "completion criteria, and blocked/failed states. Keep existing approved "
-            "plan item ids until they are completed, blocked, or failed. At most one "
+            "completion criteria, and blocked/failed states. Keep existing todo item "
+            "ids until they are completed, blocked, or failed. At most one "
             "item may be in_progress."
         ),
         "input_schema": {
@@ -179,9 +194,9 @@ TOOL_DEFINITIONS = [
                 "items": {
                     "type": "array",
                     "description": (
-                        "The complete current plan item list. Preserve existing approved "
+                        "The complete current todo item list. Preserve existing "
                         "items in this array until they are completed, blocked, or failed. "
-                        "Use an empty array only when intentionally clearing an inactive plan."
+                        "Use an empty array only when intentionally clearing an inactive todo list."
                     ),
                     "items": {
                         "type": "object",
@@ -228,7 +243,7 @@ TOOL_DEFINITIONS = [
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": (
-                                    "Plan item ids that must be completed before this task can be "
+                                    "Todo item ids that must be completed before this task can be "
                                     "in_progress or completed."
                                 ),
                             },
@@ -295,7 +310,7 @@ TOOL_DEFINITIONS = [
                                 "type": "boolean",
                                 "description": (
                                     "Whether the completion criteria were verified by tool output. "
-                                    "Use only with completed plan items."
+                                    "Use only with completed todo items."
                                 ),
                             },
                             "verification_note": {
@@ -474,7 +489,7 @@ TOOL_DEFINITIONS = [
         "description": (
             "Start a temporary Python static HTTP server inside the workspace, request one "
             "or more local paths, then terminate the server before returning. Use this for "
-            "static-site plan items like 'start static service + curl check 200' instead of "
+            "static-site todo items like 'start static service + curl check 200' instead of "
             "running a foreground server with bash."
         ),
         "input_schema": {
@@ -693,18 +708,24 @@ def tool_definitions(
     extra_definitions=None,
     only_tools=None,
     exclude_tools=None,
+    plan_mode=False,
 ):
     definitions = [
         tool
         for tool in TOOL_DEFINITIONS
-        if include_plan or tool["name"] != "update_plan"
+        if include_plan or tool["name"] != "update_todo"
     ]
+    if not plan_mode:
+        definitions = [tool for tool in definitions if tool["name"] != "ask_user"]
     if include_skills:
         definitions.extend(SKILL_TOOL_DEFINITIONS)
     if include_web_search:
         definitions.append(WEB_SEARCH_TOOL_DEFINITION)
     if extra_definitions:
         definitions.extend(extra_definitions)
+    if plan_mode:
+        only_tools = (only_tools or set()) | PLAN_MODE_ALLOWED_TOOLS
+        only_tools = only_tools & {d["name"] for d in definitions}
     return _filter_tool_definition_list(definitions, only_tools, exclude_tools)
 
 
@@ -715,6 +736,7 @@ def anthropic_tool_schemas(
     extra_definitions=None,
     only_tools=None,
     exclude_tools=None,
+    plan_mode=False,
 ):
     return tool_definitions(
         include_web_search,
@@ -723,6 +745,7 @@ def anthropic_tool_schemas(
         extra_definitions=extra_definitions,
         only_tools=only_tools,
         exclude_tools=exclude_tools,
+        plan_mode=plan_mode,
     )
 
 
@@ -733,6 +756,7 @@ def glm_tool_schemas(
     extra_definitions=None,
     only_tools=None,
     exclude_tools=None,
+    plan_mode=False,
 ):
     return [
         {
@@ -750,6 +774,7 @@ def glm_tool_schemas(
             extra_definitions=extra_definitions,
             only_tools=only_tools,
             exclude_tools=exclude_tools,
+            plan_mode=plan_mode,
         )
     ]
 
@@ -761,6 +786,7 @@ def openai_tool_schemas(
     extra_definitions=None,
     only_tools=None,
     exclude_tools=None,
+    plan_mode=False,
 ):
     return glm_tool_schemas(
         include_web_search,
@@ -769,6 +795,7 @@ def openai_tool_schemas(
         extra_definitions=extra_definitions,
         only_tools=only_tools,
         exclude_tools=exclude_tools,
+        plan_mode=plan_mode,
     )
 
 
@@ -779,6 +806,7 @@ def ollama_tool_schemas(
     extra_definitions=None,
     only_tools=None,
     exclude_tools=None,
+    plan_mode=False,
 ):
     return glm_tool_schemas(
         include_web_search,
@@ -787,6 +815,7 @@ def ollama_tool_schemas(
         extra_definitions=extra_definitions,
         only_tools=only_tools,
         exclude_tools=exclude_tools,
+        plan_mode=plan_mode,
     )
 
 
@@ -807,21 +836,23 @@ class AgentTools:
         web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
         web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
         todo_update_callback=None,
-        plan_approval_output_callback=None,
+        todo_approval_output_callback=None,
         todos_enabled=True,
         skills_enabled=True,
         skills_app_enabled=True,
         skills_workspace_enabled=False,
         skills_auto_catalog=True,
         skills_max_chars=12000,
+        plan_mode=False,
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
-        self.plan_approval_output_callback = plan_approval_output_callback
-        self.todos_enabled = bool(todos_enabled)
+        self.todo_approval_output_callback = todo_approval_output_callback
+        self.todos_enabled = True
+        self.plan_mode = bool(plan_mode)
         self.todo_store = TodoStore(
             on_change=todo_update_callback if self.todos_enabled else None,
-            plan_dir=_plan_dir_for_workspace(self.workspace_dir),
+            todo_dir=_todo_dir_for_workspace(self.workspace_dir),
         )
         self.todo_update_callback = todo_update_callback
         self.max_tool_calls = None
@@ -865,8 +896,8 @@ class AgentTools:
 
     def set_workspace_dir(self, workspace_dir):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
-        self.todo_store.set_plan_dir(
-            _plan_dir_for_workspace(self.workspace_dir),
+        self.todo_store.set_todo_dir(
+            _todo_dir_for_workspace(self.workspace_dir),
             load=True,
         )
         self.skill_registry.configure(workspace_dir=self.workspace_dir)
@@ -890,12 +921,10 @@ class AgentTools:
         self.todo_store.set_on_change(callback if self.todos_enabled else None)
 
     def set_todos_enabled(self, enabled):
-        self.todos_enabled = bool(enabled)
-        self.todo_store.set_on_change(
-            self.todo_update_callback if self.todos_enabled else None
-        )
-        if not self.todos_enabled and self.todo_update_callback:
-            self.todo_update_callback([])
+        self.todos_enabled = True
+
+    def set_plan_mode(self, enabled):
+        self.plan_mode = bool(enabled)
 
     def set_budget_context(self, max_tool_calls=None, used_tool_calls=0):
         if max_tool_calls is None:
@@ -1265,16 +1294,16 @@ class AgentTools:
 
     def todo_summary(self, include_completed=True):
         if not self.todos_enabled:
-            return "(plan disabled)"
+            return "(todo disabled)"
         return self.todo_store.summary(include_completed=include_completed)
 
     def todo_incomplete_summary(self):
         if not self.todos_enabled:
-            return "(plan disabled)"
+            return "(todo disabled)"
         return self.todo_store.incomplete_summary()
 
     def has_incomplete_todos(self):
-        return self.todos_enabled and self.todo_store.has_actionable_incomplete()
+        return self.todos_enabled and self.todo_store.has_incomplete()
 
     def has_unverified_completed_todos(self):
         return (
@@ -1283,12 +1312,12 @@ class AgentTools:
 
     def todo_actionable_summary(self):
         if not self.todos_enabled:
-            return "(plan disabled)"
+            return "(todo disabled)"
         return self.todo_store.actionable_summary()
 
     def todo_quality_report(self):
         if not self.todos_enabled:
-            return "Plan disabled."
+            return "Todo disabled."
         return self.todo_store.quality_report(
             max_tool_calls=self.max_tool_calls,
             used_tool_calls=self.used_tool_calls,
@@ -1306,10 +1335,10 @@ class AgentTools:
         return self.todo_store.history_tail(limit)
 
     def approve_todos(self, note=""):
-        return self.todo_store.approve_plan(note=note, source="user")
+        return self.todo_store.approve_todos(note=note, source="user")
 
     def reject_todos(self, reason=""):
-        return self.todo_store.reject_plan(reason=reason, source="user")
+        return self.todo_store.reject_todos(reason=reason, source="user")
 
     def retry_todo(self, todo_id, reason=""):
         return self.todo_store.retry_todo(todo_id, reason=reason)
@@ -1418,11 +1447,16 @@ class AgentTools:
                 tool_input = json.loads(tool_input or "{}")
             if not isinstance(tool_input, dict):
                 raise AgentToolError("Tool input must be an object.")
-            if name == "update_plan" and not self.todos_enabled:
-                return _error_result("Agent plan is disabled.")
+            if self.plan_mode and name not in PLAN_MODE_ALLOWED_TOOLS:
+                return _error_result(
+                    f"Tool '{name}' is not available in Plan mode (read-only). "
+                    "Switch to Build mode to use modification tools."
+                )
+            if not self.plan_mode and name == "ask_user":
+                return _error_result("Tool 'ask_user' is available only in Plan mode.")
 
             handlers = {
-                "update_plan": self._update_plan,
+                "update_todo": self._update_todo,
                 "ask_user": self._ask_user,
                 "read_file": self._read_file,
                 "read_program_docs": self._read_program_docs,
@@ -1452,7 +1486,7 @@ class AgentTools:
             handler = handlers.get(name)
             if handler is None:
                 raise AgentToolError(f"Unknown tool: {name}")
-            plan_gate_result = self._plan_action_gate(name, tool_input)
+            plan_gate_result = self._todo_action_gate(name, tool_input)
             if plan_gate_result is not None:
                 return plan_gate_result
             return handler(tool_input)
@@ -1464,7 +1498,7 @@ class AgentTools:
         self._display_payload = None
         return payload
 
-    def _update_plan(self, tool_input):
+    def _update_todo(self, tool_input):
         items = tool_input.get("items")
         self.todo_store.update(items)
         return self.todo_store.tool_result(
@@ -2381,47 +2415,17 @@ class AgentTools:
         self._before_visible_output()
         return get_agent_confirmation(title, detail)
 
-    def _plan_action_gate(self, name, tool_input):
+    def _todo_action_gate(self, name, tool_input):
+        if self.plan_mode:
+            return None
         if not self.todos_enabled:
             return None
-        if not self.todo_store.needs_action_approval():
-            return self._active_todo_gate(name)
-        if name in {"update_plan", "ask_user"}:
-            return None
-
-        if self.todo_store.approval_state == "rejected":
-            return _error_result(
-                "Current plan was rejected. Revise the plan with update_plan, "
-                "or ask the user to approve the updated plan before using more tools."
-            )
-
-        if self.approval_mode in {AGENT_APPROVAL_APPROVE, AGENT_APPROVAL_FULL}:
-            self.todo_store.approve_plan(
-                note=f"{self.approval_mode} approval mode approved the current plan.",
-                source="auto",
-            )
-            return self._active_todo_gate(name)
-
-        self._before_plan_approval_output()
-        if get_agent_plan_confirmation(self.todo_store.to_dicts()):
-            self.todo_store.approve_plan(
-                note="User approved the current plan before action.",
-                source="user",
-            )
-            return self._active_todo_gate(name)
-
-        self.todo_store.reject_plan(
-            reason="User rejected the current plan before action.",
-            source="user",
-        )
-        return _error_result(
-            "User rejected the current plan. Revise the plan before using more tools."
-        )
+        return self._active_todo_gate(name)
 
     def _active_todo_gate(self, name):
         if not self.todos_enabled:
             return None
-        if name in {"update_plan", "ask_user"}:
+        if name == "update_todo":
             return None
         if not self.todo_store.requires_active_todo():
             return None
@@ -2429,8 +2433,8 @@ class AgentTools:
         if active is not None:
             return None
         return _error_result(
-            "Before using more tools, call update_plan and mark exactly one ready "
-            "plan item as in_progress. This keeps the Plan synchronized with the "
+            "Before using more tools, call update_todo and mark exactly one ready "
+            "todo item as in_progress. This keeps the todo list synchronized with the "
             "work being executed."
         )
 
@@ -2439,9 +2443,9 @@ class AgentTools:
             self.visible_output_callback()
         self.output_needs_separator = True
 
-    def _before_plan_approval_output(self):
-        if self.plan_approval_output_callback:
-            self.plan_approval_output_callback()
+    def _before_todo_approval_output(self):
+        if self.todo_approval_output_callback:
+            self.todo_approval_output_callback()
         elif self.visible_output_callback:
             self.visible_output_callback()
 
@@ -2669,10 +2673,10 @@ def _program_doc_paths():
     return paths
 
 
-def _plan_dir_for_workspace(workspace_dir):
+def _todo_dir_for_workspace(workspace_dir):
     if workspace_dir is None:
         return None
-    return Path(workspace_dir) / ".omniagent" / "plans"
+    return Path(workspace_dir) / ".omniagent" / "todos"
 
 
 def _final_check_passed(check_result):

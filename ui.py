@@ -351,10 +351,12 @@ def _todo_string_list(value):
     return []
 
 
-def get_agent_plan_confirmation(todos, next_tool=""):
+def get_agent_todo_confirmation(todos, next_tool=""):
     bridge = get_bridge()
     if bridge is not None:
-        return bridge.request_confirmation("Approve current agent plan?", next_tool)
+        return bridge.request_confirmation(
+            "Approve current agent todo list?", next_tool
+        )
     return False
 
 
@@ -387,14 +389,14 @@ def get_agent_diff_confirmation(title, file_path, diff_content):
     return False
 
 
-def set_plan_panel(items):
+def set_todo_panel(items):
     bridge = get_bridge()
     if bridge is not None:
-        bridge.set_plan_items(items)
+        bridge.set_todo_items(items)
 
 
-def clear_plan_panel():
-    set_plan_panel([])
+def clear_todo_panel():
+    set_todo_panel([])
 
 
 def set_context_usage(input_tokens, context_window_tokens):

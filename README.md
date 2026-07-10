@@ -15,7 +15,7 @@ OmniAgent 是一个基于 Python 和 Rich 的终端 AI Agent 工作台。它面�
 - 支持 Tavily 网络搜索，普通交互可按需自动检索，Agent 模式会注入 `web_search` 工具。
 - 支持持久记忆、偏好记忆、情景记忆和热历史，记忆更新可使用独立模型。
 - 支持本地文件 agent 模式，可让模型在限定工作目录内读文件、搜索代码、编辑文件和执行命令。
-- 支持 Agent plan 审批、状态恢复和最终校验，适合多步骤本地任务。
+- 支持 Agent todo 审批、状态恢复和最终校验，适合多步骤本地任务。
 - 支持 agent skills，可从程序目录、工作目录、ClawHub 或 SkillHub 加载本机专用工作流指令。
 - 对写文件、编辑文件和高风险命令执行用户确认，避免模型无提示修改本地文件。
 
@@ -172,7 +172,7 @@ MiniMax-M3 推荐使用 OpenAI 兼容配置。程序会在调用 MiniMax OpenAI 
 | `agent_mode.max_tool_calls` | 每次用户请求中，agent 最多调用多少次工具。 |
 | `agent_mode.approve` | Agent 写操作审批模式，只支持 `confirm` 或 `auto`。 |
 | `agent_mode.show_thinking` | 是否显示 Agent 的 thinking 过程。布尔值，`true` 显示完整 thinking，`false` 隐藏。它只影响显示，不改变模型 reasoning/thinking 是否开启。 |
-| `agent_mode.plan_mode` | 是否启用 Agent plan 系统。默认 `true`；关闭后不注入 `update_plan`，也不会强制计划审批或显示 Plan 面板。 |
+| `agent_mode.plan_mode` | 是否启用 Plan mode。默认 `true`；开启后可在“先想清楚再动手”的只读规划/澄清工作流中使用 `ask_user`，关闭后不启用这套 Plan mode 协作流程。 |
 | `skills.enable` | Agent skills 总开关。关闭后不会注入 `list_skills` 和 `read_skill`。 |
 | `skills.sources.app` | 是否加载程序目录 `skills/`，适合放所有项目通用的本机 skills。 |
 | `skills.sources.workspace` | 是否加载工作目录 `.omniagent/skills/`，默认关闭；开启后如果目录不存在会自动创建。 |
@@ -256,8 +256,8 @@ Agent 模式类似 Claude Code 的本地工具调用流程：模型可以请求�
 
 | 工具 | 功能 |
 | --- | --- |
-| `update_plan` | 维护当前 Agent plan，支持优先级、依赖、完成标准、blocked/failed 原因和校验状态。 |
-| `ask_user` | 向用户提出一个单选问题，用户可用方向键、数字键和 Enter 选择，结果会回传给模型；Agent 需要澄清多个选项时应使用该工具，而不是在正文里等待用户回复。 |
+| `update_todo` | 维护当前 Agent 执行 todo，支持优先级、依赖、完成标准、blocked/failed 原因和校验状态。 |
+| `ask_user` | 仅在 Plan mode 可用。向用户提出一个单选问题，用户可用方向键、数字键和 Enter 选择；当关键决策会影响目标、范围、权衡或验收标准时，应使用该工具补齐信息，而不是在正文里等待用户回复。 |
 | `list_dir` | 列出工作目录内文件和目录，支持递归深度限制。 |
 | `read_file` | 读取工作目录内的 UTF-8 文本文件，支持按行号范围读取。 |
 | `read_program_docs` | 读取程序内置 `README.md`，帮助用户学习命令、配置和使用方式；普通交互也默认可用。 |
@@ -283,9 +283,11 @@ Agent 模式会根据当前是否选中项目自动决定是否可用；相关�
 /agent
 ```
 
-多步骤任务中，Agent 会先用 `update_plan` 创建内部计划。计划和事件日志保存在 `<workspace>/.omniagent/plans/`，整个 `.omniagent/` 已被 `.gitignore` 忽略。
+Plan mode 是“先想清楚再动手”的协作状态：适合需求还不够明确、改动风险较大、需要先看设计/路线图/任务清单，或需要向用户提出 1-3 个短问题补齐关键决策的场景。Plan mode 保持只读，最终输出不一定是 todo list，也可以是清晰的方案、结论、实施步骤和待确认点。
 
-子智能体在 Agent 模式中默认可用，无需额外配置。主 Agent 可通过 `dispatch_subagent` 派发 `reader`、`researcher`、`auditor` 或 `builder`，也支持别名 `general -> builder`、`investigator -> researcher`。每个子智能体都有独立上下文和工具白名单，不能再派发子智能体，也不能调用 `update_plan` 或 `ask_user`；主 Agent 仍负责维护计划、最终校验和面向用户的结论。`builder` 的写文件和命令能力沿用当前 `agent_mode.approve` 审批策略。
+进入 Build mode 后，Agent 才会执行改动，并用 `update_todo` 维护执行中的 todo。todo 快照和事件日志保存在 `<workspace>/.omniagent/todos/`。整个 `.omniagent/` 已被 `.gitignore` 忽略。
+
+子智能体在 Agent 模式中默认可用，无需额外配置。主 Agent 可通过 `dispatch_subagent` 派发 `reader`、`researcher`、`auditor` 或 `builder`，也支持别名 `general -> builder`、`investigator -> researcher`。每个子智能体都有独立上下文和工具白名单，不能再派发子智能体，也不能调用 `update_todo` 或 `ask_user`；主 Agent 仍负责维护 todo、最终校验和面向用户的结论。`builder` 的写文件和命令能力沿用当前 `agent_mode.approve` 审批策略。
 
 终端 v1 会按模型同一轮返回的 tool call 顺序执行多个子智能体派发，不做并发执行；这样可以复用现有终端确认界面和文件变更记录，避免多个子任务同时争用审批状态。
 
@@ -299,7 +301,7 @@ Agent 模式会根据当前是否选中项目自动决定是否可用；相关�
 └── builder.md
 ```
 
-模板文件只控制对应子智能体的身份、职责和输出风格；工具白名单、最大轮次、`dispatch_subagent` / `update_plan` / `ask_user` 禁用规则仍由代码固定，不会被模板放开。整个 `.omniagent/` 已被 `.gitignore` 忽略，适合存放本机偏好。
+模板文件只控制对应子智能体的身份、职责和输出风格；工具白名单、最大轮次、`dispatch_subagent` / `update_todo` / `ask_user` 禁用规则仍由代码固定，不会被模板放开。整个 `.omniagent/` 已被 `.gitignore` 忽略，适合存放本机偏好。
 
 设置 agent skills：
 
@@ -454,7 +456,7 @@ OmniAgent/
 ├── installer.py             # ClawHub / SkillHub skills 搜索、检查和安装
 ├── main.py                  # 程序入口、启动参数、事件循环和 UI 组装
 ├── memory.py                # 持久记忆、偏好记忆、情景记忆和热历史
-├── planning.py              # Agent plan、审批状态、事件日志和质量检查
+├── todo.py                  # Agent todo、审批状态、事件日志和质量检查
 ├── search.py                # Tavily 网络搜索封装和结果格式化
 ├── session.py               # 会话保存与加载
 ├── skills.py                # Agent skills 加载、索引和读取

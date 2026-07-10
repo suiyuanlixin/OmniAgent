@@ -11,7 +11,7 @@ API_TYPE_ANTHROPIC = "anthropic"
 API_TYPE_OLLAMA = "ollama"
 FORBIDDEN_SUBAGENT_TOOL_NAMES = {
     DISPATCH_SUBAGENT_TOOL_NAME,
-    "update_plan",
+    "update_todo",
     "ask_user",
 }
 DEFAULT_SUBAGENT_TOOL_CALL_FACTOR = 4
