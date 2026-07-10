@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 from datetime import datetime
 
@@ -539,12 +540,15 @@ class ChatView(Widget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.messages = []
+        self._transcript: list[dict] = []
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._stream_transcript_index: int | None = None
         self._active_output_kind: str | None = None
         self._thought_stream_target: ThoughtBlock | None = None
         self._thought_stream_content = ""
+        self._thought_stream_transcript_index: int | None = None
         self._explored_block: ExploredBlock | None = None
         self._edited_block: EditedBlock | None = None
         self._write_block: WrittenBlock | None = None
@@ -559,6 +563,7 @@ class ChatView(Widget):
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._stream_transcript_index = None
         if role == "user":
             self.query_one("#chat-log", VerticalScroll).mount(
                 Static("", classes="message-spacer")
@@ -567,19 +572,31 @@ class ChatView(Widget):
         self.query_one("#chat-log", VerticalScroll).mount(row)
         self.call_after_refresh(self._scroll_end)
         self.messages.append((role, content, datetime.now().isoformat()))
+        self._append_transcript_entry({
+            "kind": "message",
+            "role": str(role or ""),
+            "content": str(content or ""),
+        })
         if role == "assistant":
             self._stream_target = content_widget
             self._stream_role = role
             self._stream_content = str(content or "")
+            self._stream_transcript_index = len(self._transcript) - 1
 
     def add_status(self, content: str) -> None:
         self._activate_message_output()
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._stream_transcript_index = None
         row, _ = _build_message_widgets("status", content)
         self.query_one("#chat-log", VerticalScroll).mount(row)
         self.call_after_refresh(self._scroll_end)
+        self._append_transcript_entry({
+            "kind": "message",
+            "role": "status",
+            "content": str(content or ""),
+        })
 
     def start_stream(self, role: str = "assistant", prefix: str = "") -> None:
         self._activate_message_output()
@@ -592,10 +609,17 @@ class ChatView(Widget):
             self._stream_target = content_widget
             self._stream_role = role
             self._stream_content = str(prefix or "")
+            self._append_transcript_entry({
+                "kind": "message",
+                "role": str(role or ""),
+                "content": str(prefix or ""),
+            })
+            self._stream_transcript_index = len(self._transcript) - 1
             return
         self.add_message(role, prefix)
         self._stream_role = role
         self._stream_content = str(prefix or "")
+        self._stream_transcript_index = len(self._transcript) - 1
 
     def append_stream(
         self, content: str, role: str = "assistant", prefix: str = ""
@@ -603,10 +627,15 @@ class ChatView(Widget):
         self.start_stream(role=role, prefix=prefix)
         self._stream_content += str(content or "")
         self._stream_target.update(self._stream_content)
+        self._update_transcript_entry(
+            self._stream_transcript_index,
+            content=self._stream_content,
+        )
         self.call_after_refresh(self._scroll_end)
 
     def remove_last_messages(self, count: int = 1) -> None:
         count = max(1, int(count or 1))
+        remove_count = count
         log = self.query_one("#chat-log", VerticalScroll)
         children = list(log.children)
         if not children:
@@ -616,18 +645,25 @@ class ChatView(Widget):
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._stream_transcript_index = None
         self._active_output_kind = None
+        while remove_count > 0 and self._transcript:
+            remove_count -= 1
+            entry = self._transcript.pop()
 
     def clear(self) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
         log.remove_children()
         self.messages.clear()
+        self._transcript.clear()
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._stream_transcript_index = None
         self._active_output_kind = None
         self._thought_stream_target = None
         self._thought_stream_content = ""
+        self._thought_stream_transcript_index = None
         self._explored_block = None
         self._edited_block = None
         self._write_block = None
@@ -642,6 +678,11 @@ class ChatView(Widget):
         block = ThoughtBlock(content=content, elapsed_seconds=elapsed_seconds)
         self.query_one("#chat-log", VerticalScroll).mount(block)
         self.call_after_refresh(self._scroll_end)
+        self._append_transcript_entry({
+            "kind": "thought",
+            "content": str(content or ""),
+            "elapsed_seconds": float(elapsed_seconds or 0.0),
+        })
 
     def start_thought_stream(self, elapsed_seconds: float = 0.0) -> None:
         self._activate_aux_output("thought")
@@ -652,36 +693,70 @@ class ChatView(Widget):
         self.call_after_refresh(self._scroll_end)
         self._thought_stream_target = block
         self._thought_stream_content = ""
+        self._append_transcript_entry({
+            "kind": "thought",
+            "content": "",
+            "elapsed_seconds": float(elapsed_seconds or 0.0),
+        })
+        self._thought_stream_transcript_index = len(self._transcript) - 1
 
     def append_thought_stream(self, content: str) -> None:
         self.start_thought_stream()
         self._thought_stream_content += str(content or "")
         if self._thought_stream_target is not None:
             self._thought_stream_target.set_content(self._thought_stream_content)
+            self._update_transcript_entry(
+                self._thought_stream_transcript_index,
+                content=self._thought_stream_content,
+            )
             self.call_after_refresh(self._scroll_end)
+
+    @staticmethod
+    def _trim_trailing_blank_lines(content: str) -> str:
+        return re.sub(r"(?:\r?\n[ \t]*)+\Z", "", str(content or ""))
 
     def finish_thought_stream(self, elapsed_seconds: float = 0.0) -> None:
         if self._thought_stream_target is None:
             return
+        self._thought_stream_content = self._trim_trailing_blank_lines(
+            self._thought_stream_content
+        )
+        self._thought_stream_target.set_content(self._thought_stream_content)
         self._thought_stream_target.set_elapsed_seconds(elapsed_seconds)
+        self._update_transcript_entry(
+            self._thought_stream_transcript_index,
+            content=self._thought_stream_content,
+            elapsed_seconds=max(0.0, float(elapsed_seconds or 0.0)),
+        )
         self._thought_stream_target = None
         self._thought_stream_content = ""
+        self._thought_stream_transcript_index = None
 
     def update_thought_stream_elapsed(self, elapsed_seconds: float) -> None:
         if self._thought_stream_target is None:
             return
         self._thought_stream_target.set_elapsed_seconds(elapsed_seconds)
+        self._update_transcript_entry(
+            self._thought_stream_transcript_index,
+            elapsed_seconds=max(0.0, float(elapsed_seconds or 0.0)),
+        )
 
     def replace_thought_stream(self, content: str, elapsed_seconds: float) -> None:
         if self._thought_stream_target is None:
             return
-        self._thought_stream_content = str(content or "")
+        self._thought_stream_content = self._trim_trailing_blank_lines(content)
         self._thought_stream_target.set_content(self._thought_stream_content)
         self._thought_stream_target.set_elapsed_seconds(
             max(0.0, float(elapsed_seconds or 0.0))
         )
+        self._update_transcript_entry(
+            self._thought_stream_transcript_index,
+            content=self._thought_stream_content,
+            elapsed_seconds=max(0.0, float(elapsed_seconds or 0.0)),
+        )
         self._thought_stream_target = None
         self._thought_stream_content = ""
+        self._thought_stream_transcript_index = None
         self.call_after_refresh(self._scroll_end)
 
     def add_explored_entry(self, tool_name: str, description: str) -> None:
@@ -692,6 +767,11 @@ class ChatView(Widget):
             self.call_after_refresh(self._scroll_end)
             self._explored_block = block
         self._explored_block.add_entry(tool_name, description)
+        self._append_transcript_entry({
+            "kind": "explored_entry",
+            "tool_name": str(tool_name or ""),
+            "description": str(description or ""),
+        })
         self.call_after_refresh(self._scroll_end)
 
     def reset_explored(self) -> None:
@@ -707,6 +787,13 @@ class ChatView(Widget):
             self.call_after_refresh(self._scroll_end)
             self._edited_block = block
         self._edited_block.add_entry(file_path, additions, deletions, diff)
+        self._append_transcript_entry({
+            "kind": "edit",
+            "file_path": str(file_path or ""),
+            "additions": int(additions or 0),
+            "deletions": int(deletions or 0),
+            "diff": str(diff or ""),
+        })
         self.call_after_refresh(self._scroll_end)
 
     def add_write_entry(
@@ -719,6 +806,13 @@ class ChatView(Widget):
             self.call_after_refresh(self._scroll_end)
             self._write_block = block
         self._write_block.add_entry(file_path, additions, deletions, diff)
+        self._append_transcript_entry({
+            "kind": "write",
+            "file_path": str(file_path or ""),
+            "additions": int(additions or 0),
+            "deletions": int(deletions or 0),
+            "diff": str(diff or ""),
+        })
         self.call_after_refresh(self._scroll_end)
 
     def reset_edited(self) -> None:
@@ -734,6 +828,11 @@ class ChatView(Widget):
             self.call_after_refresh(self._scroll_end)
             self._shell_block = block
         self._shell_block.add_entry(command, output)
+        self._append_transcript_entry({
+            "kind": "shell",
+            "command": str(command or ""),
+            "output": str(output or ""),
+        })
         self.call_after_refresh(self._scroll_end)
 
     def add_changed_files_entry(self, files: list[dict]) -> None:
@@ -742,6 +841,10 @@ class ChatView(Widget):
         self._activate_aux_output("changed_files")
         block = ChangedFilesBlock(files)
         self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "changed_files",
+            "files": [dict(file_info or {}) for file_info in list(files or [])],
+        })
         self.call_after_refresh(self._scroll_end)
 
     def add_question_entry(self, question: str, answer: str) -> None:
@@ -752,12 +855,103 @@ class ChatView(Widget):
             self.call_after_refresh(self._scroll_end)
             self._questions_block = block
         self._questions_block.add_entry(question, answer)
+        self._append_transcript_entry({
+            "kind": "question",
+            "question": str(question or ""),
+            "answer": str(answer or ""),
+        })
         self.call_after_refresh(self._scroll_end)
 
     def _reset_message_stream(self) -> None:
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
+        self._stream_transcript_index = None
+
+    def get_transcript(self) -> list[dict]:
+        return deepcopy(self._transcript)
+
+    def load_transcript(self, transcript: list[dict]) -> None:
+        self.clear()
+        for entry in list(transcript or []):
+            self._replay_transcript_entry(entry)
+        self._reset_message_stream()
+        self._thought_stream_target = None
+        self._thought_stream_content = ""
+        self._thought_stream_transcript_index = None
+
+    def _append_transcript_entry(self, entry: dict) -> None:
+        self._transcript.append(deepcopy(entry))
+
+    def _update_transcript_entry(self, index: int | None, **changes) -> None:
+        if index is None or index < 0 or index >= len(self._transcript):
+            return
+        entry = dict(self._transcript[index])
+        entry.update(changes)
+        self._transcript[index] = deepcopy(entry)
+
+    def _replay_transcript_entry(self, entry: dict) -> None:
+        if not isinstance(entry, dict):
+            return
+        kind = str(entry.get("kind") or "")
+        if kind == "message":
+            role = str(entry.get("role") or "")
+            content = str(entry.get("content") or "")
+            if role == "status":
+                self.add_status(content)
+            elif role:
+                self.add_message(role, content)
+            return
+        if kind == "thought":
+            self.add_thought(
+                str(entry.get("content") or ""),
+                float(entry.get("elapsed_seconds", 0.0) or 0.0),
+            )
+            return
+        if kind == "explored_entry":
+            self.add_explored_entry(
+                str(entry.get("tool_name") or ""),
+                str(entry.get("description") or ""),
+            )
+            return
+        if kind == "question":
+            self.add_question_entry(
+                str(entry.get("question") or ""),
+                str(entry.get("answer") or ""),
+            )
+            return
+        if kind == "web_fetch":
+            self.add_web_fetch_entry(str(entry.get("url") or ""))
+            return
+        if kind == "web_search":
+            self.add_web_search_entry(str(entry.get("content") or ""))
+            return
+        if kind == "edit":
+            self.add_edit_entry(
+                str(entry.get("file_path") or ""),
+                int(entry.get("additions", 0) or 0),
+                int(entry.get("deletions", 0) or 0),
+                str(entry.get("diff") or ""),
+            )
+            return
+        if kind == "write":
+            self.add_write_entry(
+                str(entry.get("file_path") or ""),
+                int(entry.get("additions", 0) or 0),
+                int(entry.get("deletions", 0) or 0),
+                str(entry.get("diff") or ""),
+            )
+            return
+        if kind == "shell":
+            self.add_shell_entry(
+                str(entry.get("command") or ""),
+                str(entry.get("output") or ""),
+            )
+            return
+        if kind == "changed_files":
+            self.add_changed_files_entry([
+                dict(file_info or {}) for file_info in list(entry.get("files") or [])
+            ])
 
     def add_web_fetch_entry(self, url: str) -> None:
         self._activate_aux_output("web_fetch")
@@ -765,6 +959,10 @@ class ChatView(Widget):
         self.query_one("#chat-log", VerticalScroll).mount(
             Static(content, classes="web-summary-entry", markup=True)
         )
+        self._append_transcript_entry({
+            "kind": "web_fetch",
+            "url": str(url or ""),
+        })
         self.call_after_refresh(self._scroll_end)
 
     def add_web_search_entry(self, content: str) -> None:
@@ -777,6 +975,10 @@ class ChatView(Widget):
                 markup=True,
             )
         )
+        self._append_transcript_entry({
+            "kind": "web_search",
+            "content": str(content or ""),
+        })
         self.call_after_refresh(self._scroll_end)
 
     def reset_turn_summaries(self) -> None:
@@ -998,8 +1200,21 @@ class SelectableMessageStatic(Static, can_focus=True):
         line_index = min(max(0, event.y - top_padding), len(lines) - 1)
         raw_start, raw_end = lines[line_index]
         column = max(0, event.x - left_padding)
-        line_length = raw_end - raw_start
-        return raw_start + min(column, line_length)
+        line_text = self._plain_content()[raw_start:raw_end]
+        return raw_start + self._index_from_column(line_text, column)
+
+    @staticmethod
+    def _index_from_column(line_text: str, column: int) -> int:
+        if column <= 0 or not line_text:
+            return 0
+
+        used_width = 0
+        for index, char in enumerate(line_text):
+            char_width = max(1, cell_len(char))
+            if column < used_width + char_width:
+                return index
+            used_width += char_width
+        return len(line_text)
 
     def _wrapped_line_ranges(self) -> list[tuple[int, int]]:
         content = self._plain_content()
@@ -1262,13 +1477,17 @@ class ShellRow(Vertical):
         self._output_widget: Static | None = None
 
     def compose(self) -> ComposeResult:
-        truncated = self.command
-        if len(truncated) > 60:
-            truncated = truncated[:57] + "..."
         with Horizontal(classes="shell-row-header"):
             yield Static("$", classes="shell-row-label", markup=True, expand=False)
-            yield Static("Shell", classes="shell-row-shell-label", markup=True, expand=False)
-            self._header_command = Static(_escape_markup(truncated), classes="shell-row-command", markup=True, expand=False)
+            yield Static(
+                "Shell", classes="shell-row-shell-label", markup=True, expand=False
+            )
+            self._header_command = Static(
+                _escape_markup(self.command),
+                classes="shell-row-command",
+                markup=True,
+                expand=False,
+            )
             yield self._header_command
         self._output_widget = Static(
             _escape_markup(self.output.rstrip()),
@@ -1290,6 +1509,10 @@ class ShellRow(Vertical):
 
     def on_mount(self) -> None:
         self._update_state()
+        self._refresh_header_command()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._refresh_header_command()
 
     def on_click(self, event: events.Click) -> None:
         self._expanded = not self._expanded
@@ -1311,6 +1534,37 @@ class ShellRow(Vertical):
                 hc.add_class("hidden")
             else:
                 hc.remove_class("hidden")
+                self._refresh_header_command()
+
+    @staticmethod
+    def _truncate_command_for_width(command: str, width: int) -> str:
+        text = str(command or "")
+        if width <= 0 or not text:
+            return ""
+        if cell_len(text) <= width:
+            return text
+        if width <= 3:
+            return "." * width
+
+        reserved = width - 3
+        result: list[str] = []
+        used = 0
+        for char in text:
+            char_width = cell_len(char)
+            if used + char_width > reserved:
+                break
+            result.append(char)
+            used += char_width
+        return "".join(result) + "..."
+
+    def _refresh_header_command(self) -> None:
+        hc = self._header_command
+        if hc is None:
+            return
+        width = max(0, hc.content_region.width or hc.size.width)
+        if width <= 0:
+            return
+        hc.update(_escape_markup(self._truncate_command_for_width(self.command, width)))
 
 
 class DiffFileRow(Vertical):

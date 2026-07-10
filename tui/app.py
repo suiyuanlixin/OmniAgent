@@ -2678,7 +2678,9 @@ class AgentTUIApp(App):
             return
         history = list(self.chat.get_history() or [])
         record = dict(self.current_session_record)
+        view = self.query_one("#messages-view", ChatView)
         record["conversation"] = history
+        record["ui_transcript"] = view.get_transcript()
         record["model_name"] = self.config.current_model
         project = self._selected_project()
         record["project"] = project.to_dict() if project is not None else None
@@ -2705,6 +2707,15 @@ class AgentTUIApp(App):
         self.start_chat()
         view = self.query_one("#messages-view", ChatView)
         view.clear()
+        transcript = []
+        if self.current_session_record is not None:
+            saved_transcript = self.current_session_record.get("ui_transcript")
+            if isinstance(saved_transcript, list):
+                transcript = saved_transcript
+        if transcript:
+            view.load_transcript(transcript)
+            self.query_one("#chat-input", ChatInput).chat_active = True
+            return
         for message in history:
             self._replay_history_message(view, message)
         self.query_one("#chat-input", ChatInput).chat_active = True
