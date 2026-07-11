@@ -230,6 +230,10 @@ class PromptOptionRow(Static, can_focus=False):
         event.stop()
 
 
+class ModelGroupToggle(Static, can_focus=False):
+    pass
+
+
 class MessageTextArea(TextArea):
     BINDINGS = [
         Binding(
@@ -623,6 +627,11 @@ class ChatInput(Widget):
     #plan-options.open, #approval-options.open, #model-options.open, #thinking-options.open {
         display: block;
     }
+    #model-options {
+        max-height: 12;
+        overflow-y: auto;
+        scrollbar-size: 0 0;
+    }
 
     #plan-options Button, #approval-options Button, #model-options Button, #thinking-options Button {
         width: 100%;
@@ -646,6 +655,42 @@ class ChatInput(Widget):
         background: $TEXT_PRIMARY;
         background-tint: transparent;
         tint: transparent;
+        color: $PAGE_BACKGROUND;
+    }
+    #model-options .model-group-toggle {
+        width: 100%;
+        height: 1;
+        color: $TEXT_MUTED;
+        background: transparent;
+        padding: 0 1 0 1;
+        content-align: left middle;
+    }
+    #model-options .model-group-toggle:hover {
+        color: $TEXT_PRIMARY;
+    }
+    #model-options .model-group-gap {
+        width: 100%;
+        height: 1;
+        background: transparent;
+    }
+    #model-options .model-group-list {
+        width: 100%;
+        height: auto;
+    }
+    #model-options .model-group-list.hidden {
+        display: none;
+    }
+    #model-options Button.model-option-item {
+        padding: 0 0 0 0;
+    }
+    #model-options Button.model-option-item.selected,
+    #model-options Button.model-option-item.selected:focus,
+    #model-options Button.model-option-item.selected.-active {
+        color: $TEXT_PRIMARY;
+        text-style: bold;
+    }
+    #model-options Button.model-option-item.selected:hover {
+        background: $TEXT_PRIMARY;
         color: $PAGE_BACKGROUND;
     }
 
@@ -694,6 +739,10 @@ class ChatInput(Widget):
         self._modifier_timer = None
         self._model_button_values: dict[str, str] = {}
         self._model_dropdown_serial = 0
+        self._model_option_groups: list[dict[str, object]] = []
+        self._collapsed_model_api_types: set[str] = set()
+        self._model_group_button_api_types: dict[str, str] = {}
+        self._model_group_button_list_ids: dict[str, str] = {}
         self._prompt_question = ""
         self._prompt_options: list[tuple[str, str, bool]] = []
         self._prompt_current_index = 1
@@ -862,6 +911,17 @@ class ChatInput(Widget):
             self._set_command_selection(event.index, scroll=False)
         event.stop()
 
+    def on_click(self, event: events.Click) -> None:
+        control = getattr(event, "control", None) or getattr(event, "widget", None)
+        while control is not None:
+            control_id = getattr(control, "id", None)
+            if control_id and str(control_id).startswith("model-group-toggle-"):
+                if not self.controls_locked:
+                    self._toggle_model_group(str(control_id))
+                event.stop()
+                return
+            control = getattr(control, "parent", None)
+
     def on_command_menu_row_chosen(self, event: CommandMenuRow.Chosen) -> None:
         if self._is_command_menu_open():
             self._set_command_selection(event.index)
@@ -947,6 +1007,22 @@ class ChatInput(Widget):
         self._fit_trigger_to_label(prefix)
         self._close_all_dropdowns()
 
+    def _toggle_model_group(self, button_id: str) -> None:
+        api_type = self._model_group_button_api_types.get(button_id, "")
+        list_id = self._model_group_button_list_ids.get(button_id, "")
+        if not list_id:
+            return
+        try:
+            group_list = self.query_one(f"#{list_id}", Vertical)
+        except Exception:
+            return
+        if group_list.has_class("hidden"):
+            group_list.remove_class("hidden")
+            self._collapsed_model_api_types.discard(api_type)
+        else:
+            group_list.add_class("hidden")
+            self._collapsed_model_api_types.add(api_type)
+
     def on_text_area_changed(self, event) -> None:
         if getattr(getattr(event, "text_area", None), "id", None) != "message-input":
             return
@@ -993,10 +1069,13 @@ class ChatInput(Widget):
         except Exception:
             pass
 
-    def set_model_options(self, options, selected_value=""):
+    def set_model_options(self, options, selected_value="", groups=None):
         self.model_options = [
             (str(label), str(value)) for label, value in options or []
         ]
+        self._model_option_groups = self._normalize_model_groups(
+            self.model_options, groups
+        )
         self.selected_model_value = str(
             selected_value or self.selected_model_value or ""
         )
@@ -1008,11 +1087,8 @@ class ChatInput(Widget):
     def set_selected_model(self, selected_value):
         self.selected_model_value = str(selected_value or "")
         if self.is_mounted:
-            self._update_dropdown_trigger(
-                "model",
-                self.model_options,
-                self.selected_model_value,
-                empty_label="No model",
+            self._rebuild_dropdown(
+                "model", self.model_options, self.selected_model_value
             )
 
     def set_selected_thinking(self, selected_value):
@@ -1259,6 +1335,9 @@ class ChatInput(Widget):
         trigger = self.query_one(f"#{prefix}-trigger", Button)
         container = self.query_one(f"#{prefix}-options", Container)
         normalized = [(str(label), str(value)) for label, value in options or []]
+        if prefix == "model":
+            self._rebuild_model_dropdown(container, trigger, normalized, selected_value)
+            return
         desired_ids = [f"{prefix}-{value}" for _, value in normalized]
         existing_ids = [child.id for child in container.children]
         if not normalized:
@@ -1294,6 +1373,107 @@ class ChatInput(Widget):
                 selected_label = label
         trigger.label = selected_label
         self._fit_trigger_to_label(prefix)
+
+    def _normalize_model_groups(self, options, groups=None) -> list[dict[str, object]]:
+        normalized_groups: list[dict[str, object]] = []
+        for group in list(groups or []):
+            group_options = [
+                (str(label), str(value))
+                for label, value in list(group.get("options") or [])
+            ]
+            if not group_options:
+                continue
+            normalized_groups.append({
+                "api_type": str(group.get("api_type") or ""),
+                "title": str(group.get("title") or "") or "Other",
+                "options": group_options,
+            })
+        if normalized_groups:
+            return normalized_groups
+        normalized_options = [
+            (str(label), str(value)) for label, value in options or []
+        ]
+        if not normalized_options:
+            return []
+        return [
+            {
+                "api_type": "",
+                "title": "Models",
+                "options": normalized_options,
+            }
+        ]
+
+    def _rebuild_model_dropdown(
+        self,
+        container: Container,
+        trigger: Button,
+        options: list[tuple[str, str]],
+        selected_value: str,
+    ) -> None:
+        if not options:
+            trigger.label = "No model"
+            self._fit_trigger_to_label("model")
+            return
+
+        groups = self._normalize_model_groups(options, self._model_option_groups)
+        selected_label = options[0][0]
+        selected_api_type = ""
+        for group in groups:
+            for label, value in list(group.get("options") or []):
+                if value == selected_value:
+                    selected_label = label
+                    selected_api_type = str(group.get("api_type") or "")
+                    break
+            if selected_api_type:
+                break
+        if selected_api_type:
+            self._collapsed_model_api_types.discard(selected_api_type)
+
+        max_width = 0
+        for group in groups:
+            max_width = max(max_width, cell_len(str(group.get("title") or "")) + 2)
+            for label, _ in list(group.get("options") or []):
+                max_width = max(max_width, cell_len(str(label)) + 2)
+        self._set_options_width("model", max_width)
+
+        container.remove_children()
+        self._model_dropdown_serial += 1
+        serial = self._model_dropdown_serial
+        self._model_button_values = {}
+        self._model_group_button_api_types = {}
+        self._model_group_button_list_ids = {}
+        option_index = 0
+
+        for group_index, group in enumerate(groups):
+            if group_index > 0:
+                container.mount(Static("", classes="model-group-gap"))
+            title = str(group.get("title") or "") or "Other"
+            api_type = str(group.get("api_type") or "")
+            button_id = f"model-group-toggle-{serial}-{group_index}"
+            list_id = f"model-group-list-{serial}-{group_index}"
+            self._model_group_button_api_types[button_id] = api_type
+            self._model_group_button_list_ids[button_id] = list_id
+            container.mount(
+                ModelGroupToggle(title, id=button_id, classes="model-group-toggle")
+            )
+
+            list_classes = "model-group-list"
+            if api_type in self._collapsed_model_api_types:
+                list_classes += " hidden"
+            group_list = Vertical(id=list_id, classes=list_classes)
+            container.mount(group_list)
+
+            for label, value in list(group.get("options") or []):
+                item_id = f"model-option-{serial}-{option_index}"
+                self._model_button_values[item_id] = value
+                classes = "model-option-item"
+                if value == selected_value:
+                    classes += " selected"
+                group_list.mount(Button(label, id=item_id, classes=classes))
+                option_index += 1
+
+        trigger.label = selected_label
+        self._fit_trigger_to_label("model")
 
     def _update_dropdown_trigger(self, prefix, options, selected_value, empty_label=""):
         trigger = self.query_one(f"#{prefix}-trigger", Button)

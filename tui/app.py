@@ -469,6 +469,23 @@ class AgentTUIApp(App):
             return titles[api_type]
         return (api_type or "Other").title()
 
+    def _grouped_model_choices(self) -> list[dict]:
+        grouped: dict[str, list[tuple[str, str]]] = {}
+        for model_name, profile in self.config.model_list.items():
+            api_type = str(getattr(profile, "api_type", "") or "").strip().lower()
+            grouped.setdefault(api_type, []).append((str(model_name), str(model_name)))
+        groups = [
+            {
+                "api_type": api_type,
+                "title": self._api_type_title(api_type),
+                "models": [value for _, value in sorted(options, key=lambda x: x[0].lower())],
+                "options": sorted(options, key=lambda x: x[0].lower()),
+            }
+            for api_type, options in grouped.items()
+        ]
+        groups.sort(key=lambda g: str(g.get("title") or "").lower())
+        return groups
+
     def compose(self) -> ComposeResult:
         with Vertical(id="left-edge", classes="sidebar-hidden"):
             yield Static("=", id="sidebar-toggle")
@@ -1359,7 +1376,11 @@ class AgentTUIApp(App):
         except NoMatches:
             return
         model_options = [(name, name) for name in self.config.model_list.keys()]
-        chat_input.set_model_options(model_options, self.config.current_model)
+        chat_input.set_model_options(
+            model_options,
+            self.config.current_model,
+            groups=self._grouped_model_choices(),
+        )
         chat_input.plan_mode = bool(self.config.agent_plan_enable)
         chat_input.set_selected_approval(self.config.agent_approval_mode)
         chat_input.set_selected_thinking(self._thinking_value_from_config())
@@ -1612,22 +1633,9 @@ class AgentTUIApp(App):
         if selected_name and selected_name in models:
             current_model = selected_name
 
-        grouped: dict[str, list[str]] = {}
-        for model_name, profile in self.config.model_list.items():
-            api_type = str(getattr(profile, "api_type", "") or "").strip().lower()
-            grouped.setdefault(api_type, []).append(str(model_name))
-        groups = [
-            {
-                "api_type": api_type,
-                "title": self._api_type_title(api_type),
-                "models": sorted(model_names, key=lambda x: x.lower()),
-            }
-            for api_type, model_names in grouped.items()
-        ]
-        groups.sort(key=lambda g: str(g.get("title") or "").lower())
         return {
             "models": models,
-            "groups": groups,
+            "groups": self._grouped_model_choices(),
             "selected_model": current_model,
             "rows": self._settings_model_rows(),
             "footer_actions": [
