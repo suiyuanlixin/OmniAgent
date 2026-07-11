@@ -513,6 +513,7 @@ class SettingsModal(ModalScreen[None]):
         self._selected_model_name: str = ""
         self._model_groups: list[dict] = []
         self._model_sidebar_content_rows: int = 0
+        self._show_model_group_titles: bool = True
         self._collapsed_model_api_types: set[str] = set()
         self._add_model_draft: dict[str, object] = {}
         self._editing_row_index: int | None = None
@@ -643,7 +644,13 @@ class SettingsModal(ModalScreen[None]):
             for g in self._model_groups:
                 if str(g.get("api_type") or "") not in self._collapsed_model_api_types:
                     visible += int(g.get("count") or 0)
-            self._model_sidebar_content_rows = len(self._model_groups) + max(0, visible)
+            header_rows = (
+                len(self._model_groups) if self._show_model_group_titles else 0
+            )
+            group_gap_rows = max(0, len(self._model_groups) - 1)
+            self._model_sidebar_content_rows = (
+                header_rows + group_gap_rows + max(0, visible)
+            )
             self.call_after_refresh(self._update_layout_constraints)
             return
 
@@ -958,21 +965,19 @@ class SettingsModal(ModalScreen[None]):
 
         if self._current_layout() == _LAYOUT_MODEL_LIST:
             footer_rows = 2 if detail_footer.has_class("open") else 0
-            detail_available = max(1, available_height - footer_rows)
+            models_needed = max(1, int(self._model_sidebar_content_rows or 0))
             detail_needed = max(
                 1,
                 sum(self._estimated_row_height(row) for row in self._current_rows) or 0,
             )
-            models_needed = max(1, int(self._model_sidebar_content_rows or 0))
-            detail_height = min(detail_needed, detail_available)
-            model_items_height = min(models_needed, max(1, available_height - 2))
-            sidebar_target = min(
-                max(1, detail_height - 2),
-                max(1, available_height - 2),
-            )
-            model_items_height = max(model_items_height, sidebar_target)
+            panel_needed = max(detail_needed + footer_rows, models_needed + 2)
+            panel_height = min(max(1, panel_needed), available_height)
+            detail_height = max(1, panel_height - footer_rows)
+            model_items_height = max(1, panel_height - 2)
             model_detail_scroll.styles.height = detail_height
-            model_detail_scroll.styles.max_height = detail_available
+            model_detail_scroll.styles.max_height = max(
+                1, available_height - footer_rows
+            )
             model_items_scroll.styles.height = model_items_height
             model_items_scroll.styles.max_height = max(1, available_height - 2)
             list_scroll.styles.height = 1
@@ -1039,6 +1044,7 @@ class SettingsModal(ModalScreen[None]):
         item_labels = dict(state.get("item_labels") or {})
         item_classes = dict(state.get("item_classes") or {})
         show_group_titles = bool(state.get("show_group_titles", True))
+        self._show_model_group_titles = show_group_titles
         allow_group_collapse = bool(state.get("allow_group_collapse", True))
         if selected_model in all_model_names:
             self._selected_model_name = selected_model
@@ -1132,7 +1138,10 @@ class SettingsModal(ModalScreen[None]):
             model_items.mount(Static("No models", classes="settings-name"))
             self._model_sidebar_content_rows = 1
         else:
-            self._model_sidebar_content_rows = header_count + visible_model_count
+            group_gap_rows = max(0, len(groups) - 1)
+            self._model_sidebar_content_rows = (
+                header_count + group_gap_rows + visible_model_count
+            )
 
         for row_index, row in enumerate(self._current_rows):
             row["_visible"] = True
