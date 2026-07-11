@@ -653,6 +653,7 @@ class OmniAgent:
         self.conversation_history.append({"role": "user", "content": user_content})
         self._record_preference_signal(user_message)
         original_history = self._history_snapshot()
+        self.agent_stop_requested = False
 
         try:
             self._auto_compact_context()
@@ -814,6 +815,8 @@ class OmniAgent:
             thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
             full_thinking += thinking
             final_response += text
+            if self._agent_should_stop():
+                return self._agent_stopped_response(full_thinking, final_response)
 
             if not tool_uses:
                 if self._append_agent_final_check_if_needed():
@@ -901,6 +904,8 @@ class OmniAgent:
         response_streamed = False
 
         for chunk in response:
+            if self._agent_should_stop():
+                break
             chunk_input_tokens = _response_input_tokens(chunk)
             if chunk_input_tokens is not None:
                 usage_input_tokens = chunk_input_tokens
@@ -1001,6 +1006,8 @@ class OmniAgent:
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             final_response += text
+            if self._agent_should_stop():
+                return self._agent_stopped_response(full_thinking, final_response)
 
             if not tool_calls:
                 if self._append_agent_final_check_if_needed():
@@ -1351,6 +1358,8 @@ class OmniAgent:
                 )
                 # #endregion
                 full_thinking += thinking
+                if self._agent_should_stop():
+                    return self._agent_stopped_response(full_thinking, text)
 
                 if not tool_calls:
                     self.conversation_history.append(assistant_message)
@@ -1414,6 +1423,8 @@ class OmniAgent:
         usage_input_tokens = None
 
         for chunk in response:
+            if self._agent_should_stop():
+                break
             chunk_input_tokens = _response_input_tokens(chunk)
             if chunk_input_tokens is not None:
                 usage_input_tokens = chunk_input_tokens
@@ -1600,6 +1611,11 @@ class OmniAgent:
                 )
                 # #endregion
                 full_thinking += thinking
+                if self._agent_should_stop():
+                    return self._agent_stopped_response(
+                        _clean_reasoning_text(full_thinking),
+                        text,
+                    )
 
                 if not tool_calls:
                     self.conversation_history.append(assistant_message)
@@ -1653,6 +1669,8 @@ class OmniAgent:
         usage_input_tokens = None
 
         for chunk in response:
+            if self._agent_should_stop():
+                break
             chunk_input_tokens = _response_input_tokens(chunk)
             if chunk_input_tokens is not None:
                 usage_input_tokens = chunk_input_tokens
@@ -1816,6 +1834,8 @@ class OmniAgent:
                 )
                 # #endregion
                 full_thinking += thinking
+                if self._agent_should_stop():
+                    return self._agent_stopped_response(full_thinking, text)
 
                 if not tool_uses:
                     self.conversation_history.append({
@@ -1837,6 +1857,8 @@ class OmniAgent:
                 })
                 tool_results = []
                 for tool_use in tool_uses:
+                    if self._agent_should_stop():
+                        return self._agent_stopped_response(full_thinking, text)
                     tool_result = self._execute_normal_web_search_tool(
                         tool_use.get("name", ""),
                         tool_use.get("input", {}),
@@ -1898,6 +1920,8 @@ class OmniAgent:
         raw_response = ""
         usage_input_tokens = None
         for chunk in response:
+            if self._agent_should_stop():
+                break
             chunk_input_tokens = _response_input_tokens(chunk)
             if chunk_input_tokens is not None:
                 usage_input_tokens = chunk_input_tokens
@@ -2327,6 +2351,8 @@ class OmniAgent:
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             final_response += text
+            if self._agent_should_stop():
+                return self._agent_stopped_response(full_thinking, final_response)
 
             if not tool_calls:
                 if self._append_agent_final_check_if_needed():
@@ -2401,6 +2427,8 @@ class OmniAgent:
 
         usage_input_tokens = None
         for chunk in response:
+            if self._agent_should_stop():
+                break
             chunk_input_tokens = _response_input_tokens(chunk)
             if chunk_input_tokens is not None:
                 usage_input_tokens = chunk_input_tokens
@@ -3577,6 +3605,8 @@ class OmniAgent:
             usage_input_tokens = None
 
             for chunk in response:
+                if self._agent_should_stop():
+                    break
                 chunk_input_tokens = _response_input_tokens(chunk)
                 if chunk_input_tokens is not None:
                     usage_input_tokens = chunk_input_tokens
@@ -3619,6 +3649,11 @@ class OmniAgent:
                     if callback_response:
                         callback_response(content)
 
+            if self._agent_should_stop():
+                return self._agent_stopped_response(
+                    _combine_reasoning_text(field_thinking, tagged_thinking),
+                    full_response,
+                )
             self.conversation_history.append(
                 self._chat_stream_assistant_message(
                     full_response,
@@ -3669,6 +3704,8 @@ class OmniAgent:
             usage_input_tokens = _no_usage_input_tokens()
 
             for chunk in response:
+                if self._agent_should_stop():
+                    break
                 chunk_input_tokens = _response_input_tokens(chunk)
                 if chunk_input_tokens is not None:
                     usage_input_tokens = chunk_input_tokens
@@ -3708,6 +3745,11 @@ class OmniAgent:
                         callback_response(content)
 
             full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
+            if self._agent_should_stop():
+                return self._agent_stopped_response(
+                    _clean_reasoning_text(full_thinking),
+                    full_response,
+                )
             self.conversation_history.append(
                 self._ollama_assistant_message(
                     full_response,
@@ -3758,6 +3800,8 @@ class OmniAgent:
             usage_input_tokens = _no_usage_input_tokens()
 
             for chunk in response:
+                if self._agent_should_stop():
+                    break
                 chunk_input_tokens = _response_input_tokens(chunk)
                 if chunk_input_tokens is not None:
                     usage_input_tokens = chunk_input_tokens
@@ -3893,6 +3937,11 @@ class OmniAgent:
                             if callback_response:
                                 callback_response(content)
 
+            if self._agent_should_stop():
+                return self._agent_stopped_response(
+                    _combine_reasoning_text(field_thinking, tagged_thinking),
+                    full_response,
+                )
             history_content = _assistant_history_content(full_response)
             if self._uses_minimax_anthropic_compat():
                 history_content = blocks
@@ -4297,8 +4346,8 @@ class OmniAgent:
                 "\n- Use Plan mode when the request is still ambiguous, the change is risky, "
                 "the user wants design/options/roadmap first, or key decisions still need "
                 "confirmation."
-                "\n- ask_user is available only in Plan mode. Use it for up to 3 short, "
-                "high-impact clarification questions, one question at a time."
+                "\n- ask_user is available only in Plan mode. Use it for short, "
+                "high-impact clarification questions; you may batch a few related questions in one call."
                 "\n- Your final output in Plan mode does not need a rigid format, but it "
                 "should usually make clear: the recommendation or conclusion, why it is "
                 "recommended, concrete implementation steps or a task list, and any points "
@@ -4328,7 +4377,7 @@ class OmniAgent:
             prompt += (
                 "\n- Use ask_user only for an important uncertainty that materially affects "
                 "the goal, scope, tradeoffs, or acceptance criteria and cannot be resolved "
-                "from local files, tools, or web facts. Ask one multiple-choice question at a time."
+                "from local files, tools, or web facts. You may ask one question or a short related batch."
                 "\n- When you need the user to choose among options during planning, "
                 "call ask_user instead of writing a numbered or bulleted choice list in normal "
                 "assistant text. After ask_user returns, continue the planning work."

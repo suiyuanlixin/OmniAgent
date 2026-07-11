@@ -334,13 +334,27 @@ def get_agent_confirmation(title, detail):
 
 def get_agent_choice(question, options, default_index=1):
     bridge = get_bridge()
-    if bridge is not None:
-        selected = bridge.request_choice(question, options, default_index=default_index)
-        normalized_options = [str(option) for option in options]
-        return selected, normalized_options[selected - 1]
     normalized_options = [str(option) for option in options]
+    if bridge is not None:
+        return bridge.request_choice(question, options, default_index=default_index)
     default_index = max(1, min(len(normalized_options), int(default_index or 1)))
     return default_index, normalized_options[default_index - 1]
+
+
+def get_agent_choices(questions):
+    bridge = get_bridge()
+    if bridge is not None:
+        return bridge.request_questions(questions)
+    results = []
+    for item in questions or []:
+        if not isinstance(item, dict):
+            continue
+        options = [str(option) for option in item.get("options") or []]
+        if not options:
+            continue
+        default_index = max(1, min(len(options), int(item.get("default_index") or 1)))
+        results.append((default_index, options[default_index - 1]))
+    return results
 
 
 def _todo_string_list(value):

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import Button, Label, Static, TextArea
@@ -52,9 +53,6 @@ from tui.runtime import clear_bridge, render_console_text, set_bridge
 from tui.theme import render_css
 from tui.widgets.chat_input import ChatInput, HalfRowSpacer
 from tui.widgets.chat_view import ChatView
-from tui.widgets.choice_modal import ChoiceModal
-from tui.widgets.confirm_modal import ConfirmModal
-from tui.widgets.input_modal import InputModal
 from tui.widgets.memory_modal import MemoryModal
 from tui.widgets.project_modal import ProjectModal
 from tui.widgets.project_picker import ProjectPicker
@@ -128,9 +126,37 @@ Toast.-error .toast--title {
 
 
 @dataclass
-class _BlockingModalRequest:
+class _InlinePromptOption:
+    title: str
+    detail: str = ""
+    value: str = ""
+    recommended: bool = False
+
+
+@dataclass
+class _InlinePromptQuestion:
+    question: str
+    options: list[_InlinePromptOption]
+    allow_custom: bool = False
+    custom_label: str = "Type your own answer"
+    custom_placeholder: str = "Type your own answer..."
+    default_option_index: int | None = None
+    default_custom_value: str = ""
+
+
+@dataclass
+class _InlinePromptAnswer:
+    selected_option_index: int | None = None
+    custom_text: str = ""
+
+
+@dataclass
+class _InlinePromptRequest:
     event: threading.Event
-    result: object = None
+    questions: list[_InlinePromptQuestion]
+    answers: list[_InlinePromptAnswer]
+    current_index: int = 0
+    cancelled: bool = False
 
 
 class AgentTUIApp(App):
@@ -272,6 +298,63 @@ class AgentTUIApp(App):
         color: $TEXT_MUTED;
         margin-left: 1;
     }
+    #prompt-dismiss {
+        display: none;
+        width: auto;
+        min-width: 1;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+    }
+    #prompt-dismiss.visible {
+        display: block;
+    }
+    #prompt-dismiss:hover,
+    #prompt-dismiss:focus,
+    #prompt-dismiss.-active {
+        background: transparent;
+        color: $TEXT_PRIMARY;
+    }
+    #prompt-nav {
+        display: none;
+        width: 1fr;
+        height: 1;
+        align-horizontal: right;
+    }
+    #prompt-nav.visible {
+        display: block;
+    }
+    #prompt-back,
+    #prompt-next {
+        width: auto;
+        min-width: 1;
+        height: 1;
+        margin: 0;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: $TEXT_PRIMARY;
+        text-align: left;
+        content-align: left middle;
+    }
+    #prompt-back {
+        margin-right: 1;
+    }
+    #prompt-back.hidden {
+        display: none;
+    }
+    #prompt-next:disabled,
+    #prompt-back:disabled {
+        color: $TEXT_MUTED;
+    }
+    #context-label.hidden {
+        display: none;
+    }
     #info-bar > #context-label {
         width: 1fr;
         text-align: right;
@@ -329,7 +412,7 @@ class AgentTUIApp(App):
     )
 
     BINDINGS = [
-        ("escape", "dismiss", "Dismiss"),
+        Binding("escape", "dismiss", "Dismiss", priority=True),
         ("ctrl+c", "quit_attempt", "Quit"),
     ]
 
@@ -348,6 +431,8 @@ class AgentTUIApp(App):
         self._message_started_at: float | None = None
         self._thinking_started_at: float | None = None
         self._thinking_elapsed_timer = None
+        self._suppress_stream_output = False
+        self._prompt_request: _InlinePromptRequest | None = None
 
     @property
     def config(self):
@@ -407,6 +492,10 @@ class AgentTUIApp(App):
                             with Horizontal(id="interrupt-hint"):
                                 yield Label("esc", id="interrupt-key")
                                 yield Label("interrupt", id="interrupt-text")
+                            yield Button("Dismiss", id="prompt-dismiss")
+                            with Horizontal(id="prompt-nav"):
+                                yield Button("Back", id="prompt-back")
+                                yield Button("Next", id="prompt-next")
                             yield Label("Context: 0 (0%)", id="context-label")
                         yield HalfRowSpacer(id="info-bar-bottom")
 
@@ -420,6 +509,7 @@ class AgentTUIApp(App):
         self._apply_config_to_controls()
         self._set_current_project("")
         self._set_input_enabled(True)
+        self._sync_prompt_actions()
 
     def on_unmount(self) -> None:
         self._pause_thinking_elapsed_timer()
@@ -432,12 +522,28 @@ class AgentTUIApp(App):
             self._reset_chat_state()
         elif btn_id == "side-settings":
             self._open_settings()
+        elif btn_id == "prompt-dismiss":
+            self._dismiss_inline_prompt()
+        elif btn_id == "prompt-back":
+            self._go_to_previous_prompt_question()
+        elif btn_id == "prompt-next":
+            self._advance_inline_prompt()
 
     def on_click(self, event: events.Click) -> None:
         if not event.control:
             return
         if event.control.id == "sidebar-toggle":
             self.toggle_sidebar()
+
+    def on_chat_input_prompt_state_changed(
+        self, event: ChatInput.PromptStateChanged
+    ) -> None:
+        self._sync_prompt_actions(can_submit=event.can_submit)
+
+    def on_chat_input_prompt_submit_requested(
+        self, event: ChatInput.PromptSubmitRequested
+    ) -> None:
+        self._advance_inline_prompt()
 
     def on_chat_input_send(self, event: ChatInput.Send) -> None:
         if self.chat_busy:
@@ -460,6 +566,7 @@ class AgentTUIApp(App):
         self._set_controls_locked(True)
         self._set_input_enabled(False)
         self.chat_busy = True
+        self._suppress_stream_output = False
         self._message_started_at = perf_counter()
         self._thinking_started_at = None
         new_session = (
@@ -607,8 +714,12 @@ class AgentTUIApp(App):
             toggle.update("=")
 
     def action_dismiss(self) -> None:
+        if self._prompt_request is not None:
+            self._dismiss_inline_prompt()
+            return
         if self.chat_busy and self.chat is not None:
             dbg_event("ui.interrupt.esc")
+            self._suppress_stream_output = True
             self._pause_thinking_elapsed_timer()
             self._call_ui(
                 self._finish_thought_stream_widget,
@@ -646,6 +757,7 @@ class AgentTUIApp(App):
         info_bar_shell.add_class("stretch")
         project_picker.add_class("hidden")
         interrupt_hint.add_class("visible")
+        self._sync_prompt_actions()
 
     def append_console_print(self, *objects, **kwargs) -> None:
         text = render_console_text(*objects, **kwargs).rstrip()
@@ -669,6 +781,8 @@ class AgentTUIApp(App):
         self.notify(text, severity="information")
 
     def add_thinking_message(self, content) -> None:
+        if self._suppress_stream_output:
+            return
         text = clean_display_text_preserve_newlines(content)
         if not text:
             return
@@ -677,6 +791,8 @@ class AgentTUIApp(App):
         )
 
     def start_stream_thinking(self) -> None:
+        if self._suppress_stream_output:
+            return
         dbg_event(
             "bridge.start_stream_thinking",
             thinking_started=bool(self._thinking_started_at is not None),
@@ -684,12 +800,16 @@ class AgentTUIApp(App):
         )
 
     def start_thinking_timer(self) -> None:
+        if self._suppress_stream_output:
+            return
         if self._thinking_started_at is None:
             self._thinking_started_at = perf_counter()
         self._resume_thinking_elapsed_timer()
         dbg_event("bridge.start_thinking_timer")
 
     def append_stream_thinking(self, content) -> None:
+        if self._suppress_stream_output:
+            return
         first = self._thinking_started_at is None
         if self._thinking_started_at is None:
             self._thinking_started_at = perf_counter()
@@ -699,6 +819,8 @@ class AgentTUIApp(App):
         self._call_ui(self._append_thought_stream_widget, str(content or ""))
 
     def finish_thinking_round(self) -> None:
+        if self._suppress_stream_output:
+            return
         elapsed = self._elapsed_since_thinking()
         dbg_event("bridge.thinking.finish", elapsed=elapsed)
         self._call_ui(self._finish_thought_stream_widget, elapsed)
@@ -709,6 +831,8 @@ class AgentTUIApp(App):
         self.query_one("#messages-view", ChatView).reset_explored()
 
     def start_stream_response(self, model_name) -> None:
+        if self._suppress_stream_output:
+            return
         dbg_event(
             "bridge.response.start",
             thinking_started=bool(self._thinking_started_at is not None),
@@ -722,6 +846,8 @@ class AgentTUIApp(App):
         self._call_ui(self._start_stream_widget, "assistant", "")
 
     def append_stream_response(self, content) -> None:
+        if self._suppress_stream_output:
+            return
         self._call_ui(self._append_stream_widget, "assistant", str(content or ""), "")
 
     def set_todo_items(self, items) -> None:
@@ -740,61 +866,351 @@ class AgentTUIApp(App):
         self._call_ui(self._set_context_label, input_tokens, context_window_tokens)
 
     def request_confirmation(self, title, detail="") -> bool:
-        request = _BlockingModalRequest(threading.Event())
-
-        def show_modal() -> None:
-            self.push_screen(
-                ConfirmModal(str(title or "Confirm"), str(detail or "")),
-                callback=lambda result: self._resolve_modal_request(
-                    request, bool(result)
-                ),
+        question = str(title or "Confirm").strip()
+        detail_text = str(detail or "").strip()
+        if detail_text:
+            question = f"{question}\n{detail_text}"
+        request = self._build_inline_prompt_request([
+            _InlinePromptQuestion(
+                question=question,
+                options=[
+                    _InlinePromptOption("Approve", value="Approve"),
+                    _InlinePromptOption("Cancel", value="Cancel"),
+                ],
             )
-
-        self._call_ui(show_modal)
+        ])
+        self._call_ui(self._open_inline_prompt, request)
         request.event.wait()
-        return bool(request.result)
+        if request.cancelled:
+            return False
+        return bool(request.answers[0].selected_option_index == 0)
 
-    def request_choice(self, question, options, default_index=1) -> int:
-        request = _BlockingModalRequest(threading.Event())
-        options = [str(option) for option in options or []]
-        if not options:
-            return 0
-
-        def show_modal() -> None:
-            self.push_screen(
-                ChoiceModal(str(question or "Choose"), options),
-                callback=lambda result: self._resolve_modal_request(
-                    request, int(result or 0)
-                ),
+    @staticmethod
+    def _normalize_inline_option(
+        option, recommended: bool = False
+    ) -> _InlinePromptOption | None:
+        if isinstance(option, _InlinePromptOption):
+            value = option.value or option.title
+            return _InlinePromptOption(
+                title=option.title,
+                detail=option.detail,
+                value=value,
+                recommended=option.recommended or bool(recommended),
             )
+        if isinstance(option, dict):
+            title = str(option.get("title") or "").strip()
+            detail = str(option.get("detail") or "").strip()
+            if not title:
+                return None
+            value = str(option.get("value") or title)
+            return _InlinePromptOption(
+                title=title,
+                detail=detail,
+                value=value,
+                recommended=bool(option.get("recommended")) or bool(recommended),
+            )
+        title = str(option or "").strip()
+        if not title:
+            return None
+        return _InlinePromptOption(
+            title=title,
+            detail="",
+            value=title,
+            recommended=bool(recommended),
+        )
 
-        self._call_ui(show_modal)
+    def request_choice(self, question, options, default_index=1) -> tuple[int, str]:
+        raw_options = list(options or [])
+        if not raw_options:
+            return 0, ""
+        default_index = max(1, min(len(raw_options), int(default_index or 1)))
+        normalized_options = []
+        for index, option in enumerate(raw_options):
+            normalized = self._normalize_inline_option(
+                option,
+                recommended=index == (default_index - 1),
+            )
+            if normalized is not None:
+                normalized_options.append(normalized)
+        if not normalized_options:
+            return 0, ""
+        request = self._build_inline_prompt_request([
+            _InlinePromptQuestion(
+                question=str(question or "Choose one"),
+                options=normalized_options,
+                allow_custom=True,
+                default_option_index=default_index - 1,
+            )
+        ])
+        self._call_ui(self._open_inline_prompt, request)
         request.event.wait()
-        if request.result:
-            return int(request.result)
-        return max(1, min(len(options), int(default_index or 1)))
+        if request.cancelled:
+            return 0, ""
+        answer = request.answers[0]
+        if answer.selected_option_index is not None:
+            selected_index = int(answer.selected_option_index)
+            return selected_index + 1, request.questions[0].options[
+                selected_index
+            ].value
+        return len(normalized_options) + 1, str(answer.custom_text or "").strip()
+
+    def request_questions(self, questions) -> list[tuple[int, str]]:
+        normalized_questions = []
+        for item in questions or []:
+            if not isinstance(item, dict):
+                continue
+            raw_options = list(item.get("options") or [])
+            if not raw_options:
+                continue
+            default_index = item.get("default_index")
+            if default_index is None:
+                default_option_index = None
+            else:
+                default_option_index = max(
+                    0,
+                    min(len(raw_options) - 1, int(default_index) - 1),
+                )
+            normalized_options = []
+            for index, option in enumerate(raw_options):
+                normalized = self._normalize_inline_option(
+                    option,
+                    recommended=index == default_option_index,
+                )
+                if normalized is not None:
+                    normalized_options.append(normalized)
+            if not normalized_options:
+                continue
+            normalized_questions.append(
+                _InlinePromptQuestion(
+                    question=str(item.get("question") or "Choose one"),
+                    options=normalized_options,
+                    allow_custom=True,
+                    default_option_index=default_option_index,
+                )
+            )
+        if not normalized_questions:
+            return []
+        request = self._build_inline_prompt_request(normalized_questions)
+        self._call_ui(self._open_inline_prompt, request)
+        request.event.wait()
+        if request.cancelled:
+            return []
+        answers: list[tuple[int, str]] = []
+        for prompt_question, answer in zip(request.questions, request.answers):
+            if answer.selected_option_index is not None:
+                selected_index = int(answer.selected_option_index)
+                answers.append((
+                    selected_index + 1,
+                    prompt_question.options[selected_index].value,
+                ))
+            else:
+                answers.append((
+                    len(prompt_question.options) + 1,
+                    str(answer.custom_text or "").strip(),
+                ))
+        return answers
 
     def request_input(self, prompt_text, multiline=False) -> str:
-        request = _BlockingModalRequest(threading.Event())
-
-        def show_modal() -> None:
-            self.push_screen(
-                InputModal(str(prompt_text or "Input"), multiline=bool(multiline)),
-                callback=lambda result: self._resolve_modal_request(
-                    request, str(result or "")
-                ),
+        request = self._build_inline_prompt_request([
+            _InlinePromptQuestion(
+                question=str(prompt_text or "Input"),
+                options=[],
+                allow_custom=True,
+                default_custom_value="",
             )
-
-        self._call_ui(show_modal)
+        ])
+        self._call_ui(self._open_inline_prompt, request)
         request.event.wait()
-        return str(request.result or "")
+        if request.cancelled:
+            return ""
+        return str(request.answers[0].custom_text or "")
+
+    def _build_inline_prompt_request(
+        self,
+        questions: list[_InlinePromptQuestion],
+    ) -> _InlinePromptRequest:
+        answers: list[_InlinePromptAnswer] = []
+        for question in questions:
+            answer = _InlinePromptAnswer(
+                selected_option_index=question.default_option_index,
+                custom_text=str(question.default_custom_value or ""),
+            )
+            answers.append(answer)
+        return _InlinePromptRequest(
+            event=threading.Event(),
+            questions=list(questions),
+            answers=answers,
+        )
 
     def clear_current_lines(self, line_count) -> None:
         return
 
-    def _resolve_modal_request(self, request: _BlockingModalRequest, result) -> None:
-        request.result = result
+    def _open_inline_prompt(self, request: _InlinePromptRequest) -> None:
+        self._prompt_request = request
+        self._show_current_prompt_question()
+
+    def _show_current_prompt_question(self) -> None:
+        request = self._prompt_request
+        if request is None or not request.questions:
+            return
+        index = max(0, min(request.current_index, len(request.questions) - 1))
+        request.current_index = index
+        question = request.questions[index]
+        answer = request.answers[index]
+        chat_input = self.query_one("#chat-input", ChatInput)
+        chat_input.set_prompt_state(
+            active=True,
+            current_index=index + 1,
+            total=len(request.questions),
+            question=question.question,
+            options=[
+                (option.title, option.detail, option.recommended)
+                for option in question.options
+            ],
+            allow_custom=question.allow_custom,
+            selected_option_index=answer.selected_option_index,
+            custom_selected=(
+                question.allow_custom and answer.selected_option_index is None
+            ),
+            custom_value=answer.custom_text,
+            custom_label=question.custom_label,
+            custom_placeholder=question.custom_placeholder,
+        )
+        self._set_input_enabled(bool(question.allow_custom))
+        self._sync_prompt_actions(can_submit=chat_input.prompt_can_submit())
+        if chat_input.prompt_uses_custom_input():
+            chat_input.focus_prompt_input()
+        else:
+            self.query_one("#prompt-next", Button).focus()
+
+    def _capture_current_prompt_answer(self, require_complete: bool) -> bool:
+        request = self._prompt_request
+        if request is None or not request.questions:
+            return False
+        index = request.current_index
+        question = request.questions[index]
+        selected_option_index, custom_text = self.query_one(
+            "#chat-input", ChatInput
+        ).get_prompt_answer()
+        if selected_option_index is not None:
+            request.answers[index] = _InlinePromptAnswer(
+                selected_option_index=selected_option_index,
+                custom_text="",
+            )
+            return True
+        if question.allow_custom:
+            request.answers[index] = _InlinePromptAnswer(
+                selected_option_index=None,
+                custom_text=str(custom_text or "").strip(),
+            )
+            if require_complete:
+                return bool(str(custom_text or "").strip())
+            return True
+        if not require_complete:
+            request.answers[index] = _InlinePromptAnswer()
+            return True
+        return False
+
+    def _go_to_previous_prompt_question(self) -> None:
+        request = self._prompt_request
+        if request is None or request.current_index <= 0:
+            return
+        self._capture_current_prompt_answer(require_complete=False)
+        request.current_index -= 1
+        self._show_current_prompt_question()
+
+    def _advance_inline_prompt(self) -> None:
+        request = self._prompt_request
+        if request is None:
+            return
+        if not self._capture_current_prompt_answer(require_complete=True):
+            self._sync_prompt_actions(can_submit=False)
+            return
+        if request.current_index >= len(request.questions) - 1:
+            self._finish_inline_prompt(cancelled=False)
+            return
+        request.current_index += 1
+        self._show_current_prompt_question()
+
+    def _dismiss_inline_prompt(self) -> None:
+        if self._prompt_request is None:
+            return
+        self._finish_inline_prompt(cancelled=True)
+
+    def _finish_inline_prompt(self, cancelled: bool) -> None:
+        request = self._prompt_request
+        if request is None:
+            return
+        request.cancelled = bool(cancelled)
+        self._prompt_request = None
+        self.query_one("#chat-input", ChatInput).set_prompt_state(active=False)
+        self._set_input_enabled(not self.chat_busy)
+        self._sync_prompt_actions()
         request.event.set()
+
+    def _sync_prompt_actions(self, can_submit: bool | None = None) -> None:
+        chat_input = self.query_one("#chat-input", ChatInput)
+        project_picker = self.query_one("#project-picker", ProjectPicker)
+        interrupt_hint = self.query_one("#interrupt-hint", Horizontal)
+        context_label = self.query_one("#context-label", Label)
+        dismiss_button = self.query_one("#prompt-dismiss", Button)
+        prompt_nav = self.query_one("#prompt-nav", Horizontal)
+        back_button = self.query_one("#prompt-back", Button)
+        next_button = self.query_one("#prompt-next", Button)
+        if self._prompt_request is None:
+            dismiss_button.remove_class("visible")
+            prompt_nav.remove_class("visible")
+            back_button.remove_class("hidden")
+            context_label.remove_class("hidden")
+            dismiss_button.styles.width = 9
+            dismiss_button.styles.min_width = 9
+            back_button.styles.width = 6
+            back_button.styles.min_width = 6
+            next_button.styles.width = 6
+            next_button.styles.min_width = 6
+            back_button.styles.margin_right = 1
+            if chat_input.chat_active:
+                project_picker.add_class("hidden")
+                interrupt_hint.add_class("visible")
+            else:
+                project_picker.remove_class("hidden")
+                interrupt_hint.remove_class("visible")
+            return
+
+        self._capture_current_prompt_answer(require_complete=False)
+        project_picker.add_class("hidden")
+        interrupt_hint.remove_class("visible")
+        context_label.add_class("hidden")
+        dismiss_button.add_class("visible")
+        prompt_nav.add_class("visible")
+        current_index = self._prompt_request.current_index
+        if current_index <= 0:
+            back_button.add_class("hidden")
+            back_button.styles.margin_right = 0
+        else:
+            back_button.remove_class("hidden")
+            back_button.styles.margin_right = 1
+        next_button.label = (
+            "Submit"
+            if current_index >= len(self._prompt_request.questions) - 1
+            else "Next"
+        )
+        dismiss_width = len(str(dismiss_button.label or "")) + 2
+        back_width = len(str(back_button.label or "")) + 2
+        next_width = len(str(next_button.label or "")) + 2
+        dismiss_button.styles.width = dismiss_width
+        dismiss_button.styles.min_width = dismiss_width
+        back_button.styles.width = back_width
+        back_button.styles.min_width = back_width
+        next_button.styles.width = next_width
+        next_button.styles.min_width = next_width
+        next_button.disabled = (
+            not chat_input.prompt_can_submit() if can_submit is None else not can_submit
+        )
+        if chat_input.prompt_uses_custom_input():
+            chat_input.focus_prompt_input()
+        elif self.focused is self.query_one("#message-input", TextArea):
+            next_button.focus()
 
     def _call_ui(self, callback, *args) -> None:
         if threading.current_thread() is threading.main_thread():
@@ -2407,12 +2823,14 @@ class AgentTUIApp(App):
         self._clear_loaded_session_state(refresh_sidebar=True)
 
     def _clear_loaded_session_state(self, refresh_sidebar: bool = True) -> None:
+        self._prompt_request = None
         self.chat = None
         self.chat_busy = False
         self.current_session_record = None
         self.todo_items = []
         self._set_todo_panel_items([])
         self._stream_kind = None
+        self._suppress_stream_output = False
         self._set_input_enabled(True)
         self._set_context_label(0, self.config.context_window_tokens)
         self._set_controls_locked(False)
@@ -2426,6 +2844,7 @@ class AgentTUIApp(App):
         interrupt_hint = self.query_one("#interrupt-hint", Horizontal)
         project_title = self.query_one("#project-title", Static)
         chat_input.chat_active = False
+        chat_input.set_prompt_state(active=False)
         chat_input.remove_class("stretch")
         info_bar_shell.remove_class("stretch")
         project_picker.remove_class("hidden")
@@ -2434,6 +2853,7 @@ class AgentTUIApp(App):
         messages_wrap.remove_class("visible")
         messages.clear()
         input_wrapper.add_class("welcome")
+        self._sync_prompt_actions()
         self._apply_config_to_controls()
         if refresh_sidebar:
             self._refresh_project_views()
@@ -2561,20 +2981,26 @@ class AgentTUIApp(App):
 
     def _finish_open_settings_page_command(self, page_id: str) -> None:
         self.chat_busy = False
+        self._suppress_stream_output = False
         self._set_input_enabled(True)
         self._set_controls_locked(False)
+        self._sync_prompt_actions()
         self._open_settings(page_id)
 
     def _finish_open_memory_command(self) -> None:
         self.chat_busy = False
+        self._suppress_stream_output = False
         self._set_input_enabled(True)
         self._set_controls_locked(False)
+        self._sync_prompt_actions()
         self._open_memory()
 
     def _after_command(self, base: str, should_continue) -> None:
         self.chat_busy = False
+        self._suppress_stream_output = False
         self._set_input_enabled(True)
         self._set_controls_locked(False)
+        self._sync_prompt_actions()
         self._apply_config_to_controls()
         if should_continue is False:
             self.exit()
@@ -2591,8 +3017,10 @@ class AgentTUIApp(App):
             self._elapsed_since_thinking(),
         )
         self.chat_busy = False
+        self._suppress_stream_output = False
         self._set_input_enabled(True)
         self._set_controls_locked(False)
+        self._sync_prompt_actions()
         self._display_response(response)
         self._maybe_show_changed_files()
         self._persist_current_session()
@@ -2616,8 +3044,10 @@ class AgentTUIApp(App):
             self._elapsed_since_thinking(),
         )
         self.chat_busy = False
+        self._suppress_stream_output = False
         self._set_input_enabled(True)
         self._set_controls_locked(False)
+        self._sync_prompt_actions()
         self.add_status_message("[✗]", f"处理消息失败: {error}")
         self._persist_current_session()
         self._message_started_at = None
@@ -2864,6 +3294,23 @@ class AgentTUIApp(App):
             return False
         kind = str(display.get("kind") or "")
         if kind == "ask_user":
+            entries = display.get("entries")
+            if isinstance(entries, list):
+                rendered = False
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    question = clean_display_text_preserve_newlines(
+                        entry.get("question", "")
+                    )
+                    answer = clean_display_text_preserve_newlines(
+                        entry.get("answer", "")
+                    )
+                    if question or answer:
+                        view.add_question_entry(question, answer)
+                        rendered = True
+                if rendered:
+                    return True
             question = clean_display_text_preserve_newlines(display.get("question", ""))
             answer = clean_display_text_preserve_newlines(display.get("answer", ""))
             if question or answer:

@@ -173,6 +173,63 @@ class CommandMenuRow(Static, can_focus=False):
         event.stop()
 
 
+class PromptOptionRow(Static, can_focus=False):
+    class Selected(Message):
+        def __init__(self, index: int | None, is_custom: bool = False) -> None:
+            super().__init__()
+            self.index = index
+            self.is_custom = is_custom
+
+    def __init__(
+        self,
+        title: str,
+        detail: str,
+        index: int | None,
+        is_custom: bool = False,
+        recommended: bool = False,
+    ) -> None:
+        super().__init__("", classes="prompt-option")
+        self.title = str(title or "")
+        self.detail = str(detail or "")
+        self.index = index
+        self.is_custom = bool(is_custom)
+        self.recommended = bool(recommended)
+        self.is_selected = False
+
+    def set_selected(self, selected: bool) -> None:
+        self.is_selected = bool(selected)
+        self.refresh()
+
+    def render(self) -> Text:
+        width = max(1, self.size.width)
+        marker = "●" if self.is_selected else "○"
+        title = self.title
+        if self.recommended:
+            title = f"{title} (Recommended)"
+        prefix = f"  {marker} "
+        prefix_style = Style(color=TEXT_PRIMARY, bgcolor=SURFACE_BACKGROUND)
+        title_style = Style(color=TEXT_PRIMARY, bgcolor=SURFACE_BACKGROUND)
+        detail_style = Style(color=TEXT_MUTED, bgcolor=SURFACE_BACKGROUND)
+        content = Text()
+        first_line = Text(no_wrap=True, overflow="crop")
+        first_line.append(prefix, style=prefix_style)
+        first_line.append(title, style=title_style)
+        first_line.truncate(width, overflow="crop", pad=True)
+        content.append_text(first_line)
+        if self.detail:
+            content.append("\n")
+            second_line = Text(no_wrap=True, overflow="crop")
+            second_line.append(" " * len(prefix), style=prefix_style)
+            second_line.append(self.detail, style=detail_style)
+            second_line.truncate(width, overflow="crop", pad=True)
+            content.append_text(second_line)
+        return content
+
+    def on_click(self, event: events.Click) -> None:
+        self.post_message(self.Selected(self.index, is_custom=self.is_custom))
+        event.stop()
+
+
 class MessageTextArea(TextArea):
     BINDINGS = [
         Binding(
@@ -307,7 +364,7 @@ class MessageTextArea(TextArea):
     def render_line(self, y: int):
         if y == 0 and not self.text:
             width = max(1, self.size.width)
-            hint = "Type a message..."
+            hint = self._owner.input_placeholder()
             placeholder_style = Style(color=TEXT_MUTED, bgcolor=SURFACE_BACKGROUND)
             padded_hint = hint[:width].ljust(width)
             theme = self._theme
@@ -345,12 +402,70 @@ class ChatInput(Widget):
     ChatInput.stretch {
         width: 100%;
     }
+    ChatInput.prompt-mode #prompt-shell {
+        display: block;
+    }
+    ChatInput.prompt-mode > #input-area {
+        padding: 0;
+    }
+    ChatInput.prompt-mode #controls-row {
+        display: none;
+    }
+    ChatInput.prompt-mode.prompt-no-input #message-row {
+        display: none;
+        padding: 0;
+    }
+    ChatInput.prompt-mode #message-row {
+        padding: 0 2 0 4;
+    }
+    ChatInput.prompt-mode #message-input {
+        padding: 0;
+    }
 
     ChatInput > #input-area {
         width: 100%;
         height: auto;
         background: $SURFACE_BACKGROUND;
         padding: 1 1 0 1;
+    }
+
+    #prompt-shell {
+        display: none;
+        width: 100%;
+        height: auto;
+        background: $SURFACE_BACKGROUND;
+        padding: 0;
+    }
+    #prompt-top-edge {
+        color: $SURFACE_BACKGROUND;
+        background: $PAGE_BACKGROUND;
+    }
+    #prompt-progress {
+        width: 100%;
+        color: $TEXT_PRIMARY;
+        padding: 0 2;
+    }
+    #prompt-question {
+        width: 100%;
+        min-height: 2;
+        height: auto;
+        color: $TEXT_PRIMARY;
+        margin-top: 1;
+        margin-bottom: 0;
+        padding: 0 2;
+    }
+    #prompt-options {
+        width: 100%;
+        height: auto;
+        background: $SURFACE_BACKGROUND;
+    }
+    #prompt-options PromptOptionRow {
+        width: 100%;
+        height: auto;
+        min-height: 1;
+        background: $SURFACE_BACKGROUND;
+        padding: 0;
+        margin: 0;
     }
 
     #message-row {
@@ -563,6 +678,7 @@ class ChatInput(Widget):
     chat_active = reactive(False)
     allow_model_change = reactive(True)
     controls_locked = reactive(False)
+    prompt_active = reactive(False)
     model_options: list[tuple[str, str]] = []
     thinking_options: list[tuple[str, str]] = THINKING_LEVELS.copy()
     selected_model_value = reactive("")
@@ -578,6 +694,17 @@ class ChatInput(Widget):
         self._modifier_timer = None
         self._model_button_values: dict[str, str] = {}
         self._model_dropdown_serial = 0
+        self._prompt_question = ""
+        self._prompt_options: list[tuple[str, str, bool]] = []
+        self._prompt_current_index = 1
+        self._prompt_total = 1
+        self._prompt_allow_custom = False
+        self._prompt_custom_label = "Type your own answer"
+        self._prompt_custom_placeholder = "Type your own answer..."
+        self._prompt_selected_option_index: int | None = None
+        self._prompt_custom_selected = False
+        self._prompt_saved_text = ""
+        self._prompt_syncing = False
 
     class Send(Message):
         def __init__(self, content: str) -> None:
@@ -607,6 +734,14 @@ class ChatInput(Widget):
             self.label = label
             self.value = value
 
+    class PromptStateChanged(Message):
+        def __init__(self, can_submit: bool) -> None:
+            super().__init__()
+            self.can_submit = bool(can_submit)
+
+    class PromptSubmitRequested(Message):
+        pass
+
     def on_mount(self) -> None:
         self._set_options_width("plan", PLAN_OPTIONS_WIDTH)
         self._rebuild_dropdown(
@@ -631,6 +766,11 @@ class ChatInput(Widget):
             yield BottomHalfRowSpacer(id="command-menu-top-edge")
             yield VerticalScroll(id="command-menu")
         with Vertical(id="input-area"):
+            with Vertical(id="prompt-shell"):
+                yield BottomHalfRowSpacer(id="prompt-top-edge")
+                yield Static("", id="prompt-progress")
+                yield Static("", id="prompt-question")
+                yield Vertical(id="prompt-options")
             with Horizontal(id="message-row"):
                 yield MessageTextArea(
                     self,
@@ -728,6 +868,15 @@ class ChatInput(Widget):
             self._execute_selected_command()
         event.stop()
 
+    def on_prompt_option_row_selected(self, event: PromptOptionRow.Selected) -> None:
+        if not self.prompt_active:
+            return
+        if event.is_custom:
+            self._select_prompt_custom(focus=True)
+        else:
+            self._select_prompt_option(event.index)
+        event.stop()
+
     def _set_plan_mode(self, plan: bool) -> None:
         self.plan_mode = plan
         trigger = self.query_one("#plan-trigger", Button)
@@ -800,6 +949,17 @@ class ChatInput(Widget):
 
     def on_text_area_changed(self, event) -> None:
         if getattr(getattr(event, "text_area", None), "id", None) != "message-input":
+            return
+        if self.prompt_active:
+            if (
+                self._prompt_allow_custom
+                and not self._prompt_syncing
+                and str(event.text_area.text or "").strip()
+            ):
+                self._select_prompt_custom()
+            self._hide_command_menu()
+            self.call_after_refresh(self._update_input_height)
+            self.post_message(self.PromptStateChanged(self.prompt_can_submit()))
             return
         self._refresh_command_menu(event.text_area.text)
         self.call_after_refresh(self._update_input_height)
@@ -1053,6 +1213,10 @@ class ChatInput(Widget):
         self.call_after_refresh(self._update_input_height)
 
     def _submit_message_input(self) -> None:
+        if self.prompt_active:
+            if self.prompt_can_submit():
+                self.post_message(self.PromptSubmitRequested())
+            return
         if self._is_command_menu_open():
             self._execute_selected_command()
         else:
@@ -1146,6 +1310,173 @@ class ChatInput(Widget):
                 break
         trigger.label = selected_label
         self._fit_trigger_to_label(prefix)
+
+    def input_placeholder(self) -> str:
+        if self.prompt_active and self._prompt_allow_custom:
+            return self._prompt_custom_placeholder
+        return "Type a message..."
+
+    def set_prompt_state(
+        self,
+        *,
+        active: bool,
+        current_index: int = 1,
+        total: int = 1,
+        question: str = "",
+        options: list[tuple[str, str, bool]] | None = None,
+        allow_custom: bool = False,
+        selected_option_index: int | None = None,
+        custom_selected: bool = False,
+        custom_value: str = "",
+        custom_label: str = "Type your own answer",
+        custom_placeholder: str = "Type your own answer...",
+    ) -> None:
+        msg_input = self._message_input()
+        if active and not self.prompt_active:
+            self._prompt_saved_text = str(msg_input.text or "")
+        if not active:
+            self.prompt_active = False
+            self.remove_class("prompt-mode")
+            self.remove_class("prompt-no-input")
+            self._prompt_question = ""
+            self._prompt_options = []
+            self._prompt_allow_custom = False
+            self._prompt_selected_option_index = None
+            self._prompt_custom_selected = False
+            self._prompt_syncing = True
+            msg_input.load_text(self._prompt_saved_text)
+            self._prompt_syncing = False
+            self.query_one("#prompt-progress", Static).update("")
+            self.query_one("#prompt-question", Static).update("")
+            self.query_one("#prompt-options", Vertical).remove_children()
+            self.call_after_refresh(self._update_input_height)
+            return
+
+        self.prompt_active = True
+        self.add_class("prompt-mode")
+        self._close_all_dropdowns()
+        self._hide_command_menu()
+        self._prompt_current_index = max(1, int(current_index or 1))
+        self._prompt_total = max(self._prompt_current_index, int(total or 1))
+        self._prompt_question = str(question or "")
+        self._prompt_options = [
+            (
+                str(title or ""),
+                str(detail or ""),
+                bool(recommended),
+            )
+            for title, detail, recommended in (options or [])
+        ]
+        self._prompt_allow_custom = bool(allow_custom)
+        self._prompt_custom_label = str(custom_label or "Type your own answer")
+        self._prompt_custom_placeholder = str(
+            custom_placeholder or "Type your own answer..."
+        )
+        recommended_index = next(
+            (
+                index
+                for index, (_, _, recommended) in enumerate(self._prompt_options)
+                if recommended
+            ),
+            None,
+        )
+        if selected_option_index is not None and 0 <= int(selected_option_index) < len(
+            self._prompt_options
+        ):
+            self._prompt_selected_option_index = int(selected_option_index)
+            self._prompt_custom_selected = False
+        elif recommended_index is not None:
+            self._prompt_selected_option_index = recommended_index
+            self._prompt_custom_selected = False
+        else:
+            self._prompt_selected_option_index = None
+            self._prompt_custom_selected = bool(
+                self._prompt_allow_custom
+                and (custom_selected or not self._prompt_options)
+            )
+
+        self.query_one("#prompt-progress", Static).update(
+            f"{self._prompt_current_index} of {self._prompt_total} questions"
+        )
+        self.query_one("#prompt-question", Static).update(self._prompt_question)
+        self._rebuild_prompt_options()
+
+        self._prompt_syncing = True
+        msg_input.load_text(str(custom_value or ""))
+        self._prompt_syncing = False
+        if self._prompt_allow_custom:
+            self.remove_class("prompt-no-input")
+        else:
+            self.add_class("prompt-no-input")
+        self.call_after_refresh(self._update_input_height)
+        self.post_message(self.PromptStateChanged(self.prompt_can_submit()))
+
+    def _rebuild_prompt_options(self) -> None:
+        container = self.query_one("#prompt-options", Vertical)
+        container.remove_children()
+        for index, (title, detail, recommended) in enumerate(self._prompt_options):
+            row = PromptOptionRow(
+                title,
+                detail,
+                index=index,
+                recommended=recommended,
+            )
+            row.set_selected(index == self._prompt_selected_option_index)
+            container.mount(row)
+        if self._prompt_allow_custom:
+            custom_row = PromptOptionRow(
+                self._prompt_custom_label,
+                "",
+                index=None,
+                is_custom=True,
+            )
+            custom_row.set_selected(self._prompt_custom_selected)
+            container.mount(custom_row)
+
+    def _select_prompt_option(self, index: int | None) -> None:
+        if index is None:
+            return
+        self._prompt_selected_option_index = int(index)
+        self._prompt_custom_selected = False
+        self._update_prompt_option_selection()
+        self.post_message(self.PromptStateChanged(self.prompt_can_submit()))
+
+    def _select_prompt_custom(self, focus: bool = False) -> None:
+        if not self._prompt_allow_custom:
+            return
+        self._prompt_selected_option_index = None
+        self._prompt_custom_selected = True
+        self._update_prompt_option_selection()
+        if focus:
+            self.focus_prompt_input()
+        self.post_message(self.PromptStateChanged(self.prompt_can_submit()))
+
+    def _update_prompt_option_selection(self) -> None:
+        for row in self.query("#prompt-options PromptOptionRow"):
+            if row.is_custom:
+                row.set_selected(self._prompt_custom_selected)
+            else:
+                row.set_selected(row.index == self._prompt_selected_option_index)
+
+    def focus_prompt_input(self) -> None:
+        self._message_input().focus()
+
+    def prompt_uses_custom_input(self) -> bool:
+        return bool(self._prompt_allow_custom and self._prompt_custom_selected)
+
+    def prompt_can_submit(self) -> bool:
+        if not self.prompt_active:
+            return False
+        if self._prompt_selected_option_index is not None:
+            return True
+        if self._prompt_allow_custom and self._prompt_custom_selected:
+            return bool(str(self._message_input().text or "").strip())
+        return False
+
+    def get_prompt_answer(self) -> tuple[int | None, str]:
+        if self._prompt_selected_option_index is not None:
+            return self._prompt_selected_option_index, ""
+        return None, str(self._message_input().text or "").strip()
 
 
 def _windows_key_down(virtual_key: int) -> bool:

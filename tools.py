@@ -26,6 +26,7 @@ from ui import (
     dbg_event,
     get_agent_confirmation,
     get_agent_choice,
+    get_agent_choices,
     get_agent_diff_confirmation,
 )
 from search import (
@@ -151,7 +152,8 @@ WEB_FETCH_TOOL_DEFINITION = {
 ASK_USER_TOOL_DEFINITION = {
     "name": "ask_user",
     "description": (
-        "Ask the user one important multiple-choice question and return the selected option. "
+        "Ask the user one important multiple-choice question, or a short batch of related questions, "
+        "and return the selected option or typed answer for each. "
         "This tool is available only in Plan mode. Use it instead of asking the user to "
         "choose from options in normal assistant text. "
         "Use only for uncertainty that materially affects goal, scope, tradeoffs, or acceptance "
@@ -166,15 +168,63 @@ ASK_USER_TOOL_DEFINITION = {
             },
             "options": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Two to eight mutually exclusive answer options.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Short option title shown on the first line.",
+                        },
+                        "detail": {
+                            "type": "string",
+                            "description": "Short explanation shown on the second line.",
+                        },
+                    },
+                    "required": ["title", "detail"],
+                },
+                "description": "Two to eight mutually exclusive answer options with title and detail.",
             },
             "default_index": {
                 "type": "integer",
                 "description": "Optional 1-based default option index.",
             },
+            "questions": {
+                "type": "array",
+                "description": "Optional batch of related multiple-choice questions.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to ask the user.",
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {
+                                        "type": "string",
+                                        "description": "Short option title shown on the first line.",
+                                    },
+                                    "detail": {
+                                        "type": "string",
+                                        "description": "Short explanation shown on the second line.",
+                                    },
+                                },
+                                "required": ["title", "detail"],
+                            },
+                            "description": "Two to eight mutually exclusive answer options with title and detail.",
+                        },
+                        "default_index": {
+                            "type": "integer",
+                            "description": "Optional 1-based default option index.",
+                        },
+                    },
+                    "required": ["question", "options"],
+                },
+            },
         },
-        "required": ["question", "options"],
     },
 }
 
@@ -1507,28 +1557,46 @@ class AgentTools:
         )
 
     def _ask_user(self, tool_input):
-        question = _required_string(tool_input, "question")
-        options = _required_string_options(tool_input.get("options"))
-        default_index = _bounded_int(
-            tool_input.get("default_index"),
-            1,
-            1,
-            len(options),
-            "default_index",
-        )
+        questions = _ask_user_questions(tool_input)
         self._before_visible_output()
-        selected_index, selected_text = get_agent_choice(
-            question,
-            options,
-            default_index=default_index,
-        )
-        add_question_entry(question, selected_text)
+        if len(questions) == 1:
+            item = questions[0]
+            selected_index, selected_text = get_agent_choice(
+                item["question"],
+                item["options"],
+                default_index=item["default_index"],
+            )
+            add_question_entry(item["question"], selected_text)
+            self._display_payload = {
+                "kind": "ask_user",
+                "entries": [
+                    {
+                        "question": item["question"],
+                        "answer": selected_text,
+                    }
+                ],
+            }
+            return f"User selected option {selected_index}: {selected_text}"
+
+        answers = get_agent_choices(questions)
+        if not answers:
+            self._display_payload = None
+            return "User cancelled question batch."
+        entries = []
+        response_lines = []
+        for index, (item, answer) in enumerate(zip(questions, answers), 1):
+            _, selected_text = answer
+            add_question_entry(item["question"], selected_text)
+            entries.append({
+                "question": item["question"],
+                "answer": selected_text,
+            })
+            response_lines.append(f"{index}. {selected_text}")
         self._display_payload = {
             "kind": "ask_user",
-            "question": question,
-            "answer": selected_text,
+            "entries": entries,
         }
-        return f"User selected option {selected_index}: {selected_text}"
+        return "User answers:\n" + "\n".join(response_lines)
 
     def _read_file(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
@@ -2838,17 +2906,68 @@ def _required_string(data, key, allow_empty=False):
     return value
 
 
-def _required_string_options(value):
+def _ask_user_questions(tool_input):
+    raw_questions = tool_input.get("questions")
+    if raw_questions is None:
+        question = _required_string(tool_input, "question")
+        options = _required_ask_user_options(tool_input.get("options"))
+        default_index = _bounded_int(
+            tool_input.get("default_index"),
+            1,
+            1,
+            len(options),
+            "default_index",
+        )
+        return [
+            {
+                "question": question,
+                "options": options,
+                "default_index": default_index,
+            }
+        ]
+    if not isinstance(raw_questions, list):
+        raise AgentToolError("questions must be an array.")
+    if len(raw_questions) < 1:
+        raise AgentToolError("questions must contain at least 1 item.")
+    questions = []
+    for index, item in enumerate(raw_questions, 1):
+        if not isinstance(item, dict):
+            raise AgentToolError(f"questions[{index}] must be an object.")
+        question = _required_string(item, "question")
+        options = _required_ask_user_options(item.get("options"))
+        default_index = _bounded_int(
+            item.get("default_index"),
+            1,
+            1,
+            len(options),
+            f"questions[{index}].default_index",
+        )
+        questions.append({
+            "question": question,
+            "options": options,
+            "default_index": default_index,
+        })
+    return questions
+
+
+def _required_ask_user_options(value):
     if not isinstance(value, list):
         raise AgentToolError("options must be an array.")
     options = []
     for index, item in enumerate(value, 1):
-        if not isinstance(item, str):
-            raise AgentToolError(f"options[{index}] must be a string.")
-        text = " ".join(item.split())
-        if not text:
-            raise AgentToolError(f"options[{index}] cannot be empty.")
-        options.append(text)
+        if not isinstance(item, dict):
+            raise AgentToolError(f"options[{index}] must be an object.")
+        title = " ".join(str(item.get("title") or "").split())
+        detail = " ".join(str(item.get("detail") or "").split())
+        if not title:
+            raise AgentToolError(f"options[{index}].title cannot be empty.")
+        if not detail:
+            raise AgentToolError(f"options[{index}].detail cannot be empty.")
+        options.append({
+            "title": title,
+            "detail": detail,
+            "value": title,
+        })
     if len(options) < 2 or len(options) > 8:
         raise AgentToolError("options must contain between 2 and 8 items.")
     return options
