@@ -10,7 +10,6 @@ from textual.widget import Widget
 
 from tui.theme import (
     INFO_BAR_BACKGROUND,
-    PAGE_BACKGROUND,
     TEXT_MUTED,
     TEXT_PRIMARY,
     render_css,

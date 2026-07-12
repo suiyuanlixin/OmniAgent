@@ -52,6 +52,7 @@ DEFAULT_COMPACTION_COMPACT_MODEL = AUTO_MODEL_SELECTION
 DEFAULT_MEMORY_MODEL = AUTO_MODEL_SELECTION
 DEFAULT_DEBUG = False
 DEFAULT_AGENT_SHOW_THINKING = True
+DEFAULT_RENDER_MARKDOWN = True
 AGENT_APPROVAL_MODES = {
     AGENT_APPROVAL_CONFIRM,
     AGENT_APPROVAL_APPROVE,
@@ -95,6 +96,7 @@ GLOBAL_FIELD_KEYS = {
     "compaction_keep_recent_messages",
     "compaction_compact_model",
     "memory_model",
+    "render_markdown",
     "debug",
     "web_search_enable",
     "web_search_provider",
@@ -155,6 +157,7 @@ class AppConfig:
     compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
     memory_model: str = DEFAULT_MEMORY_MODEL
+    render_markdown: bool = DEFAULT_RENDER_MARKDOWN
     debug: bool = DEFAULT_DEBUG
     web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
     web_search_provider: str = DEFAULT_WEB_SEARCH_PROVIDER
@@ -215,6 +218,9 @@ class AppConfig:
 
     def to_dict(self):
         return {
+            "general": {
+                "render_markdown": self.render_markdown,
+            },
             "model_list": {
                 name: model.to_dict() for name, model in self.model_list.items()
             },
@@ -277,6 +283,7 @@ class AppConfig:
             "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
             "compaction_compact_model": self.compaction_compact_model,
             "memory_model": self.memory_model,
+            "render_markdown": self.render_markdown,
             "debug": self.debug,
             "web_search_enable": self.web_search_enable,
             "web_search_provider": self.web_search_provider,
@@ -548,6 +555,9 @@ def _sanitize_config(data):
     memory_config = data.get("memory_system", {})
     if not isinstance(memory_config, dict):
         memory_config = {}
+    general_config = data.get("general", {})
+    if not isinstance(general_config, dict):
+        general_config = {}
     web_search = data.get("web_search", {})
     if not isinstance(web_search, dict):
         web_search = {}
@@ -655,6 +665,9 @@ def _sanitize_config(data):
         ),
         memory_model=normalize_optional_model_selection(
             memory_config.get("memory_model")
+        ),
+        render_markdown=_parse_bool(
+            general_config.get("render_markdown"), DEFAULT_RENDER_MARKDOWN
         ),
         debug=_parse_bool(data.get("debug"), DEFAULT_DEBUG),
         web_search_enable=_parse_bool(
@@ -862,6 +875,8 @@ def save_config_fields(fields):
             config.compaction_compact_model = normalize_optional_model_selection(value)
         elif key == "memory_model":
             config.memory_model = normalize_optional_model_selection(value)
+        elif key == "render_markdown":
+            config.render_markdown = _parse_bool(value, config.render_markdown)
         elif key == "debug":
             config.debug = _parse_bool(value, DEFAULT_DEBUG)
         elif key == "web_search_enable":

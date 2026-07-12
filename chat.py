@@ -350,7 +350,6 @@ class OmniAgent:
         self.model = model
         self.api_key = api_key
         self.client = client
-        self._clear_context_usage()
         if max_tokens is not None:
             self.max_tokens = max_tokens
         if temperature is not None:
@@ -418,7 +417,7 @@ class OmniAgent:
 
     def set_context_window_tokens(self, context_window_tokens):
         self.context_window_tokens = max(1, int(context_window_tokens))
-        self._clear_context_usage()
+        set_context_usage(self.last_context_input_tokens, self.context_window_tokens)
 
     def set_temperature(self, temperature):
         self.temperature = temperature
@@ -5076,6 +5075,9 @@ class OmniAgent:
         self.session_memory_generation += 1
         self.clear_todos()
         self._clear_context_usage()
+        estimated_tokens = self._estimate_current_context_tokens()
+        if estimated_tokens > 0:
+            self._set_context_input_tokens(estimated_tokens, "estimated_loaded_history")
 
     def get_history(self):
         return self.conversation_history

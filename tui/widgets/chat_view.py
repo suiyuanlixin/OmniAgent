@@ -4,9 +4,14 @@ from copy import deepcopy
 import re
 from datetime import datetime
 
+from rich import box
 from rich.cells import cell_len
+from rich.console import Console
+import rich.markdown as rich_markdown
+from rich.markdown import Markdown as RichMarkdown
 from rich.segment import Segment
 from rich.style import Style
+from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
@@ -26,10 +31,45 @@ from tui.theme import (
     PAGE_BACKGROUND,
     SURFACE_BACKGROUND,
     TEXT_MUTED,
-    TEXT_PRIMARY,
     render_css,
 )
 from tui.widgets.chat_input import HalfRowSpacer, BottomHalfRowSpacer
+
+
+def _patch_rich_markdown_tables() -> None:
+    if getattr(rich_markdown.TableElement, "_omniagent_fold_patch", False):
+        return
+
+    def _render_table(self, console, options):
+        table = Table(
+            box=box.SIMPLE,
+            pad_edge=False,
+            style="markdown.table.border",
+            show_edge=True,
+            collapse_padding=True,
+        )
+
+        if self.header is not None and self.header.row is not None:
+            for column in self.header.row.cells:
+                heading = column.content.copy()
+                heading.stylize("markdown.table.header")
+                table.add_column(heading, overflow="fold", no_wrap=False)
+
+        if self.body is not None:
+            if not table.columns and self.body.rows:
+                for _ in range(max(len(row.cells) for row in self.body.rows)):
+                    table.add_column(overflow="fold", no_wrap=False)
+            for row in self.body.rows:
+                row_content = [element.content for element in row.cells]
+                table.add_row(*row_content)
+
+        yield table
+
+    rich_markdown.TableElement.__rich_console__ = _render_table
+    rich_markdown.TableElement._omniagent_fold_patch = True
+
+
+_patch_rich_markdown_tables()
 
 
 class ChatView(Widget):
@@ -61,6 +101,9 @@ class ChatView(Widget):
     .message-row-assistant,
     .message-row-status {
         align-horizontal: left;
+    }
+    .message-row-assistant > .message-bubble {
+        width: 100%;
     }
 
     .message-bubble {
@@ -107,6 +150,9 @@ class ChatView(Widget):
     .message-row-assistant .message-bubble-content,
     .message-row-status .message-bubble-content {
         padding: 0;
+    }
+    .message-row-assistant .message-bubble-content {
+        width: 100%;
     }
 
     .message-spacer {
@@ -537,10 +583,11 @@ class ChatView(Widget):
     """
     )
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, markdown_enabled: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self.messages = []
         self._transcript: list[dict] = []
+        self._assistant_markdown_enabled = bool(markdown_enabled)
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
@@ -568,7 +615,11 @@ class ChatView(Widget):
             self.query_one("#chat-log", VerticalScroll).mount(
                 Static("", classes="message-spacer")
             )
-        row, content_widget = _build_message_widgets(role, content)
+        row, content_widget = _build_message_widgets(
+            role,
+            content,
+            assistant_markdown_enabled=self._assistant_markdown_enabled,
+        )
         self.query_one("#chat-log", VerticalScroll).mount(row)
         self.call_after_refresh(self._scroll_end)
         self.messages.append((role, content, datetime.now().isoformat()))
@@ -589,7 +640,11 @@ class ChatView(Widget):
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
-        row, _ = _build_message_widgets("status", content)
+        row, _ = _build_message_widgets(
+            "status",
+            content,
+            assistant_markdown_enabled=self._assistant_markdown_enabled,
+        )
         self.query_one("#chat-log", VerticalScroll).mount(row)
         self.call_after_refresh(self._scroll_end)
         self._append_transcript_entry({
@@ -603,7 +658,11 @@ class ChatView(Widget):
         if self._stream_target is not None and self._stream_role == role:
             return
         if role == "status":
-            row, content_widget = _build_message_widgets("status", prefix)
+            row, content_widget = _build_message_widgets(
+                "status",
+                prefix,
+                assistant_markdown_enabled=self._assistant_markdown_enabled,
+            )
             self.query_one("#chat-log", VerticalScroll).mount(row)
             self.call_after_refresh(self._scroll_end)
             self._stream_target = content_widget
@@ -649,7 +708,7 @@ class ChatView(Widget):
         self._active_output_kind = None
         while remove_count > 0 and self._transcript:
             remove_count -= 1
-            entry = self._transcript.pop()
+            self._transcript.pop()
 
     def clear(self) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
@@ -880,6 +939,14 @@ class ChatView(Widget):
         self._thought_stream_content = ""
         self._thought_stream_transcript_index = None
 
+    def set_markdown_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._assistant_markdown_enabled == enabled:
+            return
+        transcript = self.get_transcript()
+        self._assistant_markdown_enabled = enabled
+        self.load_transcript(transcript)
+
     def _append_transcript_entry(self, entry: dict) -> None:
         self._transcript.append(deepcopy(entry))
 
@@ -1014,7 +1081,9 @@ class ChatView(Widget):
             self._questions_block = None
 
 
-def _build_message_widgets(role: str, content: str):
+def _build_message_widgets(
+    role: str, content: str, assistant_markdown_enabled: bool = True
+):
     row_classes = "message-row"
     bubble_classes = "message-bubble"
     content_classes = "message-bubble-content"
@@ -1035,7 +1104,13 @@ def _build_message_widgets(role: str, content: str):
         content_classes += " message-bubble-assistant"
         half_classes += " message-half-assistant"
     content_widget: Static
-    if role in {"user", "assistant"}:
+    if role == "assistant" and assistant_markdown_enabled:
+        content_widget = MarkdownMessageStatic(
+            content,
+            classes=content_classes,
+            expand=False,
+        )
+    elif role in {"user", "assistant"}:
         content_widget = SelectableMessageStatic(
             content,
             classes=content_classes,
@@ -1108,18 +1183,25 @@ class SelectableMessageStatic(Static, can_focus=True):
         self._selection_anchor = 0
         self._selection_focus = 0
         self._drag_selecting = False
+        self._render_cache_width = 0
+        self._render_cache_source = ""
+        self._render_cache_text = ""
+        self._render_cache_styled: Text | None = None
 
     def render(self):
         start, end = self._selection_range()
         if start == end:
             return super().render()
-        content = self._plain_content()
-        text = Text(content)
+        text = self._rendered_plain_text().copy()
         text.stylize("reverse", start, end)
         return text
 
     def update(self, content="") -> None:
         super().update(content)
+        self._render_cache_width = 0
+        self._render_cache_source = ""
+        self._render_cache_text = ""
+        self._render_cache_styled = None
         self.clear_selection(refresh=False)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
@@ -1138,14 +1220,14 @@ class SelectableMessageStatic(Static, can_focus=True):
     def on_mouse_move(self, event: events.MouseMove) -> None:
         if not self._drag_selecting:
             return
-        self._selection_focus = self._index_from_event(event)
+        self._selection_focus = self._selection_index_from_event(event)
         self.refresh()
         event.stop()
 
     def on_mouse_up(self, event: events.MouseUp) -> None:
         if not self._drag_selecting:
             return
-        self._selection_focus = self._index_from_event(event)
+        self._selection_focus = self._selection_index_from_event(event)
         self._drag_selecting = False
         self.release_mouse()
         self.refresh()
@@ -1160,7 +1242,7 @@ class SelectableMessageStatic(Static, can_focus=True):
             self.release_mouse()
 
     def action_copy_selection(self) -> None:
-        selected = self.selected_text or self._plain_content()
+        selected = self.selected_text or self._raw_content()
         if not selected:
             return
         self.app.copy_to_clipboard(selected)
@@ -1182,8 +1264,47 @@ class SelectableMessageStatic(Static, can_focus=True):
         if refresh:
             self.refresh()
 
-    def _plain_content(self) -> str:
+    def _raw_content(self) -> str:
         return str(getattr(self, "content", "") or "")
+
+    def _plain_content(self) -> str:
+        self._rendered_plain_text()
+        return self._render_cache_text
+
+    def _rendered_plain_text(self) -> Text:
+        width = max(1, self.content_region.width)
+        source = self._raw_content()
+        if (
+            self._render_cache_width == width
+            and self._render_cache_source == source
+            and self._render_cache_styled is not None
+        ):
+            return self._render_cache_styled
+        base_text = Text(source)
+        raw_lines = base_text.split("\n", include_separator=False)
+        if not raw_lines:
+            raw_lines = [Text("")]
+        rendered = Text()
+        plain_lines: list[str] = []
+        for line_index, raw_line in enumerate(raw_lines):
+            wrapped = raw_line.wrap(
+                self.app.console,
+                width,
+                no_wrap=False,
+                overflow="fold",
+            )
+            if not wrapped:
+                wrapped = [Text("")]
+            for wrapped_index, visual_line in enumerate(wrapped):
+                if rendered:
+                    rendered.append("\n")
+                rendered.append_text(visual_line)
+                plain_lines.append(visual_line.plain)
+        self._render_cache_width = width
+        self._render_cache_source = source
+        self._render_cache_text = "\n".join(plain_lines)
+        self._render_cache_styled = rendered
+        return rendered
 
     def _selection_range(self) -> tuple[int, int]:
         start = max(0, min(self._selection_anchor, self._selection_focus))
@@ -1203,6 +1324,20 @@ class SelectableMessageStatic(Static, can_focus=True):
         line_text = self._plain_content()[raw_start:raw_end]
         return raw_start + self._index_from_column(line_text, column)
 
+    def _selection_index_from_event(self, event: events.MouseEvent) -> int:
+        lines = self._wrapped_line_ranges()
+        if not lines:
+            return 0
+        top_padding = self.styles.padding.top
+        left_padding = self.styles.padding.left
+        line_index = min(max(0, event.y - top_padding), len(lines) - 1)
+        raw_start, raw_end = lines[line_index]
+        column = max(0, event.x - left_padding)
+        line_text = self._plain_content()[raw_start:raw_end]
+        before = raw_start + self._index_from_column(line_text, column)
+        after = raw_start + self._index_after_column(line_text, column)
+        return before if before < self._selection_anchor else after
+
     @staticmethod
     def _index_from_column(line_text: str, column: int) -> int:
         if column <= 0 or not line_text:
@@ -1216,32 +1351,231 @@ class SelectableMessageStatic(Static, can_focus=True):
             used_width += char_width
         return len(line_text)
 
+    @staticmethod
+    def _index_after_column(line_text: str, column: int) -> int:
+        if not line_text:
+            return 0
+
+        used_width = 0
+        for index, char in enumerate(line_text):
+            char_width = max(1, cell_len(char))
+            if column < used_width + char_width:
+                return index + 1
+            used_width += char_width
+        return len(line_text)
+
     def _wrapped_line_ranges(self) -> list[tuple[int, int]]:
         content = self._plain_content()
         if not content:
             return [(0, 0)]
-        width = max(1, self.content_region.width)
         lines: list[tuple[int, int]] = []
         offset = 0
         raw_lines = content.split("\n")
         for line_number, raw_line in enumerate(raw_lines):
-            wrapped = Text(raw_line).wrap(
-                self.app.console,
-                width,
-                no_wrap=False,
-                overflow="fold",
-            )
-            if not wrapped:
-                wrapped = [Text("")]
-            for visual_line in wrapped:
-                line_text = visual_line.plain
-                line_start = offset
-                line_end = offset + len(line_text)
-                lines.append((line_start, line_end))
-                offset = line_end
+            line_start = offset
+            line_end = offset + len(raw_line)
+            lines.append((line_start, line_end))
+            offset = line_end
             if line_number != len(raw_lines) - 1:
                 offset += 1
         return lines or [(0, 0)]
+
+
+class MarkdownMessageStatic(Static, can_focus=True):
+    BINDINGS = [
+        Binding("ctrl+c", "copy_markdown", show=False, priority=True),
+        Binding("ctrl+a", "select_all", show=False, priority=True),
+    ]
+
+    def __init__(self, content: str = "", *args, **kwargs):
+        super().__init__("", *args, **kwargs)
+        self._markdown_source = str(content or "")
+        self._selection_anchor = 0
+        self._selection_focus = 0
+        self._drag_selecting = False
+        self._render_cache_width = 0
+        self._render_cache_source = ""
+        self._render_cache_text = ""
+        self._render_cache_styled: Text | None = None
+
+    def render(self):
+        start, end = self._selection_range()
+        if start == end:
+            return self._markdown_renderable()
+        text = self._rendered_markdown_text().copy()
+        text.stylize("reverse", start, end)
+        return text
+
+    def update(self, content="") -> None:
+        self._markdown_source = str(content or "")
+        self._render_cache_width = 0
+        self._render_cache_source = ""
+        self._render_cache_text = ""
+        self._render_cache_styled = None
+        self.clear_selection(refresh=False)
+        self.refresh(layout=True)
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        try:
+            self.screen.set_focus(self, scroll_visible=False)
+        except Exception:
+            self.focus(scroll_visible=False)
+        self._drag_selecting = True
+        index = self._index_from_event(event)
+        self._selection_anchor = index
+        self._selection_focus = index
+        self.capture_mouse()
+        self.refresh()
+        event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self._drag_selecting:
+            return
+        self._selection_focus = self._selection_index_from_event(event)
+        self.refresh()
+        event.stop()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if not self._drag_selecting:
+            return
+        self._selection_focus = self._selection_index_from_event(event)
+        self._drag_selecting = False
+        self.release_mouse()
+        self.refresh()
+        event.stop()
+
+    def on_focus(self) -> None:
+        return
+
+    def on_blur(self) -> None:
+        if self._drag_selecting:
+            self._drag_selecting = False
+            self.release_mouse()
+
+    def action_select_all(self) -> None:
+        content = self._plain_content()
+        self._selection_anchor = 0
+        self._selection_focus = len(content)
+        self.refresh()
+
+    @property
+    def selected_text(self) -> str:
+        start, end = self._selection_range()
+        return self._plain_content()[start:end]
+
+    def clear_selection(self, refresh: bool = True) -> None:
+        self._selection_anchor = 0
+        self._selection_focus = 0
+        if refresh:
+            self.refresh()
+
+    def _markdown_renderable(self):
+        return RichMarkdown(self._markdown_source)
+
+    def _plain_content(self) -> str:
+        self._rendered_markdown_text()
+        return self._render_cache_text
+
+    def _rendered_markdown_text(self) -> Text:
+        width = max(1, self.content_region.width)
+        if (
+            self._render_cache_width == width
+            and self._render_cache_source == self._markdown_source
+            and self._render_cache_styled is not None
+        ):
+            return self._render_cache_styled
+        console = Console(
+            force_terminal=False, color_system=None, width=width, highlight=False
+        )
+        lines = console.render_lines(
+            self._markdown_renderable(),
+            console.options.update(width=width),
+            pad=False,
+        )
+        rendered = Text()
+        plain_lines: list[str] = []
+        for line_index, segments in enumerate(lines):
+            line_text = Text()
+            for segment in segments:
+                if not segment.text:
+                    continue
+                line_text.append(segment.text, segment.style)
+            trim_length = len(line_text.plain.rstrip())
+            if trim_length <= 0:
+                line_text = Text("")
+                plain_lines.append("")
+            else:
+                line_text = line_text[:trim_length]
+                plain_lines.append(line_text.plain)
+            if line_index:
+                rendered.append("\n")
+            rendered.append_text(line_text)
+        self._render_cache_width = width
+        self._render_cache_source = self._markdown_source
+        self._render_cache_text = "\n".join(plain_lines)
+        self._render_cache_styled = rendered
+        return rendered
+
+    def _selection_range(self) -> tuple[int, int]:
+        start = max(0, min(self._selection_anchor, self._selection_focus))
+        end = max(0, max(self._selection_anchor, self._selection_focus))
+        limit = len(self._plain_content())
+        return min(start, limit), min(end, limit)
+
+    def _index_from_event(self, event: events.MouseEvent) -> int:
+        lines = self._wrapped_line_ranges()
+        if not lines:
+            return 0
+        top_padding = self.styles.padding.top
+        left_padding = self.styles.padding.left
+        line_index = min(max(0, event.y - top_padding), len(lines) - 1)
+        raw_start, raw_end = lines[line_index]
+        column = max(0, event.x - left_padding)
+        line_text = self._plain_content()[raw_start:raw_end]
+        return raw_start + SelectableMessageStatic._index_from_column(line_text, column)
+
+    def _selection_index_from_event(self, event: events.MouseEvent) -> int:
+        lines = self._wrapped_line_ranges()
+        if not lines:
+            return 0
+        top_padding = self.styles.padding.top
+        left_padding = self.styles.padding.left
+        line_index = min(max(0, event.y - top_padding), len(lines) - 1)
+        raw_start, raw_end = lines[line_index]
+        column = max(0, event.x - left_padding)
+        line_text = self._plain_content()[raw_start:raw_end]
+        before = raw_start + SelectableMessageStatic._index_from_column(
+            line_text, column
+        )
+        after = raw_start + SelectableMessageStatic._index_after_column(
+            line_text, column
+        )
+        return before if before < self._selection_anchor else after
+
+    def _wrapped_line_ranges(self) -> list[tuple[int, int]]:
+        content = self._plain_content()
+        if not content:
+            return [(0, 0)]
+        lines: list[tuple[int, int]] = []
+        offset = 0
+        raw_lines = content.split("\n")
+        for line_number, raw_line in enumerate(raw_lines):
+            line_start = offset
+            line_end = offset + len(raw_line)
+            lines.append((line_start, line_end))
+            offset = line_end
+            if line_number != len(raw_lines) - 1:
+                offset += 1
+        return lines or [(0, 0)]
+
+    def action_copy_markdown(self) -> None:
+        selected = self.selected_text
+        if selected:
+            self.app.copy_to_clipboard(selected)
+            return
+        if not self._markdown_source:
+            return
+        self.app.copy_to_clipboard(self._markdown_source)
 
 
 class ThoughtBlock(Vertical):

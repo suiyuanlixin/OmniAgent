@@ -478,7 +478,9 @@ class AgentTUIApp(App):
             {
                 "api_type": api_type,
                 "title": self._api_type_title(api_type),
-                "models": [value for _, value in sorted(options, key=lambda x: x[0].lower())],
+                "models": [
+                    value for _, value in sorted(options, key=lambda x: x[0].lower())
+                ],
                 "options": sorted(options, key=lambda x: x[0].lower()),
             }
             for api_type, options in grouped.items()
@@ -494,7 +496,10 @@ class AgentTUIApp(App):
         with Vertical(id="main-area"):
             with Container(id="messages-wrap"):
                 with Vertical(id="messages-shell"):
-                    yield ChatView(id="messages-view")
+                    yield ChatView(
+                        id="messages-view",
+                        markdown_enabled=bool(self.config.render_markdown),
+                    )
 
             with Vertical(id="input-wrapper", classes="welcome"):
                 with Container(id="project-title-wrap"):
@@ -513,7 +518,7 @@ class AgentTUIApp(App):
                             with Horizontal(id="prompt-nav"):
                                 yield Button("Back", id="prompt-back")
                                 yield Button("Next", id="prompt-next")
-                            yield Label("Context: 0 (0%)", id="context-label")
+                            yield Label("Context: 0.0k (0%)", id="context-label")
                         yield HalfRowSpacer(id="info-bar-bottom")
 
     def on_mount(self) -> None:
@@ -603,20 +608,32 @@ class AgentTUIApp(App):
     def on_chat_input_model_changed(self, event: ChatInput.ModelChanged) -> None:
         save_config_field("current_model", event.value)
         self._reload_config()
-        if self.chat is not None:
-            model = self.config.active_model
-            self.chat.configure(
-                api_type=model.api_type,
-                base_url=model.base_url,
-                model=model.model,
-                api_key=model.api_key,
-                max_tokens=model.max_tokens,
-                temperature=model.temperature,
-                stream_mode=model.stream_mode,
-                thinking_mode=model.thinking_mode,
-                reasoning_effort=model.reasoning_effort,
-            )
+        self._sync_chat_from_active_model()
+        self._refresh_context_label_for_active_model()
         self._apply_config_to_controls()
+
+    def _refresh_context_label_for_active_model(self) -> None:
+        if self.chat is not None:
+            self.chat.set_context_window_tokens(self.config.context_window_tokens)
+            return
+        self._set_context_label(0, self.config.context_window_tokens)
+
+    def _sync_chat_from_active_model(self) -> None:
+        if self.chat is None:
+            return
+        model = self.config.active_model
+        self.chat.configure(
+            api_type=model.api_type,
+            base_url=model.base_url,
+            model=model.model,
+            api_key=model.api_key,
+            max_tokens=model.max_tokens,
+            temperature=model.temperature,
+            stream_mode=model.stream_mode,
+            thinking_mode=model.thinking_mode,
+            reasoning_effort=model.reasoning_effort,
+        )
+        self.chat.set_context_window_tokens(model.context_window_tokens)
 
     def on_chat_input_thinking_changed(self, event: ChatInput.ThinkingChanged) -> None:
         thinking_enabled = event.value != "none"
@@ -1358,10 +1375,7 @@ class AgentTUIApp(App):
         except (TypeError, ValueError):
             context_window_tokens = 1
 
-        if input_tokens >= 1000:
-            value = f"{input_tokens / 1000:.1f}k"
-        else:
-            value = str(input_tokens)
+        value = f"{input_tokens / 1000:.1f}k"
         percent = (input_tokens / context_window_tokens) * 100
         self.query_one("#context-label", Label).update(
             f"Context: {value} ({percent:.0f}%)"
@@ -1371,6 +1385,12 @@ class AgentTUIApp(App):
         self.config = load_config()
 
     def _apply_config_to_controls(self) -> None:
+        try:
+            chat_view = self.query_one("#messages-view", ChatView)
+        except NoMatches:
+            chat_view = None
+        if chat_view is not None:
+            chat_view.set_markdown_enabled(bool(self.config.render_markdown))
         try:
             chat_input = self.query_one("#chat-input", ChatInput)
         except NoMatches:
@@ -1510,6 +1530,11 @@ class AgentTUIApp(App):
                 "layout": "list",
                 "rows": self._settings_home_rows,
             },
+            "general": {
+                "title": "General",
+                "layout": "list",
+                "rows": self._settings_general_rows,
+            },
             "model_list": {
                 "title": "Model list",
                 "layout": "model_list",
@@ -1562,6 +1587,13 @@ class AgentTUIApp(App):
     def _settings_home_rows(self) -> list[dict]:
         return [
             {
+                "name": "General",
+                "value": ">",
+                "keywords": "general markdown",
+                "edit_type": "nav",
+                "target_page": "general",
+            },
+            {
                 "name": "Model list",
                 "value": ">",
                 "keywords": "model list model_list current_model",
@@ -1609,6 +1641,19 @@ class AgentTUIApp(App):
                 "keywords": "web search web_search",
                 "edit_type": "nav",
                 "target_page": "web_search",
+            },
+        ]
+
+    def _settings_general_rows(self) -> list[dict]:
+        bool_choices = [("true", "true"), ("false", "false")]
+        return [
+            {
+                "name": "Use markdown",
+                "value": "true" if self.config.render_markdown else "false",
+                "keywords": "markdown render_markdown",
+                "edit_type": "toggle",
+                "options": bool_choices,
+                "on_change": lambda v: self._on_setting_render_markdown_changed(v),
             },
         ]
 
@@ -2481,22 +2526,6 @@ class AgentTUIApp(App):
     def _open_memory(self) -> None:
         self.push_screen(MemoryModal(self._memory_sections()))
 
-    def _sync_chat_from_active_model(self) -> None:
-        if self.chat is None:
-            return
-        model = self.config.active_model
-        self.chat.configure(
-            api_type=model.api_type,
-            base_url=model.base_url,
-            model=model.model,
-            api_key=model.api_key,
-            max_tokens=model.max_tokens,
-            temperature=model.temperature,
-            stream_mode=model.stream_mode,
-            thinking_mode=model.thinking_mode,
-            reasoning_effort=model.reasoning_effort,
-        )
-
     def _on_setting_add_model(self, model_name: str, source_name: str = "") -> str:
         model_name = str(model_name or "").strip()
         if not model_name:
@@ -2584,6 +2613,7 @@ class AgentTUIApp(App):
             return
         save_config_field("context_window_tokens", tokens)
         self._reload_config()
+        self._refresh_context_label_for_active_model()
         self._apply_config_to_controls()
 
     def _on_setting_token_changed(self, value: str) -> None:
@@ -2813,6 +2843,12 @@ class AgentTUIApp(App):
 
     def _on_setting_memory_model_changed(self, value: str) -> None:
         save_config_field("memory_model", normalize_optional_model_selection(value))
+        self._reload_config()
+        self._apply_config_to_controls()
+
+    def _on_setting_render_markdown_changed(self, value: str) -> None:
+        enabled = value.lower() in ("on", "true", "yes")
+        save_config_field("render_markdown", enabled)
         self._reload_config()
         self._apply_config_to_controls()
 
