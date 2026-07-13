@@ -37,17 +37,25 @@ from search import TAVILY_SEARCH_DEPTHS, TAVILY_TOPICS, WEB_SEARCH_PROVIDERS
 from session import (
     ProjectRecord,
     add_project,
+    archive_project_sessions,
     create_session,
     delete_session,
     get_project_by_name,
+    list_pinned_projects,
     list_pinned_sessions,
     list_sessions,
     load_projects,
     load_session,
+    pin_project,
     pin_session,
+    remove_project,
+    rename_project,
+    rename_session,
     save_session_record,
+    unpin_project,
     unpin_session,
 )
+from tui.widgets.confirm_modal import ConfirmModal
 from tui.data import PROJECT_LOGO
 from tui.runtime import clear_bridge, render_console_text, set_bridge
 from tui.theme import render_css
@@ -688,8 +696,6 @@ class AgentTUIApp(App):
             self.add_status_message("[✗]", "无法读取所选会话。")
             return
         self._load_session_record(record)
-        if self.sidebar_visible:
-            self.toggle_sidebar()
 
     def on_sidebar_session_action_requested(
         self, event: Sidebar.SessionActionRequested
@@ -699,7 +705,14 @@ class AgentTUIApp(App):
             return
         session_path = str(event.session_path or "").strip()
         action = str(event.action or "").strip().lower()
-        if not session_path or action not in {"pin", "unpin", "delete", "load"}:
+        value = str(event.value or "")
+        if not session_path or action not in {
+            "pin",
+            "unpin",
+            "delete",
+            "load",
+            "rename",
+        }:
             return
         try:
             if action == "pin":
@@ -711,6 +724,19 @@ class AgentTUIApp(App):
             elif action == "delete":
                 self._delete_session_record(session_path)
                 self.add_status_message("[✓]", "已删除对话。")
+            elif action == "rename":
+                renamed = rename_session(session_path, value)
+                if (
+                    self.current_session_record is not None
+                    and str(
+                        self.current_session_record.get("session_path") or ""
+                    ).strip()
+                    == session_path
+                ):
+                    self.current_session_record["title"] = str(
+                        renamed.get("title") or ""
+                    )
+                self.add_status_message("[✓]", "已重命名对话。")
             elif action == "load":
                 record = load_session(session_path)
                 if not record:
@@ -720,6 +746,80 @@ class AgentTUIApp(App):
                 return
         except Exception as error:
             self.add_status_message("[✗]", f"会话操作失败: {error}")
+            return
+        self._refresh_project_views()
+
+    def on_sidebar_project_action_requested(
+        self, event: Sidebar.ProjectActionRequested
+    ) -> None:
+        if self.chat_busy:
+            self.add_status_message("[!]", "当前正在处理中，暂时不能操作项目。")
+            return
+        project_slug = str(event.project_slug or "").strip()
+        project_name = str(event.project_name or "").strip()
+        action = str(event.action or "").strip().lower()
+        value = str(event.value or "")
+        if not project_slug or action not in {
+            "pin",
+            "unpin",
+            "rename",
+            "archive",
+            "remove",
+        }:
+            return
+
+        if action == "archive":
+            self.push_screen(
+                ConfirmModal(
+                    f"Archive chats in {project_name}?",
+                    "This will delete every chat in the project.",
+                ),
+                callback=lambda confirmed, slug=project_slug, name=project_name: (
+                    self._handle_archive_project_confirmation(slug, name, confirmed)
+                ),
+            )
+            return
+
+        if action == "remove":
+            self.push_screen(
+                ConfirmModal(
+                    f"Remove project {project_name}?",
+                    "This will remove the project entry and delete all chats in it.",
+                ),
+                callback=lambda confirmed, slug=project_slug, name=project_name: (
+                    self._handle_remove_project_confirmation(slug, name, confirmed)
+                ),
+            )
+            return
+
+        selected_project = self._selected_project()
+        current_session_project = self._project_from_session(
+            self.current_session_record
+        )
+
+        try:
+            if action == "pin":
+                pin_project(project_slug)
+                self.add_status_message("[✓]", "已置顶项目。")
+            elif action == "unpin":
+                unpin_project(project_slug)
+                self.add_status_message("[✓]", "已取消置顶项目。")
+            elif action == "rename":
+                updated = rename_project(project_slug, value)
+                if (
+                    selected_project is not None
+                    and selected_project.slug == project_slug
+                ):
+                    self._set_current_project(updated.name)
+                if (
+                    current_session_project is not None
+                    and current_session_project.slug == project_slug
+                    and self.current_session_record is not None
+                ):
+                    self.current_session_record["project"] = updated.to_dict()
+                self.add_status_message("[✓]", "已重命名项目。")
+        except Exception as error:
+            self.add_status_message("[✗]", f"项目操作失败: {error}")
             return
         self._refresh_project_views()
 
@@ -1414,14 +1514,18 @@ class AgentTUIApp(App):
         )
 
     def _refresh_project_views(self) -> None:
+        all_projects = load_projects()
         pinned_paths = {
             str(session.get("session_path") or "")
             for session in list_pinned_sessions()
             if session.get("session_path")
         }
+        pinned_project_records = list_pinned_projects()
+        pinned_project_slugs = {project.slug for project in pinned_project_records}
+        pinned_project_rows = []
         project_rows = []
         project_names = []
-        for project in load_projects():
+        for project in all_projects:
             sessions = list_sessions(project)
             filtered = []
             for session in sessions:
@@ -1429,12 +1533,26 @@ class AgentTUIApp(App):
                 session["_pinned"] = is_pinned
                 if not is_pinned:
                     filtered.append(session)
-            project_rows.append({
+            row = {
                 "name": project.name,
+                "slug": project.slug,
                 "sessions": filtered,
-            })
+                "_pinned": project.slug in pinned_project_slugs,
+            }
+            if project.slug in pinned_project_slugs:
+                pinned_project_rows.append(row)
+            else:
+                project_rows.append(row)
             project_names.append(project.name)
-
+        pinned_project_rows.sort(
+            key=lambda row: pinned_project_records.index(
+                next(
+                    project
+                    for project in pinned_project_records
+                    if project.slug == row["slug"]
+                )
+            )
+        )
         pinned_sessions = list_pinned_sessions()
         for session in pinned_sessions:
             session["_pinned"] = True
@@ -1446,7 +1564,7 @@ class AgentTUIApp(App):
             if not is_pinned:
                 filtered_orphans.append(session)
         self.query_one("#sidebar", Sidebar).set_sessions(
-            project_rows, pinned_sessions, filtered_orphans
+            project_rows, pinned_project_rows, pinned_sessions, filtered_orphans
         )
         picker = self.query_one("#project-picker", ProjectPicker)
         picker.set_projects(project_names)
@@ -2909,6 +3027,53 @@ class AgentTUIApp(App):
         delete_session(session_path)
         if current_path and current_path == str(session_path).strip():
             self._clear_loaded_session_state(refresh_sidebar=False)
+
+    def _handle_archive_project_confirmation(
+        self, project_slug: str, project_name: str, confirmed: bool
+    ) -> None:
+        if not confirmed:
+            return
+        current_session_project = self._project_from_session(
+            self.current_session_record
+        )
+        try:
+            deleted_count = archive_project_sessions(project_slug)
+            if (
+                current_session_project is not None
+                and current_session_project.slug == project_slug
+            ):
+                self._clear_loaded_session_state(refresh_sidebar=False)
+            self.add_status_message(
+                "[✓]", f"已归档项目对话，共删除 {deleted_count} 个对话。"
+            )
+        except Exception as error:
+            self.add_status_message("[✗]", f"项目操作失败: {error}")
+            return
+        self._refresh_project_views()
+
+    def _handle_remove_project_confirmation(
+        self, project_slug: str, project_name: str, confirmed: bool
+    ) -> None:
+        if not confirmed:
+            return
+        selected_project = self._selected_project()
+        current_session_project = self._project_from_session(
+            self.current_session_record
+        )
+        try:
+            removed = remove_project(project_slug)
+            if selected_project is not None and selected_project.slug == project_slug:
+                self._set_current_project("")
+            if (
+                current_session_project is not None
+                and current_session_project.slug == project_slug
+            ):
+                self._clear_loaded_session_state(refresh_sidebar=False)
+            self.add_status_message("[✓]", f"已移除项目 {removed.name}。")
+        except Exception as error:
+            self.add_status_message("[✗]", f"项目操作失败: {error}")
+            return
+        self._refresh_project_views()
 
     def _ensure_ready_for_message(self) -> None:
         if self.current_session_record is None:
