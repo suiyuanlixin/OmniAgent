@@ -55,7 +55,6 @@ from session import (
     unpin_project,
     unpin_session,
 )
-from tui.widgets.confirm_modal import ConfirmModal
 from tui.data import PROJECT_LOGO
 from tui.runtime import clear_bridge, render_console_text, set_bridge
 from tui.theme import render_css
@@ -768,30 +767,6 @@ class AgentTUIApp(App):
         }:
             return
 
-        if action == "archive":
-            self.push_screen(
-                ConfirmModal(
-                    f"Archive chats in {project_name}?",
-                    "This will delete every chat in the project.",
-                ),
-                callback=lambda confirmed, slug=project_slug, name=project_name: (
-                    self._handle_archive_project_confirmation(slug, name, confirmed)
-                ),
-            )
-            return
-
-        if action == "remove":
-            self.push_screen(
-                ConfirmModal(
-                    f"Remove project {project_name}?",
-                    "This will remove the project entry and delete all chats in it.",
-                ),
-                callback=lambda confirmed, slug=project_slug, name=project_name: (
-                    self._handle_remove_project_confirmation(slug, name, confirmed)
-                ),
-            )
-            return
-
         selected_project = self._selected_project()
         current_session_project = self._project_from_session(
             self.current_session_record
@@ -818,6 +793,29 @@ class AgentTUIApp(App):
                 ):
                     self.current_session_record["project"] = updated.to_dict()
                 self.add_status_message("[✓]", "已重命名项目。")
+            elif action == "archive":
+                deleted_count = archive_project_sessions(project_slug)
+                if (
+                    current_session_project is not None
+                    and current_session_project.slug == project_slug
+                ):
+                    self._clear_loaded_session_state(refresh_sidebar=False)
+                self.add_status_message(
+                    "[✓]", f"已归档项目对话，共删除 {deleted_count} 个对话。"
+                )
+            elif action == "remove":
+                removed = remove_project(project_slug)
+                if (
+                    selected_project is not None
+                    and selected_project.slug == project_slug
+                ):
+                    self._set_current_project("")
+                if (
+                    current_session_project is not None
+                    and current_session_project.slug == project_slug
+                ):
+                    self._clear_loaded_session_state(refresh_sidebar=False)
+                self.add_status_message("[✓]", f"已移除项目 {removed.name}。")
         except Exception as error:
             self.add_status_message("[✗]", f"项目操作失败: {error}")
             return
@@ -3027,53 +3025,6 @@ class AgentTUIApp(App):
         delete_session(session_path)
         if current_path and current_path == str(session_path).strip():
             self._clear_loaded_session_state(refresh_sidebar=False)
-
-    def _handle_archive_project_confirmation(
-        self, project_slug: str, project_name: str, confirmed: bool
-    ) -> None:
-        if not confirmed:
-            return
-        current_session_project = self._project_from_session(
-            self.current_session_record
-        )
-        try:
-            deleted_count = archive_project_sessions(project_slug)
-            if (
-                current_session_project is not None
-                and current_session_project.slug == project_slug
-            ):
-                self._clear_loaded_session_state(refresh_sidebar=False)
-            self.add_status_message(
-                "[✓]", f"已归档项目对话，共删除 {deleted_count} 个对话。"
-            )
-        except Exception as error:
-            self.add_status_message("[✗]", f"项目操作失败: {error}")
-            return
-        self._refresh_project_views()
-
-    def _handle_remove_project_confirmation(
-        self, project_slug: str, project_name: str, confirmed: bool
-    ) -> None:
-        if not confirmed:
-            return
-        selected_project = self._selected_project()
-        current_session_project = self._project_from_session(
-            self.current_session_record
-        )
-        try:
-            removed = remove_project(project_slug)
-            if selected_project is not None and selected_project.slug == project_slug:
-                self._set_current_project("")
-            if (
-                current_session_project is not None
-                and current_session_project.slug == project_slug
-            ):
-                self._clear_loaded_session_state(refresh_sidebar=False)
-            self.add_status_message("[✓]", f"已移除项目 {removed.name}。")
-        except Exception as error:
-            self.add_status_message("[✗]", f"项目操作失败: {error}")
-            return
-        self._refresh_project_views()
 
     def _ensure_ready_for_message(self) -> None:
         if self.current_session_record is None:
