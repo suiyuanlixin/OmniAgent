@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from textual import events
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
@@ -13,6 +14,10 @@ from config import (
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
     add_model_profile_with_config,
+    format_extra_modalities,
+    parse_extra_modalities_input,
+    normalize_reasoning_effort_for_api,
+    supported_reasoning_efforts,
 )
 from tui.theme import render_css
 from tui.widgets.chat_input import HalfRowSpacer
@@ -22,6 +27,7 @@ _EDIT_NONE = "none"
 _EDIT_TOGGLE = "toggle"
 _EDIT_SELECT = "select"
 _EDIT_INPUT = "input"
+_EDIT_MODALITIES = "modalities"
 _EDIT_NAV = "nav"
 _EDIT_ACTION = "action"
 
@@ -50,6 +56,14 @@ class _ModelGroupTitle(Static):
 
 
 class _FooterAction(Static):
+    can_focus = True
+
+
+class _ModalitiesChip(Static):
+    can_focus = True
+
+
+class _ModalitiesAddTrigger(Static):
     can_focus = True
 
 
@@ -303,10 +317,65 @@ class SettingsModal(ModalScreen[None]):
         color: $TEXT_MUTED;
     }
 
+    .settings-inline-action,
+    .settings-inline-action:hover,
+    .settings-inline-action:focus,
+    .settings-inline-action.-active {
+        min-width: 8;
+        color: $TEXT_MUTED;
+        padding: 0 0 0 1;
+    }
+
     .settings-toggle-trigger.toggle-off,
     .settings-toggle-trigger.toggle-off:hover,
     .settings-toggle-trigger.toggle-off:focus,
     .settings-toggle-trigger.toggle-off.-active {
+        color: $TEXT_MUTED;
+    }
+
+    .settings-modalities-control {
+        width: auto;
+        height: 1;
+        min-width: 0;
+    }
+
+    .settings-modalities-chip,
+    .settings-modalities-chip:hover,
+    .settings-modalities-chip:focus,
+    .settings-modalities-chip.-active {
+        width: auto;
+        height: 1;
+        min-width: 0;
+        background: $INFO_BAR_BACKGROUND;
+        color: $TEXT_PRIMARY;
+        padding: 0 1;
+        margin: 0;
+    }
+
+    .settings-modalities-add,
+    .settings-modalities-add:hover,
+    .settings-modalities-add:focus,
+    .settings-modalities-add.-active {
+        width: auto;
+        height: 1;
+        min-width: 5;
+        background: transparent;
+        background-tint: transparent;
+        tint: transparent;
+        border: none;
+        outline: none;
+        color: $TEXT_PRIMARY;
+        padding: 0 1;
+        margin: 0;
+    }
+
+    .settings-modalities-add.disabled,
+    .settings-modalities-add.disabled:hover,
+    .settings-modalities-add.disabled:focus,
+    .settings-modalities-add.disabled.-active {
+        background: transparent;
+        background-tint: transparent;
+        tint: transparent;
         color: $TEXT_MUTED;
     }
 
@@ -499,7 +568,11 @@ class SettingsModal(ModalScreen[None]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result(None)", "Close")]
+    BINDINGS = [
+        Binding("escape", "navigate_back", "Back", priority=True),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def __init__(self, pages=None, app=None, page_id: str = "root"):
         super().__init__()
@@ -548,7 +621,7 @@ class SettingsModal(ModalScreen[None]):
                             yield Static(classes="settings-gap")
                             with Horizontal(id="settings-search-row"):
                                 yield Input(
-                                    placeholder="Search settings...",
+                                    placeholder="Search settings",
                                     id="settings-search",
                                 )
                             yield Static(
@@ -675,6 +748,42 @@ class SettingsModal(ModalScreen[None]):
             self._render_current_page(self._current_query())
             return
 
+        add_row_index = self._parse_row_index(control_id, "settings-modal-add-")
+        if add_row_index is not None:
+            rows = self._visible_rows()
+            if 0 <= add_row_index < len(rows):
+                row = rows[add_row_index]
+                if self._remaining_modalities(row):
+                    self._toggle_select_options(add_row_index)
+            return
+
+        parsed_remove = self._parse_modalities_remove(control_id)
+        if parsed_remove is not None:
+            row_index, modality = parsed_remove
+            rows = self._visible_rows()
+            if 0 <= row_index < len(rows):
+                row = rows[row_index]
+                current = list(self._modalities_from_value(str(row.get("value") or "")))
+                updated = [item for item in current if item != modality]
+                self._close_select_options()
+                self._apply_change(row, format_extra_modalities(updated))
+            return
+
+        parsed_modal_opt = self._parse_modalities_option_indices(control_id)
+        if parsed_modal_opt is not None:
+            row_index, option_index = parsed_modal_opt
+            rows = self._visible_rows()
+            if 0 <= row_index < len(rows):
+                row = rows[row_index]
+                remaining = self._remaining_modalities(row)
+                if 0 <= option_index < len(remaining):
+                    current = list(
+                        self._modalities_from_value(str(row.get("value") or ""))
+                    )
+                    current.append(remaining[option_index])
+                    self._apply_change(row, format_extra_modalities(current))
+            return
+
         if control_id.startswith("settings-row-"):
             row_index = self._parse_row_index(control_id, "settings-row-")
             if row_index is None:
@@ -687,6 +796,24 @@ class SettingsModal(ModalScreen[None]):
             if row_index is None:
                 return
             self._activate_row(row_index)
+            return
+
+        if control_id.startswith("settings-accessory-"):
+            row_index = self._parse_row_index(control_id, "settings-accessory-")
+            if row_index is None:
+                return
+            rows = self._visible_rows()
+            if row_index < 0 or row_index >= len(rows):
+                return
+            row = rows[row_index]
+            target_page = str(row.get("accessory_target_page") or "").strip()
+            if target_page:
+                self._push_page(target_page)
+                return
+            accessory_action = row.get("accessory_action")
+            if callable(accessory_action):
+                accessory_action()
+                self._render_current_page(self._current_query())
             return
 
         if control_id.startswith("settings-opt-"):
@@ -721,6 +848,9 @@ class SettingsModal(ModalScreen[None]):
             return
         self.dismiss(result)
 
+    def action_navigate_back(self) -> None:
+        self._go_back()
+
     def _current_page(self) -> dict:
         return self.pages.get(self._page_stack[-1], {})
 
@@ -736,6 +866,7 @@ class SettingsModal(ModalScreen[None]):
     def _push_page(self, page_id: str) -> None:
         if not page_id or page_id not in self.pages:
             return
+        self.set_focus(None)
         self._page_stack.append(page_id)
         self._selected_model_name = ""
         self._reset_search()
@@ -745,6 +876,7 @@ class SettingsModal(ModalScreen[None]):
         if len(self._page_stack) <= 1:
             self.dismiss(None)
             return
+        self.set_focus(None)
         self._page_stack.pop()
         self._selected_model_name = ""
         self._reset_search()
@@ -825,6 +957,9 @@ class SettingsModal(ModalScreen[None]):
     def _option_id(self, row_index: int, option_index: int) -> str:
         return f"settings-opt-{self._render_generation}-{row_index}-{option_index}"
 
+    def _accessory_id(self, row_index: int) -> str:
+        return f"settings-accessory-{self._render_generation}-{row_index}"
+
     def _model_item_id(self, item_index: int) -> str:
         return f"settings-model-item-{self._render_generation}-{item_index}"
 
@@ -836,6 +971,17 @@ class SettingsModal(ModalScreen[None]):
 
     def _footer_action_id(self, action_index: int) -> str:
         return f"settings-footer-action-{self._render_generation}-{action_index}"
+
+    def _modalities_add_id(self, row_index: int) -> str:
+        return f"settings-modal-add-{self._render_generation}-{row_index}"
+
+    def _modalities_remove_id(self, row_index: int, modality: str) -> str:
+        return f"settings-modal-remove-{self._render_generation}-{row_index}-{modality}"
+
+    def _modalities_option_id(self, row_index: int, option_index: int) -> str:
+        return (
+            f"settings-modal-opt-{self._render_generation}-{row_index}-{option_index}"
+        )
 
     def _parse_row_index(self, control_id: str, prefix: str) -> int | None:
         if not control_id.startswith(prefix):
@@ -855,6 +1001,45 @@ class SettingsModal(ModalScreen[None]):
             return int(row_text), int(option_text)
         except (TypeError, ValueError):
             return None
+
+    def _parse_modalities_remove(self, control_id: str) -> tuple[int, str] | None:
+        prefix = "settings-modal-remove-"
+        if not control_id.startswith(prefix):
+            return None
+        payload = control_id[len(prefix) :]
+        try:
+            _generation, row_text, modality = payload.split("-", 2)
+            return int(row_text), str(modality)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_modalities_option_indices(
+        self,
+        control_id: str,
+    ) -> tuple[int, int] | None:
+        prefix = "settings-modal-opt-"
+        if not control_id.startswith(prefix):
+            return None
+        payload = control_id[len(prefix) :]
+        try:
+            _generation, row_text, option_text = payload.split("-", 2)
+            return int(row_text), int(option_text)
+        except (TypeError, ValueError):
+            return None
+
+    def _modalities_from_value(self, value: str) -> tuple[str, ...]:
+        try:
+            return parse_extra_modalities_input(str(value or ""), required=True)
+        except ValueError:
+            return ()
+
+    def _remaining_modalities(self, row: dict) -> list[str]:
+        selected = set(self._modalities_from_value(str(row.get("value") or "")))
+        return [
+            str(opt_value)
+            for _, opt_value in list(row.get("options") or [])
+            if str(opt_value) not in selected
+        ]
 
     def _click_target_id(self, event: events.Click) -> str:
         control = getattr(event, "control", None) or getattr(event, "widget", None)
@@ -904,6 +1089,8 @@ class SettingsModal(ModalScreen[None]):
             self._commit_toggle(row_index)
         elif edit_type == _EDIT_SELECT:
             self._toggle_select_options(row_index)
+        elif edit_type == _EDIT_MODALITIES:
+            return
         elif edit_type == _EDIT_INPUT:
             self._start_input_edit(row_index)
 
@@ -1171,6 +1358,15 @@ class SettingsModal(ModalScreen[None]):
         edit_type = row.get("edit_type", _EDIT_NONE)
         name = str(row.get("name") or "")
         header_children = [Static(name, classes="settings-name")]
+        accessory_label = str(row.get("accessory_label") or "").strip()
+        accessory_widget = None
+        if accessory_label:
+            accessory_widget = _ValueTrigger(
+                accessory_label,
+                markup=False,
+                id=self._accessory_id(row_index),
+                classes="settings-control-trigger settings-inline-action",
+            )
 
         if edit_type == _EDIT_NONE:
             header_children.append(
@@ -1218,6 +1414,8 @@ class SettingsModal(ModalScreen[None]):
             )
             drop_container.styles.width = trigger_width
             drop_container.styles.min_width = trigger_width
+            if accessory_widget is not None:
+                header_children.append(accessory_widget)
             header_children.append(drop_container)
         elif edit_type == _EDIT_TOGGLE:
             display_value = self._display_value(row)
@@ -1233,11 +1431,72 @@ class SettingsModal(ModalScreen[None]):
                 trigger.add_class("toggle-on")
             else:
                 trigger.add_class("toggle-off")
+            if accessory_widget is not None:
+                header_children.append(accessory_widget)
             header_children.append(trigger)
+        elif edit_type == _EDIT_MODALITIES:
+            selected_modalities = list(
+                self._modalities_from_value(str(row.get("value") or ""))
+            )
+            remaining_modalities = self._remaining_modalities(row)
+            option_width = (
+                max((len(item) for item in remaining_modalities), default=0) + 2
+            )
+            option_width = max(option_width, 7)
+            option_buttons = [
+                _OptionItem(
+                    str(modality).title(),
+                    id=self._modalities_option_id(row_index, option_index),
+                    classes="settings-option-btn",
+                )
+                for option_index, modality in enumerate(remaining_modalities)
+            ]
+            options_container = Vertical(
+                *option_buttons,
+                id=self._options_id(row_index),
+                classes="settings-options",
+            )
+            add_width = 5
+            options_container.styles.width = option_width
+            options_container.styles.min_width = option_width
+            options_container.styles.offset = (add_width - option_width, 0)
+            controls: list = []
+            for modality in selected_modalities:
+                controls.append(
+                    _ModalitiesChip(
+                        f"\u00d7 {str(modality).title()}",
+                        markup=False,
+                        id=self._modalities_remove_id(row_index, modality),
+                        classes="settings-modalities-chip",
+                    )
+                )
+            add_classes = "settings-modalities-add"
+            if not remaining_modalities:
+                add_classes += " disabled"
+            add_trigger = _ModalitiesAddTrigger(
+                "Add",
+                markup=False,
+                id=self._modalities_add_id(row_index),
+                classes=add_classes,
+            )
+            add_trigger.styles.width = add_width
+            add_trigger.styles.min_width = add_width
+            controls.append(
+                Container(
+                    add_trigger,
+                    options_container,
+                    classes="settings-modalities-control",
+                )
+            )
+            if accessory_widget is not None:
+                header_children.append(accessory_widget)
+            header_children.extend(controls)
         else:
             trigger_classes = "settings-control-trigger"
             if edit_type == _EDIT_NAV:
                 trigger_classes += " settings-nav-trigger"
+            if accessory_widget is not None:
+                header_children.append(accessory_widget)
             header_children.append(
                 _ValueTrigger(
                     self._display_value(row),
@@ -1384,13 +1643,20 @@ class SettingsModal(ModalScreen[None]):
             "temperature": "0",
             "stream_mode": "false",
             "thinking_mode": "false",
-            "reasoning_effort": "none",
+            "reasoning_effort": "medium",
+            "extra_modalities": "none",
             "context_window_tokens": "0",
         }
 
     def _set_add_model_field(self, key: str, value: str) -> None:
         if not self._add_model_draft:
             self._add_model_draft = {}
+        if key == "api_type":
+            value = str(value or API_TYPE_OLLAMA)
+            current_effort = self._add_model_draft.get("reasoning_effort") or "medium"
+            self._add_model_draft["reasoning_effort"] = (
+                normalize_reasoning_effort_for_api(value, current_effort)
+            )
         self._add_model_draft[key] = value
 
     def _add_model_rows(self) -> list[dict]:
@@ -1403,18 +1669,19 @@ class SettingsModal(ModalScreen[None]):
             ("Gemini", API_TYPE_GEMINI),
             ("GLM", API_TYPE_GLM),
         ]
+        draft_api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
         reasoning_choices = [
-            ("none", "none"),
-            ("minimal", "minimal"),
-            ("low", "low"),
-            ("medium", "medium"),
-            ("high", "high"),
-            ("xhigh", "xhigh"),
-            ("max", "max"),
+            (value, value) for value in supported_reasoning_efforts(draft_api_type)
         ]
         thinking_enabled = self._is_toggle_enabled(
             str(draft.get("thinking_mode") or "false")
         )
+        current_effort = normalize_reasoning_effort_for_api(
+            draft_api_type,
+            draft.get("reasoning_effort") or "medium",
+        )
+        if current_effort not in {value for _, value in reasoning_choices}:
+            current_effort = "medium"
         rows = [
             {
                 "name": "Name",
@@ -1485,6 +1752,20 @@ class SettingsModal(ModalScreen[None]):
                 ),
             },
             {
+                "name": "Extra modalities",
+                "value": str(draft.get("extra_modalities") or "none"),
+                "keywords": "extra_modalities modalities audio image video",
+                "edit_type": "modalities",
+                "options": [
+                    ("audio", "audio"),
+                    ("image", "image"),
+                    ("video", "video"),
+                ],
+                "on_change": lambda v: self._set_add_model_field(
+                    "extra_modalities", str(v)
+                ),
+            },
+            {
                 "name": "Context",
                 "value": str(draft.get("context_window_tokens") or ""),
                 "keywords": "context_window_tokens context",
@@ -1496,15 +1777,16 @@ class SettingsModal(ModalScreen[None]):
         ]
         if thinking_enabled:
             rows.insert(
-                -1,
+                len(rows) - 2,
                 {
                     "name": "Reasoning effort",
-                    "value": str(draft.get("reasoning_effort") or "none"),
+                    "value": current_effort,
                     "keywords": "reasoning_effort",
                     "edit_type": "select",
                     "options": reasoning_choices,
                     "on_change": lambda v: self._set_add_model_field(
-                        "reasoning_effort", str(v)
+                        "reasoning_effort",
+                        normalize_reasoning_effort_for_api(draft_api_type, str(v)),
                     ),
                 },
             )
@@ -1527,6 +1809,12 @@ class SettingsModal(ModalScreen[None]):
         if not name:
             self.app_ref.add_status_message("[!]", "Model name cannot be empty.")
             return ""
+        extra_modalities = str(draft.get("extra_modalities") or "").strip()
+        try:
+            parse_extra_modalities_input(extra_modalities, required=True)
+        except ValueError as error:
+            self.app_ref.add_status_message("[!]", str(error))
+            return ""
         max_tokens = str(draft.get("max_tokens") or "").strip()
         context_tokens = str(draft.get("context_window_tokens") or "").strip()
         temperature = str(draft.get("temperature") or "").strip()
@@ -1539,6 +1827,7 @@ class SettingsModal(ModalScreen[None]):
             "stream_mode": draft.get("stream_mode"),
             "thinking_mode": draft.get("thinking_mode"),
             "reasoning_effort": draft.get("reasoning_effort"),
+            "extra_modalities": extra_modalities,
         }
         if max_tokens and max_tokens != "0":
             payload["max_tokens"] = max_tokens
@@ -1556,3 +1845,11 @@ class SettingsModal(ModalScreen[None]):
         self.app_ref._apply_config_to_controls()
         self._selected_model_name = str(created)
         return "model_list"
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()

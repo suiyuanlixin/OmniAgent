@@ -217,7 +217,11 @@ class ProjectModal(ModalScreen[dict | None]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result(None)", "Close")]
+    BINDINGS = [
+        ("escape", "dismiss_result(None)", "Close"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Container(id="project-frame"):
@@ -229,7 +233,7 @@ class ProjectModal(ModalScreen[dict | None]):
                     yield HalfRowSpacer(id="project-top-edge")
                     with Vertical(id="project-dialog"):
                         with Horizontal(id="project-header"):
-                            yield Static("Add new project", id="project-title")
+                            yield Static("New project", id="project-title")
                             yield Static("esc", id="project-close-hint")
                         with Vertical(id="project-body"):
                             yield Static(classes="project-gap")
@@ -392,3 +396,11 @@ class ProjectModal(ModalScreen[dict | None]):
 
     def action_dismiss_result(self, result: dict | None = None) -> None:
         self.dismiss(result)
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()

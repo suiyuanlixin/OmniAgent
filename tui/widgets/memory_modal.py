@@ -175,7 +175,11 @@ class MemoryModal(ModalScreen[None]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result(None)", "Close")]
+    BINDINGS = [
+        ("escape", "dismiss_result(None)", "Close"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def __init__(self, sections: list[dict], title: str = "Memory") -> None:
         super().__init__()
@@ -315,3 +319,11 @@ class MemoryModal(ModalScreen[None]):
         nav_scroll.styles.max_height = available_height
         detail_scroll.styles.height = detail_height
         detail_scroll.styles.max_height = available_height
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()

@@ -78,7 +78,6 @@ pip install -r requirements.txt
     "max_rounds": 12,
     "max_tool_calls": 40,
     "approve": "confirm",
-    "show_thinking": true,
     "plan_mode": true
   },
   "skills": {
@@ -117,7 +116,8 @@ pip install -r requirements.txt
   "api_type": "openai",
   "base_url": "https://api.minimaxi.com/v1",
   "model": "MiniMax-M3",
-  "api_key": "YOUR_MINIMAX_KEY"
+  "api_key": "YOUR_MINIMAX_KEY",
+  "extra_modalities": ["image", "video"]
 }
 ```
 
@@ -164,14 +164,14 @@ MiniMax-M3 推荐使用 OpenAI 兼容配置。程序会在调用 MiniMax OpenAI 
 | `temperature` | 采样温度，范围为 `0` 到 `1`。 |
 | `stream_mode` | 是否默认启用流式输出。 |
 | `thinking_mode` | 是否默认展示模型返回的推理 / 思考内容。 |
-| `reasoning_effort` | 推理 / 思考强度。留空时使用服务商默认值；可填写 `none`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`。不同 API 会按官方支持范围自动映射，例如 Gemini 的 `xhigh/max` 会降为 `high`，DeepSeek 的 `low/medium` 会映射为 `high`。 |
+| `reasoning_effort` | 推理 / 思考强度。关闭 `thinking_mode` 时等同于 `none`。开启后按接口支持范围填写：`openai` / `anthropic` / `glm` 支持 `low`、`medium`、`high`、`xhigh`、`max`；`gemini` 支持 `minimal`、`low`、`medium`、`high`；`ollama` 支持 `low`、`medium`、`high`、`max`。留空时使用服务商默认值；旧配置里的不兼容值会在加载时自动归一化。 |
+| `extra_modalities` | 模型除文本外额外支持的模态列表，可填写 `audio`、`image`、`video`。程序只会把这里声明过的附件直接作为多模态内容发送给模型；未声明时仍保留附件清单文本。 |
 | `context_window_tokens` | 当前模型的上下文窗口 token 数，用于按比例计算自动压缩阈值。不同模型请按服务商文档填写。 |
 | `debug` | 全局调试开关，默认 `false`。开启后会写入 `memory/memory_update_diagnostics.jsonl` 等诊断信息。 |
 | `agent_mode.enable` | 是否默认启用 agent 模式。没有启动工作目录时会自动关闭。 |
 | `agent_mode.max_rounds` | 每次用户请求中，agent 最多执行多少轮工具循环。 |
 | `agent_mode.max_tool_calls` | 每次用户请求中，agent 最多调用多少次工具。 |
 | `agent_mode.approve` | Agent 写操作审批模式，只支持 `confirm` 或 `auto`。 |
-| `agent_mode.show_thinking` | 是否显示 Agent 的 thinking 过程。布尔值，`true` 显示完整 thinking，`false` 隐藏。它只影响显示，不改变模型 reasoning/thinking 是否开启。 |
 | `agent_mode.plan_mode` | 是否启用 Plan mode。默认 `true`；开启后可在“先想清楚再动手”的只读规划/澄清工作流中使用 `ask_user`，关闭后不启用这套 Plan mode 协作流程。 |
 | `skills.enable` | Agent skills 总开关。关闭后不会注入 `list_skills` 和 `read_skill`。 |
 | `skills.sources.app` | 是否加载程序目录 `skills/`，适合放所有项目通用的本机 skills。 |
@@ -220,7 +220,7 @@ Windows 路径同样支持，例如：
 
 文本文件内容会作为只读上下文附加到本次消息中，不会放开 Agent 工具对工作目录外路径的读写限制。单个文本引用文件最多附加 `60000` 个字符，超出部分会被截断。
 
-引用图片或视频时，程序会自动检测文件类型。MiniMax-M3 的 OpenAI 兼容接口会收到 `image_url` / `video_url` 内容块，Anthropic 兼容接口会收到 `image` / `video` 内容块；其他模型或接口会保留附件清单文本，但不会直接发送媒体内容。支持的图片类型包括 JPEG、PNG、GIF、WEBP，支持的视频类型包括 MP4、AVI、MOV、MKV。本地图片最大 `10 MB`，本地视频最大 `50 MB`，媒体请求体总量限制为 `64 MB`。
+引用音频、图片或视频时，程序会自动检测文件类型，并按当前模型配置里的 `extra_modalities` 决定是否直接作为多模态内容发送。OpenAI 兼容接口会发送 `input_audio`、`image_url`、`video_url` 内容块，Anthropic 兼容接口会发送 `audio`、`image`、`video` 内容块；未声明对应模态时仍会保留附件清单文本，但不会直接发送媒体内容。支持的图片类型包括 JPEG、PNG、GIF、WEBP，支持的音频类型包括 MP3、WAV、FLAC、OGG、WEBM、M4A、AAC，支持的视频类型包括 MP4、AVI、MOV、MKV。本地图片最大 `10 MB`，本地音频和视频最大 `50 MB`，媒体请求体总量限制为 `64 MB`。
 
 ## 自定义提示词
 
@@ -391,7 +391,7 @@ Anthropic Agent 模式使用 streaming API 读取工具调用事件和 thinking 
 
 Agent 运行时会隐藏 round 编号、工具调用编号、工具结果摘要和 final check 摘要等中间噪音，只保留必要的确认、警告、错误和最终回复。Thinking、确认框和最终回复之间会自动保持一行间距。
 
-Agent 模式在 `show_thinking=true` 时会显示完整的 thinking/reasoning 过程，`show_thinking=false` 时只保留最终回复和必要的确认、错误信息。该选项只影响显示，不改变模型是否进行 reasoning/thinking。开启流式模式时，Agent 最终回复会以流式方式显示。
+Agent 模式会显示完整的 thinking/reasoning 过程，并在开启流式模式时把最终回复继续按流式方式显示。
 
 ## 上下文压缩
 

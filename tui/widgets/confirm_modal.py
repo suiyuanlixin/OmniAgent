@@ -63,7 +63,11 @@ class ConfirmModal(ModalScreen[bool]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result(False)", "Cancel")]
+    BINDINGS = [
+        ("escape", "dismiss_result(False)", "Cancel"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Container(id="confirm-wrap"):
@@ -82,3 +86,11 @@ class ConfirmModal(ModalScreen[bool]):
 
     def action_dismiss_result(self, result: bool = False) -> None:
         self.dismiss(bool(result))
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()

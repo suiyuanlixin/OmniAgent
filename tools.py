@@ -23,7 +23,6 @@ from ui import (
     add_web_fetch_entry,
     add_web_search_entry,
     add_write_entry,
-    dbg_event,
     get_agent_confirmation,
     get_agent_choice,
     get_agent_choices,
@@ -1683,12 +1682,8 @@ class AgentTools:
             WEB_FETCH_MAX_CHARS,
             "max_chars",
         )
-        dbg_event(
-            "tool.web_fetch.start", url=url, mode=extract_mode, max_chars=max_chars
-        )
         self._before_visible_output()
         add_web_fetch_entry(url)
-        dbg_event("tool.web_fetch.ui_entry", url=url)
         self._display_payload = {
             "kind": "web_fetch",
             "url": url,
@@ -1696,14 +1691,12 @@ class AgentTools:
         try:
             result = _fetch_public_webpage(url, extract_mode, max_chars)
         except Exception as error:
-            dbg_event("tool.web_fetch.error", url=url, error=str(error))
             self._display_payload = {
                 "kind": "web_fetch",
                 "url": url,
                 "error": str(error),
             }
             return _error_result(str(error))
-        dbg_event("tool.web_fetch.done", url=url, result_chars=len(str(result or "")))
         return result
 
     def _list_dir(self, tool_input):

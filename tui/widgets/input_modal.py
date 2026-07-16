@@ -65,7 +65,11 @@ class InputModal(ModalScreen[str | None]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result('')", "Cancel")]
+    BINDINGS = [
+        ("escape", "dismiss_result('')", "Cancel"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Container(id="input-modal-wrap"):
@@ -87,6 +91,14 @@ class InputModal(ModalScreen[str | None]):
             self.dismiss(value)
             return
         self.dismiss("")
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "input-modal-field":

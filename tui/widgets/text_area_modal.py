@@ -146,7 +146,11 @@ class TextAreaModal(ModalScreen[str | None]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result(None)", "Close")]
+    BINDINGS = [
+        ("escape", "dismiss_result(None)", "Close"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Container(id="text-area-frame"):
@@ -194,6 +198,14 @@ class TextAreaModal(ModalScreen[str | None]):
 
     def action_dismiss_result(self, result: str | None = None) -> None:
         self.dismiss(result)
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()
 
     def action_save(self) -> None:
         self._save()
@@ -360,7 +372,11 @@ class PromptFileModal(ModalScreen[str | None]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result(None)", "Close")]
+    BINDINGS = [
+        ("escape", "dismiss_result(None)", "Close"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Container(id="prompt-file-frame"):
@@ -406,6 +422,14 @@ class PromptFileModal(ModalScreen[str | None]):
 
     def action_save(self) -> None:
         self._save()
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()
 
     def _save(self) -> None:
         value = self.query_one("#prompt-file-field", TextArea).text

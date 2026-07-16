@@ -9,7 +9,6 @@ from ui import (
     add_explored_entry,
     clean_and_print_stream_response,
     clean_display_text,
-    dbg_event,
     finish_thinking_round,
     print_error,
     print_info,
@@ -35,8 +34,9 @@ from config import (
     GEMINI_OPENAI_BASE_URL,
     SUPPORTED_API_TYPES,
     normalize_api_type,
+    normalize_extra_modalities,
     normalize_optional_model_selection,
-    parse_reasoning_effort,
+    normalize_reasoning_effort_for_api,
 )
 from memory import MemoryStore, parse_memory_update_response
 from tools import (
@@ -210,12 +210,12 @@ class OmniAgent:
         stream_mode=False,
         thinking_mode=False,
         reasoning_effort="",
+        extra_modalities=(),
         agent_mode=False,
         workspace_dir=None,
         max_agent_rounds=DEFAULT_MAX_AGENT_ROUNDS,
         max_agent_tool_calls=DEFAULT_MAX_AGENT_TOOL_CALLS,
         agent_approval_mode="confirm",
-        agent_show_thinking=True,
         skills_enabled=True,
         skills_source_app=True,
         skills_source_workspace=False,
@@ -247,7 +247,10 @@ class OmniAgent:
         self.conversation_history = []
         self.client = None
         self.thinking_mode = thinking_mode
-        self.reasoning_effort = parse_reasoning_effort(reasoning_effort)
+        self.reasoning_effort = normalize_reasoning_effort_for_api(
+            api_type, reasoning_effort
+        )
+        self.extra_modalities = normalize_extra_modalities(extra_modalities)
         self.last_context_input_tokens = 0
         self.last_context_usage_source = ""
         self.set_context_window_tokens(context_window_tokens)
@@ -278,7 +281,6 @@ class OmniAgent:
             plan_mode=agent_plan_enabled,
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
-        self.agent_show_thinking = bool(agent_show_thinking)
         self.max_agent_rounds = max(1, int(max_agent_rounds))
         self.max_agent_tool_calls = max(1, int(max_agent_tool_calls))
         self.agent_running = False
@@ -305,6 +307,7 @@ class OmniAgent:
             stream_mode,
             thinking_mode=None,
             reasoning_effort=None,
+            extra_modalities=None,
         )
         self.agent_tools.set_subagent_executor(self._dispatch_subagent)
         self.agent_team_enabled = bool(agent_team_enable) and (
@@ -332,6 +335,7 @@ class OmniAgent:
         stream_mode=None,
         thinking_mode=None,
         reasoning_effort=None,
+        extra_modalities=None,
     ):
         api_type = normalize_api_type(api_type)
         if api_type not in SUPPORTED_API_TYPES:
@@ -360,6 +364,8 @@ class OmniAgent:
             self.thinking_mode = thinking_mode
         if reasoning_effort is not None:
             self.set_reasoning_effort(reasoning_effort)
+        if extra_modalities is not None:
+            self.set_extra_modalities(extra_modalities)
 
     def _create_client(self, api_type, api_key, base_url):
         if api_type == API_TYPE_ANTHROPIC:
@@ -429,7 +435,12 @@ class OmniAgent:
         self.thinking_mode = enabled
 
     def set_reasoning_effort(self, effort):
-        self.reasoning_effort = parse_reasoning_effort(effort)
+        self.reasoning_effort = normalize_reasoning_effort_for_api(
+            self.api_type, effort
+        )
+
+    def set_extra_modalities(self, extra_modalities):
+        self.extra_modalities = normalize_extra_modalities(extra_modalities)
 
     def set_agent_limits(self, max_rounds=None, max_tool_calls=None):
         if max_rounds is not None:
@@ -439,9 +450,6 @@ class OmniAgent:
 
     def set_agent_approval_mode(self, approval_mode):
         self.agent_tools.set_approval_mode(approval_mode)
-
-    def set_agent_show_thinking(self, enabled):
-        self.agent_show_thinking = bool(enabled)
 
     def set_plan_mode(self, enabled):
         self.agent_tools.set_plan_mode(enabled)
@@ -567,7 +575,6 @@ class OmniAgent:
             "max_rounds": self.max_agent_rounds,
             "max_tool_calls": self.max_agent_tool_calls,
             "approval_mode": self.agent_tools.approval_mode,
-            "show_thinking": bool(self.agent_show_thinking),
             "plan_enabled": self.agent_tools.plan_mode,
             "plan_mode": self.agent_tools.plan_mode,
             "skills": self.agent_tools.skills_status(),
@@ -641,13 +648,6 @@ class OmniAgent:
         stream_callback_response=None,
         media_references=None,
     ):
-        dbg_event(
-            "chat.send.start",
-            api_type=self.api_type,
-            stream_mode=bool(self.stream_mode),
-            thinking_mode=bool(self.thinking_mode),
-            agent_mode=bool(self.agent_mode),
-        )
         user_content = self._user_message_content(user_message, media_references)
         self.conversation_history.append({"role": "user", "content": user_content})
         self._record_preference_signal(user_message)
@@ -663,21 +663,17 @@ class OmniAgent:
                 self.agent_mode = False
 
             if self.agent_mode:
-                dbg_event("chat.send.branch", branch="agent")
                 response = self._agent_response()
             elif self._normal_tools_available():
-                dbg_event("chat.send.branch", branch="normal_tools")
                 response = self._normal_web_search_response(
                     stream_callback_thinking,
                     stream_callback_response,
                 )
             elif self.stream_mode:
-                dbg_event("chat.send.branch", branch="stream")
                 response = self._stream_response(
                     stream_callback_thinking, stream_callback_response, self.model
                 )
             elif self.api_type == API_TYPE_ANTHROPIC:
-                dbg_event("chat.send.branch", branch="anthropic")
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=self.max_tokens,
@@ -688,25 +684,16 @@ class OmniAgent:
                 )
                 response = self._parse_anthropic_response(response)
             elif self.api_type == API_TYPE_OLLAMA:
-                dbg_event("chat.send.branch", branch="ollama")
                 response = self.client.chat(
                     **self._ollama_chat_kwargs(messages=self.conversation_history)
                 )
                 response = self._parse_ollama_response(response)
             else:
-                dbg_event("chat.send.branch", branch="openai-nonstream")
                 response = self.client.chat.completions.create(
                     **self._chat_completion_kwargs(messages=self.conversation_history)
                 )
                 response = self._parse_response(response)
 
-            dbg_event(
-                "chat.send.done",
-                has_response=bool(response is not None),
-                agent_stopped=bool((response or {}).get("agent_stopped")),
-                thinking_streamed=(response or {}).get("thinking_streamed"),
-                response_streamed=(response or {}).get("response_streamed"),
-            )
             if response and not response.get("agent_stopped"):
                 self._record_hot_history(user_message_index)
             if response is None:
@@ -775,16 +762,6 @@ class OmniAgent:
             self.agent_running = False
 
     def _finalize_agent_response(self, response):
-        if response and not self.agent_show_thinking:
-            response = dict(response)
-            response["thinking"] = ""
-            response["thinking_streamed"] = self.agent_thinking_streamed
-            response["response_streamed"] = self.agent_response_streamed
-            response["thinking_needs_separator"] = (
-                self.agent_thinking_needs_separator
-                and not response.get("agent_stopped")
-            )
-            return response
         if response and self.agent_thinking_streamed:
             response = dict(response)
             response["thinking"] = ""
@@ -925,8 +902,7 @@ class OmniAgent:
             )
             if reasoning:
                 field_thinking = field_thinking_candidate
-                if self.agent_show_thinking:
-                    self._stream_agent_thinking(reasoning)
+                self._stream_agent_thinking(reasoning)
 
             content, full_response, raw_response = self._stream_content_delta(
                 self._get_field(delta, "content", "") or "",
@@ -937,12 +913,7 @@ class OmniAgent:
                 raw_response,
                 tagged_thinking,
             )
-            if (
-                tagged_reasoning
-                and not response_streamed
-                and self.thinking_mode
-                and self.agent_show_thinking
-            ):
+            if tagged_reasoning and not response_streamed and self.thinking_mode:
                 self._stream_agent_thinking(tagged_reasoning)
             if content:
                 if not response_streamed:
@@ -1247,15 +1218,6 @@ class OmniAgent:
                 tool_call.get("arguments", {}),
                 tool_result,
             )
-            # #region debug-point D:normal-websearch-tool-result
-            dbg_event(
-                "debug.normal_websearch.tool_result",
-                provider=provider,
-                tool_name=str(tool_call.get("name", "") or ""),
-                has_error=str(tool_result or "").startswith("ERROR:"),
-                display_kind=str((display or {}).get("kind") or ""),
-            )
-            # #endregion
             if provider == "ollama":
                 self.conversation_history.append(
                     self._ollama_tool_result_message(
@@ -1347,15 +1309,6 @@ class OmniAgent:
                     stream_callback_response,
                     emit_response=True,
                 )
-                # #region debug-point A:normal-websearch-chat-round
-                dbg_event(
-                    "debug.normal_websearch.chat.round",
-                    response_started=response_started,
-                    tool_call_count=len(tool_calls or []),
-                    text_len=len(str(text or "")),
-                    thinking_len=len(str(thinking or "")),
-                )
-                # #endregion
                 full_thinking += thinking
                 if self._agent_should_stop():
                     return self._agent_stopped_response(full_thinking, text)
@@ -1600,15 +1553,6 @@ class OmniAgent:
                     stream_callback_response,
                     emit_response=True,
                 )
-                # #region debug-point A:normal-websearch-ollama-round
-                dbg_event(
-                    "debug.normal_websearch.ollama.round",
-                    response_started=response_started,
-                    tool_call_count=len(tool_calls or []),
-                    text_len=len(str(text or "")),
-                    thinking_len=len(str(thinking or "")),
-                )
-                # #endregion
                 full_thinking += thinking
                 if self._agent_should_stop():
                     return self._agent_stopped_response(
@@ -1823,15 +1767,6 @@ class OmniAgent:
                     stream_callback_response,
                     emit_response=True,
                 )
-                # #region debug-point A:normal-websearch-anthropic-round
-                dbg_event(
-                    "debug.normal_websearch.anthropic.round",
-                    response_started=response_started,
-                    tool_use_count=len(tool_uses or []),
-                    text_len=len(str(text or "")),
-                    thinking_len=len(str(thinking or "")),
-                )
-                # #endregion
                 full_thinking += thinking
                 if self._agent_should_stop():
                     return self._agent_stopped_response(full_thinking, text)
@@ -2112,12 +2047,6 @@ class OmniAgent:
     def _start_normal_stream_response(self, response_started, thinking):
         if response_started:
             return True
-        # #region debug-point E:normal-response-start
-        dbg_event(
-            "debug.normal_websearch.response_start",
-            thinking_len=len(str(thinking or "")),
-        )
-        # #endregion
         print_stream_response_start(self.model)
         return True
 
@@ -2172,16 +2101,6 @@ class OmniAgent:
                 thinking_streamed,
             )
         )
-        # #region debug-point B:normal-websearch-round-limit
-        dbg_event(
-            "debug.normal_websearch.round_limit",
-            response_started=response_started,
-            thinking_len=len(str(thinking or "")),
-            response_len=len(str(response or "")),
-            thinking_printed_now=thinking_printed_now,
-            thinking_streamed=thinking_streamed,
-        )
-        # #endregion
         if response_started or thinking:
             if not thinking_printed_now:
                 pass
@@ -2289,8 +2208,7 @@ class OmniAgent:
             thinking = self._get_field(message, "thinking", "") or ""
             if thinking:
                 field_thinking += thinking
-                if self.agent_show_thinking:
-                    self._stream_agent_thinking(thinking)
+                self._stream_agent_thinking(thinking)
 
             content = self._get_field(message, "content", "") or ""
             if content:
@@ -2443,8 +2361,7 @@ class OmniAgent:
                             "type": "thinking",
                             "thinking": initial_reasoning,
                         })
-                        if self.agent_show_thinking:
-                            self._stream_agent_thinking(initial_reasoning)
+                        self._stream_agent_thinking(initial_reasoning)
                     block = {"type": "text", "text": ""}
                 elif (
                     self._is_anthropic_reasoning_block_type(block_type)
@@ -2488,8 +2405,7 @@ class OmniAgent:
                 elif self._is_anthropic_reasoning_delta_type(delta_type):
                     thinking_delta = self._anthropic_delta_reasoning_text(delta)
                     block["thinking"] = block.get("thinking", "") + thinking_delta
-                    if self.agent_show_thinking:
-                        self._stream_agent_thinking(thinking_delta)
+                    self._stream_agent_thinking(thinking_delta)
                 elif delta_type == "signature_delta":
                     block["signature"] = block.get("signature", "") + (
                         self._get_field(delta, "signature", "") or ""
@@ -2548,7 +2464,7 @@ class OmniAgent:
         return
 
     def _stream_agent_thinking(self, content):
-        if not self.thinking_mode or not self.agent_show_thinking or not content:
+        if not self.thinking_mode or not content:
             return
         leading_newline = True
         if self.agent_output_needs_separator:
@@ -2587,13 +2503,6 @@ class OmniAgent:
         self.agent_thinking_needs_separator = False
 
     def _before_agent_visible_output(self):
-        # #region debug-point C:agent-visible-output
-        dbg_event(
-            "debug.agent.visible_output",
-            agent_thinking_needs_separator=bool(self.agent_thinking_needs_separator),
-            agent_response_started=bool(self.agent_response_started),
-        )
-        # #endregion
         finish_thinking_round()
         self._separate_after_agent_thinking()
 
@@ -4178,18 +4087,24 @@ class OmniAgent:
 
     def _user_message_content(self, text, media_references=None):
         media_references = list(media_references or [])
-        if not media_references or not self._supports_minimax_media_input():
+        if not self._supports_structured_media_input():
+            return text
+        supported_media = [
+            media
+            for media in media_references
+            if self._supports_extra_modality(media.get("kind"))
+        ]
+        if not supported_media:
             return text
         if self.api_type == API_TYPE_ANTHROPIC:
-            return self._anthropic_user_media_content(text, media_references)
-        return self._openai_user_media_content(text, media_references)
+            return self._anthropic_user_media_content(text, supported_media)
+        return self._openai_user_media_content(text, supported_media)
 
-    def _supports_minimax_media_input(self):
-        model_name = str(self.model or "").lower()
-        is_m3 = model_name.startswith("minimax-m3")
-        return is_m3 and (
-            self._uses_minimax_openai_compat() or self._uses_minimax_anthropic_compat()
-        )
+    def _supports_extra_modality(self, kind):
+        return str(kind or "").strip().lower() in set(self.extra_modalities)
+
+    def _supports_structured_media_input(self):
+        return self.api_type != API_TYPE_OLLAMA
 
     def _openai_user_media_content(self, text, media_references):
         content = [{"type": "text", "text": text}]
@@ -4202,6 +4117,14 @@ class OmniAgent:
                     "image_url": {
                         "url": data_url,
                         "detail": detail,
+                    },
+                })
+            elif media.get("kind") == "audio":
+                content.append({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": media.get("data") or "",
+                        "format": self._media_reference_audio_format(media),
                     },
                 })
             elif media.get("kind") == "video":
@@ -4218,7 +4141,7 @@ class OmniAgent:
         content = [{"type": "text", "text": text}]
         for media in media_references:
             kind = media.get("kind")
-            if kind not in {"image", "video"}:
+            if kind not in {"audio", "image", "video"}:
                 continue
             block = {
                 "type": kind,
@@ -4237,6 +4160,28 @@ class OmniAgent:
         mime_type = media.get("mime_type") or "application/octet-stream"
         data = media.get("data") or ""
         return f"data:{mime_type};base64,{data}"
+
+    @staticmethod
+    def _media_reference_audio_format(media):
+        mime_type = str(media.get("mime_type") or "").strip().lower()
+        if mime_type in {"audio/mpeg", "audio/mp3"}:
+            return "mp3"
+        if mime_type in {"audio/wav", "audio/x-wav"}:
+            return "wav"
+        if mime_type == "audio/flac":
+            return "flac"
+        if mime_type == "audio/ogg":
+            return "ogg"
+        if mime_type == "audio/webm":
+            return "webm"
+        if mime_type in {"audio/mp4", "audio/x-m4a"}:
+            return "m4a"
+        if mime_type == "audio/aac":
+            return "aac"
+        path = str(media.get("path") or "").strip().lower()
+        if "." in path:
+            return path.rsplit(".", 1)[1]
+        return "mp3"
 
     def _anthropic_messages(self):
         messages = []
@@ -4394,21 +4339,19 @@ class OmniAgent:
         )
 
     def _reasoning_effort_value(self):
-        return parse_reasoning_effort(self.reasoning_effort)
+        return normalize_reasoning_effort_for_api(self.api_type, self.reasoning_effort)
 
     def _reasoning_disabled_by_effort(self):
-        return self._reasoning_effort_value() == "none"
+        return not self._reasoning_effort_value()
 
     def _chat_completion_reasoning_effort(self, model=None):
         effort = self._reasoning_effort_value()
-        if not effort or self.api_type == API_TYPE_GLM:
+        if not effort:
             return ""
         if self._uses_deepseek_openai_compat(model):
             return self._deepseek_reasoning_effort(effort)
         if self._uses_gemini_openai_compat(model):
             return self._gemini_reasoning_effort(effort)
-        if effort == "max":
-            return "xhigh"
         return effort
 
     def _anthropic_request_options(self, include_reasoning=True):
@@ -4423,9 +4366,7 @@ class OmniAgent:
             effort = self._deepseek_reasoning_effort(effort_value)
             options["thinking"] = {
                 "type": (
-                    "enabled"
-                    if self.thinking_mode and effort_value != "none"
-                    else "disabled"
+                    "enabled" if self.thinking_mode and effort_value else "disabled"
                 )
             }
         else:
@@ -4436,15 +4377,11 @@ class OmniAgent:
 
     @staticmethod
     def _anthropic_reasoning_effort(effort):
-        if not effort:
-            return ""
-        if effort in {"none", "minimal"}:
-            return "low"
-        return effort
+        return effort or ""
 
     @staticmethod
     def _deepseek_reasoning_effort(effort):
-        if not effort or effort == "none":
+        if not effort:
             return ""
         if effort in {"max", "xhigh"}:
             return "max"
@@ -4452,23 +4389,17 @@ class OmniAgent:
 
     @staticmethod
     def _gemini_reasoning_effort(effort):
-        if not effort:
-            return ""
-        if effort in {"max", "xhigh"}:
-            return "high"
-        return effort
+        return effort or ""
 
     @staticmethod
     def _ollama_reasoning_effort_value(effort):
         if not effort:
             return ""
-        if effort == "none":
-            return False
-        if effort in {"minimal", "low"}:
+        if effort == "low":
             return "low"
         if effort == "medium":
             return "medium"
-        return "high"
+        return effort
 
     def _ollama_reasoning_effort(self, model=None):
         effort = self._reasoning_effort_value()
@@ -4770,8 +4701,6 @@ class OmniAgent:
         if not include_reasoning:
             return False
         reasoning_effort = self._ollama_reasoning_effort(model)
-        if reasoning_effort is False:
-            return False
         if reasoning_effort:
             return reasoning_effort
         if not self.thinking_mode:

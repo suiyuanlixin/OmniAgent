@@ -462,6 +462,7 @@ class ChatInput(Widget):
         width: 100%;
         height: auto;
         background: $SURFACE_BACKGROUND;
+        margin-top: 1;
     }
     #prompt-options PromptOptionRow {
         width: 100%;
@@ -1092,11 +1093,27 @@ class ChatInput(Widget):
             )
 
     def set_selected_thinking(self, selected_value):
-        self.selected_thinking_value = str(selected_value or "medium")
+        available_values = [value for _, value in self.thinking_options]
+        fallback = (
+            "medium"
+            if "medium" in available_values
+            else (available_values[0] if available_values else "none")
+        )
+        selected = str(selected_value or fallback)
+        if selected not in available_values:
+            selected = fallback
+        self.selected_thinking_value = selected
         if self.is_mounted:
             self._rebuild_dropdown(
                 "thinking", self.thinking_options, self.selected_thinking_value
             )
+
+    def set_thinking_options(self, options):
+        normalized = [(str(label), str(value)) for label, value in list(options or [])]
+        if not normalized:
+            normalized = THINKING_LEVELS.copy()
+        self.thinking_options = normalized
+        self.set_selected_thinking(self.selected_thinking_value)
 
     def set_selected_approval(self, selected_value):
         self.selected_approval_value = str(selected_value or "confirm")
@@ -1350,8 +1367,35 @@ class ChatInput(Widget):
             self._update_dropdown_trigger(prefix, normalized, selected_value)
             return
 
-        container.remove_children()
+        if existing_ids:
+            await_remove = container.remove_children()
+            self._update_dropdown_trigger(prefix, normalized, selected_value)
+            self.run_worker(
+                self._remount_dropdown_after_remove(
+                    prefix,
+                    normalized,
+                    str(selected_value or ""),
+                    await_remove,
+                ),
+                name=f"{prefix}-dropdown-rebuild",
+                group=f"chat-input-{prefix}-dropdown",
+                exit_on_error=False,
+                exclusive=True,
+            )
+            return
 
+        self._mount_dropdown_buttons(
+            prefix, container, trigger, normalized, str(selected_value or "")
+        )
+
+    def _mount_dropdown_buttons(
+        self,
+        prefix: str,
+        container: Container,
+        trigger: Button,
+        normalized: list[tuple[str, str]],
+        selected_value: str,
+    ) -> None:
         max_width = (
             max(len(label) for label, _ in normalized)
             + (OPTION_HORIZONTAL_PADDING * 2)
@@ -1373,6 +1417,25 @@ class ChatInput(Widget):
                 selected_label = label
         trigger.label = selected_label
         self._fit_trigger_to_label(prefix)
+
+    async def _remount_dropdown_after_remove(
+        self,
+        prefix: str,
+        normalized: list[tuple[str, str]],
+        selected_value: str,
+        await_remove,
+    ) -> None:
+        await await_remove
+        if not self.is_mounted:
+            return
+        try:
+            trigger = self.query_one(f"#{prefix}-trigger", Button)
+            container = self.query_one(f"#{prefix}-options", Container)
+        except Exception:
+            return
+        self._mount_dropdown_buttons(
+            prefix, container, trigger, normalized, selected_value
+        )
 
     def _normalize_model_groups(self, options, groups=None) -> list[dict[str, object]]:
         normalized_groups: list[dict[str, object]] = []
@@ -1494,7 +1557,7 @@ class ChatInput(Widget):
     def input_placeholder(self) -> str:
         if self.prompt_active and self._prompt_allow_custom:
             return self._prompt_custom_placeholder
-        return "Type a message..."
+        return "Type a message"
 
     def set_prompt_state(
         self,

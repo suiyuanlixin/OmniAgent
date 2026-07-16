@@ -52,7 +52,11 @@ class ChoiceModal(ModalScreen[int]):
     """
     )
 
-    BINDINGS = [("escape", "dismiss_result(0)", "Cancel")]
+    BINDINGS = [
+        ("escape", "dismiss_result(0)", "Cancel"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Container(id="choice-wrap"):
@@ -60,7 +64,11 @@ class ChoiceModal(ModalScreen[int]):
             with Vertical(id="choice-dialog"):
                 yield Static(self.question, id="choice-title")
                 for index, option in enumerate(self.options, 1):
-                    yield Button(f"{index}. {option}", id=f"choice-{index}", classes="choice-button")
+                    yield Button(
+                        f"{index}. {option}",
+                        id=f"choice-{index}",
+                        classes="choice-button",
+                    )
             yield HalfRowSpacer(id="choice-bottom")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -72,3 +80,11 @@ class ChoiceModal(ModalScreen[int]):
 
     def action_dismiss_result(self, result: int = 0) -> None:
         self.dismiss(int(result or 0))
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()

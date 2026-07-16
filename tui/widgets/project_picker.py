@@ -12,8 +12,8 @@ from tui.theme import render_css
 from tui.widgets.chat_input import HalfRowSpacer
 
 OPTION_HORIZONTAL_PADDING = 1
-_MORE_LABELS = ["Add new project", "Don't work in a project"]
-_SEARCH_PLACEHOLDER = "Search projects..."
+_MORE_LABELS = ["New project", "Without project"]
+_SEARCH_PLACEHOLDER = "Search projects"
 
 
 class ProjectOptionButton(Button, can_focus=False):
@@ -183,7 +183,7 @@ class ProjectPicker(Widget):
 
     def compose(self) -> ComposeResult:
         with Container(id="project-drop"):
-            yield Button("Work in a project", id="project-trigger")
+            yield Button("Choose project", id="project-trigger")
             with Container(id="project-options"):
                 yield HalfRowSpacer(id="project-top-edge")
                 yield Input(placeholder=_SEARCH_PLACEHOLDER, id="project-search-input")
@@ -193,8 +193,8 @@ class ProjectPicker(Widget):
                         "\u2500" * max(1, self._measure_dropdown_width() - 2),
                         id="project-separator-line",
                     )
-                yield Static("Add new project", id="add-project-btn")
-                yield Static("Don't work in a project", id="no-project-btn")
+                yield Static("New project", id="add-project-btn")
+                yield Static("Without project", id="no-project-btn")
                 yield HalfRowSpacer(id="project-bottom-edge")
 
     def _fit_trigger(self) -> None:
@@ -247,7 +247,7 @@ class ProjectPicker(Widget):
             self._close_dropdown()
             self.current_project = ""
             trigger = self.query_one("#project-trigger", Button)
-            trigger.label = "Work in a project"
+            trigger.label = "Choose project"
             self._fit_trigger()
             self.post_message(self.NoProject())
 
@@ -294,5 +294,5 @@ class ProjectPicker(Widget):
     def set_current_project(self, project_name):
         self.current_project = str(project_name or "")
         trigger = self.query_one("#project-trigger", Button)
-        trigger.label = self.current_project or "Work in a project"
+        trigger.label = self.current_project or "Choose project"
         self._fit_trigger()

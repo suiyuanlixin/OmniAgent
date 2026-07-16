@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +30,14 @@ DEFAULT_TEMPERATURE = 0.7
 DEFAULT_STREAM_MODE = False
 DEFAULT_THINKING_MODE = False
 DEFAULT_REASONING_EFFORT = ""
+EXTRA_MODALITY_AUDIO = "audio"
+EXTRA_MODALITY_IMAGE = "image"
+EXTRA_MODALITY_VIDEO = "video"
+SUPPORTED_EXTRA_MODALITIES = (
+    EXTRA_MODALITY_AUDIO,
+    EXTRA_MODALITY_IMAGE,
+    EXTRA_MODALITY_VIDEO,
+)
 DEFAULT_AGENT_MODE = False
 DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
@@ -51,7 +60,6 @@ AUTO_MODEL_SELECTION = "auto"
 DEFAULT_COMPACTION_COMPACT_MODEL = AUTO_MODEL_SELECTION
 DEFAULT_MEMORY_MODEL = AUTO_MODEL_SELECTION
 DEFAULT_DEBUG = False
-DEFAULT_AGENT_SHOW_THINKING = True
 DEFAULT_RENDER_MARKDOWN = True
 AGENT_APPROVAL_MODES = {
     AGENT_APPROVAL_CONFIRM,
@@ -59,6 +67,13 @@ AGENT_APPROVAL_MODES = {
     AGENT_APPROVAL_FULL,
 }
 REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+REASONING_EFFORTS_BY_API = {
+    API_TYPE_OPENAI: ("low", "medium", "high", "xhigh", "max"),
+    API_TYPE_ANTHROPIC: ("low", "medium", "high", "xhigh", "max"),
+    API_TYPE_GLM: ("low", "medium", "high", "xhigh", "max"),
+    API_TYPE_GEMINI: ("minimal", "low", "medium", "high"),
+    API_TYPE_OLLAMA: ("low", "medium", "high", "max"),
+}
 SUPPORTED_API_TYPES = {
     API_TYPE_GLM,
     API_TYPE_ANTHROPIC,
@@ -76,6 +91,7 @@ MODEL_FIELD_KEYS = {
     "stream_mode",
     "thinking_mode",
     "reasoning_effort",
+    "extra_modalities",
     "context_window_tokens",
 }
 GLOBAL_FIELD_KEYS = {
@@ -83,7 +99,6 @@ GLOBAL_FIELD_KEYS = {
     "max_agent_rounds",
     "max_agent_tool_calls",
     "agent_approval_mode",
-    "agent_show_thinking",
     "agent_plan_enable",
     "agent_team_enable",
     "skills_enable",
@@ -118,6 +133,7 @@ class ModelConfig:
     stream_mode: bool = DEFAULT_STREAM_MODE
     thinking_mode: bool = DEFAULT_THINKING_MODE
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    extra_modalities: tuple[str, ...] = field(default_factory=tuple)
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
 
     def to_dict(self):
@@ -131,6 +147,7 @@ class ModelConfig:
             "stream_mode": self.stream_mode,
             "thinking_mode": self.thinking_mode,
             "reasoning_effort": self.reasoning_effort,
+            "extra_modalities": list(self.extra_modalities),
             "context_window_tokens": self.context_window_tokens,
         }
 
@@ -144,7 +161,6 @@ class AppConfig:
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
-    agent_show_thinking: bool = DEFAULT_AGENT_SHOW_THINKING
     agent_plan_enable: bool = DEFAULT_AGENT_PLAN_ENABLE
     agent_team_enable: bool = DEFAULT_AGENT_TEAM_ENABLE
     skills_enable: bool = DEFAULT_SKILLS_ENABLE
@@ -213,6 +229,10 @@ class AppConfig:
         return self.active_model.reasoning_effort
 
     @property
+    def extra_modalities(self):
+        return self.active_model.extra_modalities
+
+    @property
     def context_window_tokens(self):
         return self.active_model.context_window_tokens
 
@@ -229,7 +249,6 @@ class AppConfig:
                 "max_rounds": self.max_agent_rounds,
                 "max_tool_calls": self.max_agent_tool_calls,
                 "approve": self.agent_approval_mode,
-                "show_thinking": bool(self.agent_show_thinking),
                 "plan_mode": self.agent_plan_enable,
                 "agent_team": {
                     "enable": self.agent_team_enable,
@@ -270,7 +289,6 @@ class AppConfig:
             "max_agent_rounds": self.max_agent_rounds,
             "max_agent_tool_calls": self.max_agent_tool_calls,
             "agent_approval_mode": self.agent_approval_mode,
-            "agent_show_thinking": bool(self.agent_show_thinking),
             "agent_plan_enable": self.agent_plan_enable,
             "agent_team_enable": self.agent_team_enable,
             "skills_enable": self.skills_enable,
@@ -320,6 +338,91 @@ def normalize_optional_model_selection(value):
     if normalized.lower() in {"none", AUTO_MODEL_SELECTION}:
         return AUTO_MODEL_SELECTION
     return normalized
+
+
+def normalize_extra_modalities(value):
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ()
+        if stripped.lower() == "none":
+            return ()
+        tokens = re.split(r"[\s,，]+", stripped)
+    elif isinstance(value, (list, tuple, set)):
+        tokens = [str(item or "").strip() for item in value]
+    elif value is None:
+        tokens = []
+    else:
+        tokens = [str(value or "").strip()]
+    normalized = {
+        token.lower()
+        for token in tokens
+        if str(token or "").strip().lower() in SUPPORTED_EXTRA_MODALITIES
+    }
+    return tuple(
+        modality for modality in SUPPORTED_EXTRA_MODALITIES if modality in normalized
+    )
+
+
+def parse_extra_modalities_input(value, *, required=False):
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            if required:
+                raise ValueError(
+                    "Extra modalities is required. Use none or a comma-separated "
+                    "list of audio, image, video."
+                )
+            return ()
+        if stripped.lower() == "none":
+            return ()
+        tokens = [token.strip().lower() for token in re.split(r"[\s,，]+", stripped)]
+        invalid = [
+            token
+            for token in tokens
+            if token and token not in SUPPORTED_EXTRA_MODALITIES
+        ]
+        if invalid:
+            raise ValueError(
+                "Unsupported extra modalities: "
+                + ", ".join(invalid)
+                + ". Use none or a comma-separated list of audio, image, video."
+            )
+    return normalize_extra_modalities(value)
+
+
+def format_extra_modalities(extra_modalities):
+    normalized = normalize_extra_modalities(extra_modalities)
+    return ", ".join(normalized) if normalized else "none"
+
+
+def supported_reasoning_efforts(api_type):
+    normalized = normalize_api_type(api_type)
+    return REASONING_EFFORTS_BY_API.get(
+        normalized, REASONING_EFFORTS_BY_API[DEFAULT_API_TYPE]
+    )
+
+
+def normalize_reasoning_effort_for_api(api_type, effort):
+    parsed = parse_reasoning_effort(effort)
+    if parsed in {"", "none"}:
+        return ""
+    if parsed in supported_reasoning_efforts(api_type):
+        return parsed
+    normalized = normalize_api_type(api_type)
+    if normalized in {API_TYPE_OPENAI, API_TYPE_ANTHROPIC, API_TYPE_GLM}:
+        if parsed == "minimal":
+            return "low"
+    elif normalized == API_TYPE_GEMINI:
+        if parsed in {"xhigh", "max"}:
+            return "high"
+    elif normalized == API_TYPE_OLLAMA:
+        if parsed == "minimal":
+            return "low"
+        if parsed == "xhigh":
+            return "max"
+    supported = supported_reasoning_efforts(normalized)
+    return supported[-1] if supported else ""
 
 
 def _parse_positive_integer(value, label):
@@ -413,19 +516,6 @@ def parse_agent_approval_mode(value):
     return mode
 
 
-def parse_agent_show_thinking(value):
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return DEFAULT_AGENT_SHOW_THINKING
-    mode = str(value).strip().lower()
-    if mode in {"true", "ture", "1", "yes", "on", "full", "show"}:
-        return True
-    if mode in {"false", "0", "no", "off", "none", "hide", "hidden"}:
-        return False
-    raise ValueError("Agent thinking display must be true or false.")
-
-
 def parse_reasoning_effort(value):
     if value is None:
         return DEFAULT_REASONING_EFFORT
@@ -479,6 +569,8 @@ def _sanitize_model_config(data):
     api_type = normalize_api_type(data.get("api_type", DEFAULT_API_TYPE))
     if api_type not in SUPPORTED_API_TYPES:
         api_type = DEFAULT_API_TYPE
+    base_url = _normalize_base_url(api_type, data.get("base_url", DEFAULT_BASE_URL))
+    model_name = str(data.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     try:
         max_tokens = parse_max_tokens(data.get("max_tokens", DEFAULT_MAX_TOKENS))
     except ValueError:
@@ -500,18 +592,31 @@ def _sanitize_model_config(data):
     except ValueError:
         reasoning_effort = DEFAULT_REASONING_EFFORT
     thinking_mode = _parse_bool(data.get("thinking_mode"), DEFAULT_THINKING_MODE)
-    if not thinking_mode:
-        reasoning_effort = ""
+    if reasoning_effort:
+        reasoning_effort = normalize_reasoning_effort_for_api(
+            api_type, reasoning_effort
+        )
+    if "extra_modalities" not in data:
+        raise ValueError("Model config requires extra_modalities.")
+    raw_extra_modalities = data.get("extra_modalities")
+    if isinstance(raw_extra_modalities, str):
+        extra_modalities = parse_extra_modalities_input(
+            raw_extra_modalities,
+            required=True,
+        )
+    else:
+        extra_modalities = normalize_extra_modalities(raw_extra_modalities)
     return ModelConfig(
         api_type=api_type,
-        base_url=_normalize_base_url(api_type, data.get("base_url", DEFAULT_BASE_URL)),
-        model=str(data.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        base_url=base_url,
+        model=model_name,
         api_key=str(data.get("api_key") or "").strip(),
         max_tokens=max_tokens,
         temperature=temperature,
         stream_mode=_parse_bool(data.get("stream_mode"), DEFAULT_STREAM_MODE),
         thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
+        extra_modalities=extra_modalities,
         context_window_tokens=context_window_tokens,
     )
 
@@ -581,12 +686,6 @@ def _sanitize_config(data):
     except ValueError:
         agent_approval_mode = DEFAULT_AGENT_APPROVAL_MODE
     try:
-        agent_show_thinking = parse_agent_show_thinking(
-            agent_config.get("show_thinking", DEFAULT_AGENT_SHOW_THINKING)
-        )
-    except ValueError:
-        agent_show_thinking = DEFAULT_AGENT_SHOW_THINKING
-    try:
         skills_max_chars = parse_skill_max_chars(
             skills_config.get("max_skill_chars", DEFAULT_SKILLS_MAX_CHARS)
         )
@@ -637,7 +736,6 @@ def _sanitize_config(data):
         max_agent_rounds=max_agent_rounds,
         max_agent_tool_calls=max_agent_tool_calls,
         agent_approval_mode=agent_approval_mode,
-        agent_show_thinking=agent_show_thinking,
         agent_plan_enable=_parse_bool(
             agent_config.get("plan_mode"), DEFAULT_AGENT_PLAN_ENABLE
         ),
@@ -802,6 +900,9 @@ def save_config_fields(fields):
                 active_model.base_url = _normalize_base_url(
                     active_model.api_type, active_model.base_url
                 )
+                active_model.reasoning_effort = normalize_reasoning_effort_for_api(
+                    active_model.api_type, active_model.reasoning_effort
+                )
             elif key == "base_url":
                 active_model.base_url = _normalize_base_url(
                     active_model.api_type, value
@@ -820,13 +921,21 @@ def save_config_fields(fields):
                 active_model.thinking_mode = _parse_bool(
                     value, active_model.thinking_mode
                 )
-                if not active_model.thinking_mode:
-                    active_model.reasoning_effort = ""
             elif key == "reasoning_effort":
-                if not active_model.thinking_mode:
-                    active_model.reasoning_effort = ""
+                if value:
+                    active_model.reasoning_effort = normalize_reasoning_effort_for_api(
+                        active_model.api_type, value
+                    )
                 else:
-                    active_model.reasoning_effort = parse_reasoning_effort(value)
+                    active_model.reasoning_effort = ""
+            elif key == "extra_modalities":
+                if isinstance(value, str):
+                    active_model.extra_modalities = parse_extra_modalities_input(
+                        value,
+                        required=True,
+                    )
+                else:
+                    active_model.extra_modalities = normalize_extra_modalities(value)
             elif key == "context_window_tokens":
                 active_model.context_window_tokens = parse_context_window_tokens(value)
             continue
@@ -845,8 +954,6 @@ def save_config_fields(fields):
             config.max_agent_tool_calls = parse_agent_tool_calls(value)
         elif key == "agent_approval_mode":
             config.agent_approval_mode = parse_agent_approval_mode(value)
-        elif key == "agent_show_thinking":
-            config.agent_show_thinking = parse_agent_show_thinking(value)
         elif key == "agent_plan_enable":
             config.agent_plan_enable = _parse_bool(value, config.agent_plan_enable)
         elif key == "agent_team_enable":

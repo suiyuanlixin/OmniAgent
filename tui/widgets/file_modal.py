@@ -59,6 +59,8 @@ class FileInputModal(ModalScreen[str | None]):
 
     BINDINGS = [
         ("escape", "dismiss_result(None)", "Cancel"),
+        ("ctrl+c", "quit_attempt", "Quit"),
+        ("ctrl+q", "quit_app", "Quit"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -82,3 +84,11 @@ class FileInputModal(ModalScreen[str | None]):
 
     def action_dismiss_result(self, result: str | None = None) -> None:
         self.dismiss(result)
+
+    def action_quit_app(self) -> None:
+        if self.app is not None:
+            self.app.exit()
+
+    def action_quit_attempt(self) -> None:
+        if self.app is not None and hasattr(self.app, "action_quit_attempt"):
+            self.app.action_quit_attempt()

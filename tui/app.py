@@ -25,11 +25,15 @@ from config import (
     AUTO_MODEL_SELECTION,
     add_model_profile,
     delete_model_profile,
+    format_extra_modalities,
     load_config,
     normalize_optional_model_selection,
+    parse_extra_modalities_input,
+    normalize_reasoning_effort_for_api,
     rename_model_profile,
     save_config_field,
     save_config_fields,
+    supported_reasoning_efforts,
 )
 from memory import MemoryStore
 from main import attach_external_file_references_with_media
@@ -71,7 +75,6 @@ from team import TeamStore, display_teammate_name
 from ui import (
     clean_display_text,
     clean_display_text_preserve_newlines,
-    dbg_event,
 )
 
 
@@ -419,7 +422,8 @@ class AgentTUIApp(App):
     )
 
     BINDINGS = [
-        Binding("escape", "dismiss", "Dismiss", priority=True),
+        Binding("escape", "dismiss", "Dismiss"),
+        Binding("ctrl+q", "quit_app", "Quit", priority=True),
         ("ctrl+c", "quit_attempt", "Quit"),
     ]
 
@@ -603,14 +607,14 @@ class AgentTUIApp(App):
             and self.current_session_record is not None
             and (not self.current_session_record.get("conversation"))
         )
+        if new_session:
+            self._update_new_session_title_from_text(event.content)
         worker = threading.Thread(
             target=self._process_user_message,
             args=(event.content,),
             daemon=True,
         )
         worker.start()
-        if new_session:
-            self._refresh_project_views()
 
     def on_chat_input_model_changed(self, event: ChatInput.ModelChanged) -> None:
         save_config_field("current_model", event.value)
@@ -639,20 +643,25 @@ class AgentTUIApp(App):
             stream_mode=model.stream_mode,
             thinking_mode=model.thinking_mode,
             reasoning_effort=model.reasoning_effort,
+            extra_modalities=model.extra_modalities,
         )
         self.chat.set_context_window_tokens(model.context_window_tokens)
 
     def on_chat_input_thinking_changed(self, event: ChatInput.ThinkingChanged) -> None:
         thinking_enabled = event.value != "none"
-        effort = "" if event.value in {"", "none"} else event.value
-        save_config_fields({
-            "thinking_mode": thinking_enabled,
-            "reasoning_effort": effort,
-        })
+        updates = {"thinking_mode": thinking_enabled}
+        if thinking_enabled:
+            updates["reasoning_effort"] = normalize_reasoning_effort_for_api(
+                self.config.active_model.api_type, event.value
+            )
+        save_config_fields(updates)
         self._reload_config()
         if self.chat is not None:
             self.chat.set_thinking_mode(thinking_enabled)
-            self.chat.set_reasoning_effort(effort)
+            if thinking_enabled:
+                self.chat.set_reasoning_effort(
+                    self.config.active_model.reasoning_effort
+                )
         self._apply_config_to_controls()
 
     def on_chat_input_plan_mode_changed(self, event: ChatInput.PlanModeChanged) -> None:
@@ -755,7 +764,6 @@ class AgentTUIApp(App):
             self.add_status_message("[!]", "当前正在处理中，暂时不能操作项目。")
             return
         project_slug = str(event.project_slug or "").strip()
-        project_name = str(event.project_name or "").strip()
         action = str(event.action or "").strip().lower()
         value = str(event.value or "")
         if not project_slug or action not in {
@@ -850,7 +858,6 @@ class AgentTUIApp(App):
             self._dismiss_inline_prompt()
             return
         if self.chat_busy and self.chat is not None:
-            dbg_event("ui.interrupt.esc")
             self._suppress_stream_output = True
             self._pause_thinking_elapsed_timer()
             self._call_ui(
@@ -868,6 +875,9 @@ class AgentTUIApp(App):
 
     def action_quit_attempt(self) -> None:
         self.notify("Press Ctrl+Q to quit", title="Quit", severity="information")
+
+    def action_quit_app(self) -> None:
+        self.exit()
 
     @property
     def is_modal_open(self) -> bool:
@@ -925,11 +935,6 @@ class AgentTUIApp(App):
     def start_stream_thinking(self) -> None:
         if self._suppress_stream_output:
             return
-        dbg_event(
-            "bridge.start_stream_thinking",
-            thinking_started=bool(self._thinking_started_at is not None),
-            stream_kind=self._stream_kind,
-        )
 
     def start_thinking_timer(self) -> None:
         if self._suppress_stream_output:
@@ -937,24 +942,19 @@ class AgentTUIApp(App):
         if self._thinking_started_at is None:
             self._thinking_started_at = perf_counter()
         self._resume_thinking_elapsed_timer()
-        dbg_event("bridge.start_thinking_timer")
 
     def append_stream_thinking(self, content) -> None:
         if self._suppress_stream_output:
             return
-        first = self._thinking_started_at is None
         if self._thinking_started_at is None:
             self._thinking_started_at = perf_counter()
         self._resume_thinking_elapsed_timer()
-        if first:
-            dbg_event("bridge.thinking.first_chunk")
         self._call_ui(self._append_thought_stream_widget, str(content or ""))
 
     def finish_thinking_round(self) -> None:
         if self._suppress_stream_output:
             return
         elapsed = self._elapsed_since_thinking()
-        dbg_event("bridge.thinking.finish", elapsed=elapsed)
         self._call_ui(self._finish_thought_stream_widget, elapsed)
         self._thinking_started_at = None
         self._call_ui(self._reset_explored_widget)
@@ -965,10 +965,6 @@ class AgentTUIApp(App):
     def start_stream_response(self, model_name) -> None:
         if self._suppress_stream_output:
             return
-        dbg_event(
-            "bridge.response.start",
-            thinking_started=bool(self._thinking_started_at is not None),
-        )
         self._pause_thinking_elapsed_timer()
         self._call_ui(
             self._finish_thought_stream_widget,
@@ -1499,17 +1495,52 @@ class AgentTUIApp(App):
             self.config.current_model,
             groups=self._grouped_model_choices(),
         )
+        chat_input.set_thinking_options(
+            self._reasoning_choices_for_api(
+                self.config.active_model.api_type,
+                include_off=True,
+                title_case=True,
+            )
+        )
         chat_input.plan_mode = bool(self.config.agent_plan_enable)
         chat_input.set_selected_approval(self.config.agent_approval_mode)
         chat_input.set_selected_thinking(self._thinking_value_from_config())
+
+    @staticmethod
+    def _reasoning_label(value: str, title_case: bool = False) -> str:
+        text = str(value or "").strip().lower()
+        if text == "none":
+            return "Off" if title_case else "off"
+        if text == "xhigh":
+            return "XHigh" if title_case else "xhigh"
+        return text.capitalize() if title_case else text
+
+    def _reasoning_choices_for_api(
+        self,
+        api_type: str,
+        *,
+        include_off: bool = False,
+        title_case: bool = False,
+    ) -> list[tuple[str, str]]:
+        choices = [
+            (self._reasoning_label(value, title_case=title_case), value)
+            for value in supported_reasoning_efforts(api_type)
+        ]
+        if include_off:
+            return [
+                (self._reasoning_label("none", title_case=title_case), "none")
+            ] + choices
+        return choices
 
     def _thinking_value_from_config(self) -> str:
         active_model = self.config.active_model
         if not active_model.thinking_mode:
             return "none"
-        return (
-            str(active_model.reasoning_effort or "medium").strip().lower() or "medium"
+        effort = normalize_reasoning_effort_for_api(
+            active_model.api_type,
+            active_model.reasoning_effort or "medium",
         )
+        return effort or "medium"
 
     def _refresh_project_views(self) -> None:
         all_projects = load_projects()
@@ -1691,7 +1722,7 @@ class AgentTUIApp(App):
                 "rows": self._help_command_rows,
             },
             "team": {
-                "title": "Team",
+                "title": "Agent team",
                 "layout": "model_list",
                 "show_search": False,
                 "add_label": "Add member",
@@ -1811,18 +1842,13 @@ class AgentTUIApp(App):
     def _settings_model_rows(self) -> list[dict]:
         active_model = self.config.active_model
         bool_choices = [("true", "true"), ("false", "false")]
-        reasoning_choices = [
-            ("none", "none"),
-            ("minimal", "minimal"),
-            ("low", "low"),
-            ("medium", "medium"),
-            ("high", "high"),
-            ("xhigh", "xhigh"),
-            ("max", "max"),
-        ]
-        current_effort = str(active_model.reasoning_effort or "none")
+        reasoning_choices = self._reasoning_choices_for_api(active_model.api_type)
+        current_effort = normalize_reasoning_effort_for_api(
+            active_model.api_type,
+            active_model.reasoning_effort or "medium",
+        )
         if current_effort not in {value for _, value in reasoning_choices}:
-            current_effort = "none"
+            current_effort = "medium"
 
         rows = [
             {
@@ -1890,6 +1916,20 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_model_thinking_changed(v),
             },
             {
+                "name": "Extra modalities",
+                "value": format_extra_modalities(active_model.extra_modalities),
+                "keywords": "extra_modalities modalities audio image video",
+                "edit_type": "modalities",
+                "options": [
+                    ("audio", "audio"),
+                    ("image", "image"),
+                    ("video", "video"),
+                ],
+                "on_change": lambda v: self._on_setting_model_extra_modalities_changed(
+                    v
+                ),
+            },
+            {
                 "name": "Context",
                 "value": str(active_model.context_window_tokens),
                 "keywords": "context_window_tokens context",
@@ -1899,7 +1939,7 @@ class AgentTUIApp(App):
         ]
         if active_model.thinking_mode:
             rows.insert(
-                -1,
+                len(rows) - 2,
                 {
                     "name": "Reasoning effort",
                     "value": current_effort,
@@ -1946,27 +1986,13 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_tool_calls_changed(v),
             },
             {
-                "name": "Show thinking",
-                "value": "true" if self.config.agent_show_thinking else "false",
-                "keywords": "show_thinking",
-                "edit_type": "toggle",
-                "options": bool_choices,
-                "on_change": lambda v: self._on_setting_agent_show_thinking_changed(v),
-            },
-            {
-                "name": "Plan mode",
-                "value": "true" if self.config.agent_plan_enable else "false",
-                "keywords": "plan_mode",
-                "edit_type": "toggle",
-                "options": bool_choices,
-                "on_change": lambda v: self._on_setting_plan_changed(v),
-            },
-            {
                 "name": "Agent team",
                 "value": "true" if self.config.agent_team_enable else "false",
                 "keywords": "agent_team enable",
                 "edit_type": "toggle",
                 "options": bool_choices,
+                "accessory_label": "config" if self.config.agent_team_enable else "",
+                "accessory_target_page": "team",
                 "on_change": lambda v: self._on_setting_agent_team_changed(v),
             },
         ]
@@ -2705,21 +2731,37 @@ class AgentTUIApp(App):
     def _on_setting_model_thinking_changed(self, value: str) -> None:
         enabled = str(value or "").lower() in ("on", "true", "yes")
         save_config_field("thinking_mode", enabled)
-        if not enabled:
-            save_config_field("reasoning_effort", "")
         self._reload_config()
         if self.chat is not None:
             self.chat.set_thinking_mode(enabled)
-            if not enabled:
-                self.chat.set_reasoning_effort("")
+            if enabled:
+                self.chat.set_reasoning_effort(
+                    self.config.active_model.reasoning_effort
+                )
         self._apply_config_to_controls()
 
     def _on_setting_model_reasoning_effort_changed(self, value: str) -> None:
-        effort = str(value or "").strip().lower() or "none"
+        effort = normalize_reasoning_effort_for_api(
+            self.config.active_model.api_type,
+            value or "medium",
+        )
         save_config_field("reasoning_effort", effort)
         self._reload_config()
         if self.chat is not None:
             self.chat.set_reasoning_effort(effort)
+        self._apply_config_to_controls()
+
+    def _on_setting_model_extra_modalities_changed(self, value: str) -> None:
+        text = str(value or "")
+        try:
+            parse_extra_modalities_input(text, required=True)
+        except ValueError as error:
+            self.add_status_message("[!]", str(error))
+            return
+        save_config_field("extra_modalities", text)
+        self._reload_config()
+        if self.chat is not None:
+            self.chat.set_extra_modalities(self.config.active_model.extra_modalities)
         self._apply_config_to_controls()
 
     def _on_setting_model_context_changed(self, value: str) -> None:
@@ -2764,23 +2806,19 @@ class AgentTUIApp(App):
 
     def _on_setting_thinking_changed(self, value: str) -> None:
         thinking_enabled = value != "none"
-        effort = "" if value in {"", "none"} else value
-        save_config_fields({
-            "thinking_mode": thinking_enabled,
-            "reasoning_effort": effort,
-        })
+        updates = {"thinking_mode": thinking_enabled}
+        if thinking_enabled:
+            updates["reasoning_effort"] = normalize_reasoning_effort_for_api(
+                self.config.active_model.api_type, value
+            )
+        save_config_fields(updates)
         self._reload_config()
         if self.chat is not None:
             self.chat.set_thinking_mode(thinking_enabled)
-            self.chat.set_reasoning_effort(effort)
-        self._apply_config_to_controls()
-
-    def _on_setting_plan_changed(self, value: str) -> None:
-        enabled = value.lower() in ("on", "true", "yes")
-        save_config_field("agent_plan_enable", enabled)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_plan_mode(enabled)
+            if thinking_enabled:
+                self.chat.set_reasoning_effort(
+                    self.config.active_model.reasoning_effort
+                )
         self._apply_config_to_controls()
 
     def _on_setting_agent_team_changed(self, value: str) -> None:
@@ -2796,14 +2834,6 @@ class AgentTUIApp(App):
         self._reload_config()
         if self.chat is not None:
             self.chat.set_agent_approval_mode(value)
-        self._apply_config_to_controls()
-
-    def _on_setting_agent_show_thinking_changed(self, value: str) -> None:
-        enabled = str(value or "").lower() in ("on", "true", "yes")
-        save_config_field("agent_show_thinking", enabled)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_agent_show_thinking(enabled)
         self._apply_config_to_controls()
 
     def _on_setting_rounds_changed(self, value: str) -> None:
@@ -3052,12 +3082,12 @@ class AgentTUIApp(App):
             stream_mode=model.stream_mode,
             thinking_mode=model.thinking_mode,
             reasoning_effort=model.reasoning_effort,
+            extra_modalities=model.extra_modalities,
             agent_mode=agent_mode,
             workspace_dir=workspace_dir,
             max_agent_rounds=self.config.max_agent_rounds,
             max_agent_tool_calls=self.config.max_agent_tool_calls,
             agent_approval_mode=self.config.agent_approval_mode,
-            agent_show_thinking=bool(self.config.agent_show_thinking),
             skills_enabled=self.config.skills_enable,
             skills_source_app=self.config.skills_source_app,
             skills_source_workspace=self.config.skills_source_workspace,
@@ -3283,13 +3313,28 @@ class AgentTUIApp(App):
         if refresh_sidebar:
             self._refresh_project_views()
 
+    @staticmethod
+    def _session_title_from_text(text: str) -> str:
+        title = " ".join(clean_display_text(text or "").split())
+        return title[:60] if title else "New Chat"
+
+    def _update_new_session_title_from_text(self, text: str) -> None:
+        if self.current_session_record is None:
+            return
+        record = dict(self.current_session_record)
+        if str(record.get("title") or "").strip() not in {"", "New Chat"}:
+            return
+        record["title"] = self._session_title_from_text(text)
+        self.current_session_record = save_session_record(record)
+        self._refresh_project_views()
+
     def _session_title_from_history(self, history: list[dict]) -> str:
         for message in history or []:
             if str(message.get("role") or "") != "user":
                 continue
-            title = " ".join(clean_display_text(message.get("content", "")).split())
-            if title:
-                return title[:60]
+            title = self._session_title_from_text(message.get("content", ""))
+            if title != "New Chat":
+                return title
         return "New Chat"
 
     def _sync_chat_view_with_history(self) -> None:

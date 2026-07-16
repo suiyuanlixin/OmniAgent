@@ -13,6 +13,18 @@ IMAGE_MEDIA_TYPES = {
     "image/gif",
     "image/webp",
 }
+AUDIO_MEDIA_TYPES = {
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/flac",
+    "audio/ogg",
+    "audio/webm",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/aac",
+}
 VIDEO_MEDIA_TYPES = {
     "video/mp4",
     "video/x-msvideo",
@@ -20,6 +32,7 @@ VIDEO_MEDIA_TYPES = {
     "video/x-matroska",
 }
 IMAGE_FILE_MAX_BYTES = 10 * 1024 * 1024
+AUDIO_FILE_MAX_BYTES = 50 * 1024 * 1024
 VIDEO_FILE_MAX_BYTES = 50 * 1024 * 1024
 MULTIMODAL_REQUEST_MAX_BYTES = 64 * 1024 * 1024
 
@@ -75,12 +88,27 @@ def _guess_media_type_from_header(path):
         return "image", "image/gif"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "image", "image/webp"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return "audio", "audio/wav"
+    if header.startswith(b"ID3") or (
+        len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0
+    ):
+        return "audio", "audio/mpeg"
+    if header.startswith(b"fLaC"):
+        return "audio", "audio/flac"
+    if header.startswith(b"OggS"):
+        return "audio", "audio/ogg"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"AVI ":
         return "video", "video/x-msvideo"
     if header.startswith(b"\x1a\x45\xdf\xa3"):
+        suffix = path.suffix.lower()
+        if suffix == ".webm":
+            return "audio", "audio/webm"
         return "video", "video/x-matroska"
     if len(header) >= 12 and header[4:8] == b"ftyp":
         suffix = path.suffix.lower()
+        if suffix in {".m4a", ".aac"}:
+            return "audio", "audio/mp4" if suffix == ".m4a" else "audio/aac"
         if suffix == ".mov":
             return "video", "video/quicktime"
         return "video", "video/mp4"
@@ -95,6 +123,8 @@ def _detect_reference_media_type(path):
     mime_type, _ = mimetypes.guess_type(str(path))
     if mime_type in IMAGE_MEDIA_TYPES:
         return "image", mime_type
+    if mime_type in AUDIO_MEDIA_TYPES:
+        return "audio", mime_type
     if mime_type in VIDEO_MEDIA_TYPES:
         return "video", mime_type
     return "text", ""
@@ -119,15 +149,20 @@ def _read_external_file_reference(path_text):
 def _read_external_media_reference(path_text, encoded_bytes_before=0):
     path = _resolve_external_file_reference(path_text)
     kind, mime_type = _detect_reference_media_type(path)
-    if kind not in {"image", "video"}:
+    if kind not in {"audio", "image", "video"}:
         return None
 
     size = path.stat().st_size
-    max_bytes = IMAGE_FILE_MAX_BYTES if kind == "image" else VIDEO_FILE_MAX_BYTES
+    if kind == "image":
+        max_bytes = IMAGE_FILE_MAX_BYTES
+    elif kind == "audio":
+        max_bytes = AUDIO_FILE_MAX_BYTES
+    else:
+        max_bytes = VIDEO_FILE_MAX_BYTES
     if size > max_bytes:
         limit_mb = max_bytes // (1024 * 1024)
         raise ValueError(
-            f"Referenced {kind} file is too large for MiniMax-M3 base64 input "
+            f"Referenced {kind} file is too large for multimodal base64 input "
             f"({size} bytes > {limit_mb} MB): {path}"
         )
 
@@ -141,7 +176,7 @@ def _read_external_media_reference(path_text, encoded_bytes_before=0):
     if total_encoded > MULTIMODAL_REQUEST_MAX_BYTES:
         limit_mb = MULTIMODAL_REQUEST_MAX_BYTES // (1024 * 1024)
         raise ValueError(
-            f"Referenced media files exceed MiniMax-M3 request body budget "
+            f"Referenced media files exceed multimodal request body budget "
             f"({total_encoded} encoded bytes > {limit_mb} MB)."
         )
 
@@ -183,7 +218,8 @@ def attach_external_file_references_with_media(user_input):
                 f"{media_reference['path']} "
                 f"({media_reference['mime_type']}, "
                 f"{media_reference['bytes']} bytes) ---\n"
-                "Attached as multimodal input for MiniMax-M3-capable APIs.\n"
+                "Attached as multimodal input when the current model supports "
+                "this modality.\n"
                 f"--- End {media_reference['kind']}: "
                 f"{media_reference['path']} ---"
             )
