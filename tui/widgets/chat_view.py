@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import lru_cache
 import re
 from datetime import datetime
 
+from pygments.lexers import get_lexer_for_filename
+from pygments.util import ClassNotFound
 from rich import box
 from rich.cells import cell_len
 from rich.console import Console
 import rich.markdown as rich_markdown
 from rich.markdown import Markdown as RichMarkdown
+from rich.syntax import Syntax
 from rich.segment import Segment
 from rich.style import Style
 from rich.table import Table
@@ -2037,7 +2041,7 @@ class ChangedFileRow(Vertical):
             )
             yield self._path_widget
             yield self._stats_widget
-        self._content_widget = DiffContent(self.diff)
+        self._content_widget = DiffContent(self.diff, self.file_path)
         yield self._content_widget
 
     def on_mount(self) -> None:
@@ -2061,8 +2065,9 @@ class ChangedFileRow(Vertical):
 class DiffContent(Static):
     """Renders diff content with full-width colored backgrounds and line numbers."""
 
-    def __init__(self, diff_text: str, **kwargs):
+    def __init__(self, diff_text: str, file_path: str = "", **kwargs):
         self._diff_lines = _parse_diff_lines(diff_text)
+        self._lexer_name = _get_diff_lexer_name(file_path)
         max_num = max((ln for _, ln, _ in self._diff_lines), default=0)
         self._num_width = max(1, len(str(max_num)))
         super().__init__("", markup=False, **kwargs)
@@ -2077,7 +2082,14 @@ class DiffContent(Static):
         if y < 0 or y >= len(self._diff_lines):
             return Strip.blank(width)
         line_type, line_num, content = self._diff_lines[y]
-        return _build_diff_strip(line_type, line_num, content, width, self._num_width)
+        return _build_diff_strip(
+            line_type,
+            line_num,
+            content,
+            width,
+            self._num_width,
+            self._lexer_name,
+        )
 
 
 _DIFF_HUNK_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -2114,8 +2126,55 @@ def _parse_diff_lines(diff_text: str) -> list[tuple[str, int, str]]:
     return result
 
 
+@lru_cache(maxsize=128)
+def _get_diff_lexer_name(file_path: str) -> str | None:
+    try:
+        lexer = get_lexer_for_filename(str(file_path or ""))
+    except (ClassNotFound, ValueError):
+        return None
+    aliases = list(getattr(lexer, "aliases", []) or [])
+    if aliases:
+        return aliases[0]
+    return getattr(lexer, "name", None)
+
+
+@lru_cache(maxsize=4096)
+def _highlight_diff_content(
+    content: str, lexer_name: str, content_width: int
+) -> tuple[Segment, ...]:
+    if content_width <= 0:
+        return ()
+    console = Console(
+        force_terminal=False,
+        color_system=None,
+        width=content_width,
+        highlight=False,
+    )
+    syntax = Syntax(
+        content,
+        lexer_name,
+        line_numbers=False,
+        word_wrap=False,
+        code_width=content_width,
+        background_color="default",
+    )
+    lines = console.render_lines(
+        syntax,
+        console.options.update(width=content_width),
+        pad=False,
+    )
+    if not lines:
+        return ()
+    return tuple(lines[0])
+
+
 def _build_diff_strip(
-    line_type: str, line_num: int, content: str, width: int, num_width: int = 3
+    line_type: str,
+    line_num: int,
+    content: str,
+    width: int,
+    num_width: int = 3,
+    lexer_name: str | None = None,
 ) -> Strip:
     """Build a single Strip for a diff line with full-width colored background."""
     if width <= 0:
@@ -2149,12 +2208,43 @@ def _build_diff_strip(
         segments.append(Segment(" " * gap, Style(bgcolor=INFO_BAR_BACKGROUND)))
 
     if content_width > 0:
-        display = content[:content_width]
-        pad_count = content_width - cell_len(display)
-        if pad_count > 0:
-            display = display + " " * pad_count
         content_style = Style(color=fg, bgcolor=bg)
-        segments.append(Segment(display, content_style))
+        display_width = 0
+        if lexer_name:
+            try:
+                highlighted = _highlight_diff_content(
+                    content, lexer_name, content_width
+                )
+            except Exception:
+                highlighted = ()
+            for segment in highlighted:
+                if display_width >= content_width:
+                    break
+                segment_text = segment.text
+                if not segment_text:
+                    continue
+                if display_width + cell_len(segment_text) > content_width:
+                    break
+                display_width += cell_len(segment_text)
+                merged_style = content_style
+                if segment.style is not None:
+                    merged_style += segment.style + Style(bgcolor=bg)
+                segments.append(Segment(segment_text, merged_style))
+        if display_width < content_width:
+            plain_content = content
+            if display_width > 0:
+                consumed = 0
+                char_index = 0
+                while char_index < len(plain_content) and consumed < display_width:
+                    consumed += cell_len(plain_content[char_index])
+                    char_index += 1
+                plain_content = plain_content[char_index:]
+            remaining_width = content_width - display_width
+            display = plain_content[:remaining_width]
+            pad_count = remaining_width - cell_len(display)
+            if pad_count > 0:
+                display = display + " " * pad_count
+            segments.append(Segment(display, content_style))
 
     return Strip(segments)
 
