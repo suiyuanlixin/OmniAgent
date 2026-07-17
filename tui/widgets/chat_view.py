@@ -1638,8 +1638,12 @@ class ThoughtBlock(Vertical):
 
 
 class ExploredBlock(Vertical):
-    READ_TOOLS = frozenset({"read_file", "read_program_docs"})
-    SEARCH_TOOLS = frozenset({"grep", "glob", "list_dir"})
+    READ_TOOLS = frozenset({
+        "read_file",
+        "read_program_docs",
+        "read_skill",
+    })
+    SEARCH_TOOLS = frozenset({"grep", "glob", "list_dir", "list_skills"})
 
     def __init__(self):
         super().__init__()

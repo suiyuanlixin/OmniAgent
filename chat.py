@@ -71,6 +71,8 @@ USER_PROMPT_MAX_CHARS = 20000
 _EXPLORED_TOOLS = frozenset({
     "read_file",
     "read_program_docs",
+    "list_skills",
+    "read_skill",
     "grep",
     "glob",
     "list_dir",
@@ -5066,6 +5068,18 @@ def _format_explored_entry(name, tool_input):
         return " ".join(parts)
     if name == "read_program_docs":
         return "[white]Read program docs[/white]"
+    if name == "list_skills":
+        return "[white]List skills[/white]"
+    if name == "read_skill":
+        parts = ["[white]Read skill[/white]"]
+        skill_name = _escape_rich_markup(tool_input.get("name") or "")
+        if skill_name:
+            parts.append(f"[gray]{skill_name}[/gray]")
+        files = tool_input.get("files")
+        if isinstance(files, list) and files:
+            file_list = ", ".join(_escape_rich_markup(str(item)) for item in files)
+            parts.append(f"[gray]files={file_list}[/gray]")
+        return " ".join(parts)
     if name == "grep":
         parts = ["[white]Grep[/white]"]
         pattern = str(tool_input.get("pattern") or "")
