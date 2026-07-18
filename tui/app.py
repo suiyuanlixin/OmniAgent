@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import threading
 from time import perf_counter
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from config import (
     save_config_fields,
     supported_reasoning_efforts,
 )
+from installer import install_registry_skill
 from memory import MemoryStore
 from main import attach_external_file_references_with_media
 from search import TAVILY_SEARCH_DEPTHS, TAVILY_TOPICS, WEB_SEARCH_PROVIDERS
@@ -59,6 +61,7 @@ from session import (
     unpin_project,
     unpin_session,
 )
+from skills import APP_SKILLS_DIR, SkillRegistry
 from tui.data import PROJECT_LOGO
 from tui.runtime import clear_bridge, render_console_text, set_bridge
 from tui.theme import render_css
@@ -1700,6 +1703,20 @@ class AgentTUIApp(App):
                 "layout": "list",
                 "rows": self._settings_skills_rows,
             },
+            "installed_skills": {
+                "title": "Installed skills",
+                "layout": "model_list",
+                "show_search": False,
+                "add_label": "Install skill",
+                "add_page": "add_skill",
+                "state": self._settings_installed_skills_state,
+            },
+            "add_skill": {
+                "title": "Install skill",
+                "layout": "list",
+                "show_search": False,
+                "rows": self._settings_add_skill_rows,
+            },
             "auto_compact": {
                 "title": "Auto compact",
                 "layout": "list",
@@ -1824,6 +1841,16 @@ class AgentTUIApp(App):
         )
         if selected_name and selected_name in models:
             current_model = selected_name
+        if not models:
+            return {
+                "models": [],
+                "groups": [],
+                "selected_model": "",
+                "rows": [],
+                "footer_actions": [],
+                "empty_list_label": "",
+                "blank_detail_when_empty": True,
+            }
 
         return {
             "models": models,
@@ -1837,6 +1864,8 @@ class AgentTUIApp(App):
                     "on_activate": self._on_setting_delete_current_model,
                 }
             ],
+            "empty_list_label": "",
+            "blank_detail_when_empty": True,
         }
 
     def _settings_model_rows(self) -> list[dict]:
@@ -2009,6 +2038,13 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_skills_changed(v),
             },
             {
+                "name": "Installed skills",
+                "value": ">",
+                "keywords": "installed skills browser",
+                "edit_type": "nav",
+                "target_page": "installed_skills",
+            },
+            {
                 "name": "Sources",
                 "value": "",
                 "keywords": "sources app workspace",
@@ -2051,6 +2087,474 @@ class AgentTUIApp(App):
             },
         ]
         return rows
+
+    def _skills_registry_for_page(self) -> SkillRegistry:
+        project = self._project_from_session(self.current_session_record)
+        workspace_dir = project.path if project is not None else None
+        return SkillRegistry(
+            enabled=True,
+            app_enabled=True,
+            workspace_enabled=bool(workspace_dir),
+            workspace_dir=workspace_dir,
+            auto_catalog=self.config.skills_auto_catalog,
+            max_chars=self.config.skills_max_chars,
+        )
+
+    def _skill_records_for_page(self) -> list[dict]:
+        source_order = {"app": 0, "workspace": 1}
+        records = self._skills_registry_for_page().list_skill_records()
+        records.sort(
+            key=lambda record: (
+                source_order.get(str(record.get("source") or ""), 99),
+                str(record.get("name") or "").lower(),
+            )
+        )
+        return records
+
+    def _skill_record_for_page(self, skill_name: str = "") -> dict | None:
+        records = self._skill_records_for_page()
+        if not records:
+            return None
+        target = str(skill_name or "").strip().lower()
+        for record in records:
+            if (
+                str(record.get("key") or "").strip().lower() == target
+                or str(record.get("name") or "").strip().lower() == target
+            ):
+                return record
+        return records[0]
+
+    def _installed_skill_key_for_path(self, skill_path: Path) -> str:
+        target = skill_path.resolve()
+        for record in self._skill_records_for_page():
+            try:
+                record_path = Path(str(record.get("path") or "")).resolve()
+            except OSError:
+                continue
+            if record_path == target:
+                return str(record.get("key") or "")
+        return ""
+
+    def _settings_installed_skills_state(self, selected_name: str = "") -> dict:
+        records = self._skill_records_for_page()
+        selected = self._skill_record_for_page(selected_name)
+        selected_key = str((selected or {}).get("key") or "")
+        if not records:
+            return {
+                "models": [],
+                "groups": [],
+                "selected_model": "",
+                "show_group_titles": False,
+                "allow_group_collapse": False,
+                "item_labels": {},
+                "rows": [],
+                "footer_actions": [],
+                "empty_list_label": "",
+                "blank_detail_when_empty": True,
+            }
+        groups = []
+        for source in ("app", "workspace"):
+            names = [
+                str(record.get("key") or "")
+                for record in records
+                if str(record.get("source") or "") == source
+            ]
+            if not names:
+                continue
+            groups.append({
+                "api_type": source,
+                "title": "App" if source == "app" else "Workspace",
+                "models": names,
+            })
+        return {
+            "models": [str(record.get("key") or "") for record in records],
+            "groups": groups,
+            "selected_model": selected_key,
+            "show_group_titles": True,
+            "allow_group_collapse": False,
+            "item_labels": {
+                str(record.get("key") or ""): str(record.get("name") or "")
+                for record in records
+            },
+            "rows": self._settings_installed_skill_rows(selected_key),
+            "footer_actions": [
+                {
+                    "label": "Delete",
+                    "disabled": not bool(selected_key),
+                    "on_activate": (
+                        lambda current=selected_key: self._on_setting_skill_deleted(
+                            current
+                        )
+                    ),
+                }
+            ],
+            "empty_list_label": "No skills",
+            "blank_detail_when_empty": True,
+        }
+
+    def _settings_installed_skill_rows(self, skill_name: str) -> list[dict]:
+        record = self._skill_record_for_page(skill_name)
+        if record is None:
+            return []
+
+        source = str(record.get("source") or "")
+        source_label = "App" if source == "app" else "Workspace"
+        source_enabled = (
+            self.config.skills_source_app
+            if source == "app"
+            else self.config.skills_source_workspace
+        )
+        provider = str(record.get("provider") or "")
+        provider_label = {
+            "clawhub": "ClawHub",
+            "skillhub": "SkillHub",
+        }.get(provider, "Local")
+        triggers_text = "\n".join(
+            str(item)
+            for item in list(record.get("triggers") or [])
+            if str(item).strip()
+        )
+        if not triggers_text:
+            triggers_text = "(empty)"
+        files_text = "\n".join(
+            str(item) for item in list(record.get("files") or []) if str(item).strip()
+        )
+        if not files_text:
+            files_text = "(empty)"
+        skill_md_text = str(record.get("skill_md") or "").strip() or "(empty)"
+        description_text = str(record.get("description") or "").strip() or "(empty)"
+        version_text = str(record.get("version") or "").strip() or "Local"
+        slug_text = str(record.get("slug") or "").strip() or "(local)"
+        target_text = str(record.get("target") or "").strip()
+        target_label = {
+            "app": "App",
+            "workspace": "Workspace",
+        }.get(target_text, source_label)
+        registry_text = str(record.get("registry") or "").strip() or "(local)"
+        installed_at = str(record.get("installed_at") or "").strip() or "(unknown)"
+        return [
+            {
+                "name": "Name",
+                "value": str(record.get("name") or ""),
+                "keywords": "name",
+                "edit_type": "none",
+            },
+            {
+                "name": "Source",
+                "value": source_label,
+                "keywords": "source",
+                "edit_type": "none",
+            },
+            {
+                "name": "Loaded",
+                "value": (
+                    "true" if self.config.skills_enable and source_enabled else "false"
+                ),
+                "keywords": "loaded enabled",
+                "edit_type": "none",
+            },
+            {
+                "name": "Installed via",
+                "value": provider_label,
+                "keywords": "provider clawhub skillhub",
+                "edit_type": "none",
+            },
+            {
+                "name": "Slug",
+                "value": slug_text,
+                "keywords": "slug",
+                "edit_type": "none",
+            },
+            {
+                "name": "Version",
+                "value": version_text,
+                "keywords": "version",
+                "edit_type": "none",
+            },
+            {
+                "name": "Target",
+                "value": target_label,
+                "keywords": "target app workspace",
+                "edit_type": "none",
+            },
+            {
+                "name": "Installed at",
+                "value": installed_at,
+                "keywords": "installed at time",
+                "edit_type": "none",
+            },
+            {
+                "name": "Registry",
+                "value": "",
+                "keywords": "registry",
+                "edit_type": "none",
+                "long_value": registry_text,
+            },
+            {
+                "name": "Path",
+                "value": "",
+                "keywords": "path",
+                "edit_type": "none",
+                "long_value": str(record.get("path") or ""),
+            },
+            {
+                "name": "Description",
+                "value": "",
+                "keywords": "description",
+                "edit_type": "none",
+                "long_value": description_text,
+            },
+            {
+                "name": "Triggers",
+                "value": "",
+                "keywords": "triggers",
+                "edit_type": "none",
+                "long_value": triggers_text,
+            },
+            {
+                "name": "Files",
+                "value": "",
+                "keywords": "files",
+                "edit_type": "none",
+                "long_value": files_text,
+            },
+            {
+                "name": "SKILL.md",
+                "value": "",
+                "keywords": "skill instructions markdown",
+                "edit_type": "none",
+                "long_value": skill_md_text,
+            },
+        ]
+
+    def _ensure_skill_install_draft(self) -> dict[str, str]:
+        project = self._project_from_session(self.current_session_record)
+        default_target = "workspace" if project is not None else "app"
+        draft = getattr(self, "_skill_install_draft", None)
+        if not isinstance(draft, dict):
+            draft = {
+                "provider": "clawhub",
+                "name": "",
+                "slug": "",
+                "target": default_target,
+                "version": "",
+                "registry": "",
+                "force": "false",
+            }
+        if str(draft.get("target") or "") not in {"app", "workspace"}:
+            draft["target"] = default_target
+        self._skill_install_draft = draft
+        return draft
+
+    def _set_add_skill_field(self, key: str, value: str) -> None:
+        draft = self._ensure_skill_install_draft()
+        text = str(value or "")
+        if key == "version":
+            stripped = text.strip()
+            if not stripped:
+                text = ""
+            elif stripped.lower() == "latest":
+                text = "Latest"
+            else:
+                text = stripped
+        elif key in {"provider", "target", "force"}:
+            text = text.strip()
+        draft[key] = text
+
+    def _settings_add_skill_rows(self) -> list[dict]:
+        draft = dict(self._ensure_skill_install_draft())
+        registry = self._skills_registry_for_page()
+        provider = str(draft.get("provider") or "clawhub").strip().lower()
+        target_choices = [("App", "app")]
+        if registry.workspace_skills_dir is not None:
+            target_choices.append(("Workspace", "workspace"))
+        rows = [
+            {
+                "name": "Provider",
+                "value": str(draft.get("provider") or "clawhub"),
+                "keywords": "provider clawhub skillhub",
+                "edit_type": "select",
+                "options": [("ClawHub", "clawhub"), ("SkillHub", "skillhub")],
+                "on_change": lambda v: self._set_add_skill_field("provider", v),
+            },
+            {
+                "name": "Name",
+                "value": str(draft.get("name") or ""),
+                "keywords": "name local directory",
+                "edit_type": "input",
+                "on_change": lambda v: self._set_add_skill_field("name", v),
+            },
+            {
+                "name": "Slug",
+                "value": str(draft.get("slug") or ""),
+                "keywords": "slug name owner",
+                "edit_type": "input",
+                "placeholder_value": (
+                    "@owner/skill-name" if provider == "clawhub" else "owner/skill-name"
+                ),
+                "on_change": lambda v: self._set_add_skill_field("slug", v),
+            },
+            {
+                "name": "Target",
+                "value": str(draft.get("target") or "app"),
+                "keywords": "target app workspace",
+                "edit_type": "select",
+                "options": target_choices,
+                "on_change": lambda v: self._set_add_skill_field("target", v),
+            },
+            {
+                "name": "Version",
+                "value": str(draft.get("version") or ""),
+                "keywords": "version latest",
+                "edit_type": "input",
+                "placeholder_value": "Latest",
+                "on_change": lambda v: self._set_add_skill_field("version", v),
+            },
+            {
+                "name": "Registry",
+                "value": str(draft.get("registry") or ""),
+                "keywords": "registry url",
+                "edit_type": "input",
+                "placeholder_value": "Default",
+                "on_change": lambda v: self._set_add_skill_field("registry", v),
+            },
+            {
+                "name": "Force",
+                "value": str(draft.get("force") or "false"),
+                "keywords": "force overwrite",
+                "edit_type": "toggle",
+                "options": [("true", "true"), ("false", "false")],
+                "on_change": lambda v: self._set_add_skill_field("force", v),
+            },
+        ]
+        rows.append({"name": "", "value": "", "edit_type": "none"})
+        rows.append({
+            "name": "",
+            "value": "Install",
+            "keywords": "install add skill",
+            "edit_type": "action",
+            "show_value": True,
+            "on_activate": self._install_skill_from_draft,
+        })
+        return rows
+
+    def _refresh_chat_skills_registry(self) -> None:
+        if self.chat is None:
+            return
+        self.chat.set_skills_config(
+            enabled=self.config.skills_enable,
+            app_enabled=self.config.skills_source_app,
+            workspace_enabled=self.config.skills_source_workspace,
+            auto_catalog=self.config.skills_auto_catalog,
+            max_chars=self.config.skills_max_chars,
+        )
+
+    def _install_skill_from_draft(self) -> str:
+        draft = dict(self._ensure_skill_install_draft())
+        provider = str(draft.get("provider") or "clawhub").strip().lower()
+        display_name = str(draft.get("name") or "").strip() or None
+        local_name = display_name or None
+        slug = str(draft.get("slug") or "").strip()
+        if not slug:
+            self.add_status_message("[!]", "Skill slug 不能为空。")
+            return ""
+        target = str(draft.get("target") or "app").strip().lower()
+        registry = str(draft.get("registry") or "").strip() or None
+        version_text = str(draft.get("version") or "").strip()
+        version = (
+            None
+            if not version_text or version_text.lower() == "latest"
+            else version_text
+        )
+        force = str(draft.get("force") or "").lower() in ("true", "on", "yes")
+        page_registry = self._skills_registry_for_page()
+        if target == "workspace":
+            skills_dir = page_registry.workspace_skills_dir
+            if skills_dir is None:
+                self.add_status_message("[!]", "请先选择项目后再安装到 Workspace。")
+                return ""
+        else:
+            skills_dir = APP_SKILLS_DIR.resolve()
+            target = "app"
+        try:
+            result = install_registry_skill(
+                provider,
+                slug,
+                skills_dir,
+                target=target,
+                version=version,
+                registry=registry,
+                force=force,
+                dry_run=False,
+                local_name=local_name,
+                display_name=display_name,
+            )
+        except Exception as error:
+            self.add_status_message("[✗]", f"安装 Skill 失败: {error}")
+            return ""
+        self._skill_install_draft = {
+            **draft,
+            "name": "",
+            "slug": "",
+            "version": "",
+            "registry": "",
+            "force": "false",
+        }
+        self._refresh_chat_skills_registry()
+        selected_key = self._installed_skill_key_for_path(result.install_dir)
+        if selected_key:
+            self._set_settings_selected_item(selected_key)
+        self.add_status_message(
+            "[✓]", f"已安装 Skill: {display_name or result.install_dir.name}"
+        )
+        return "installed_skills"
+
+    def _on_setting_skill_deleted(self, skill_name: str) -> None:
+        record = self._skill_record_for_page(skill_name)
+        if record is None:
+            self.add_status_message("[!]", "未找到可删除的 Skill。")
+            return
+        registry = self._skills_registry_for_page()
+        try:
+            skill_path = Path(str(record.get("path") or "")).resolve()
+        except OSError:
+            self.add_status_message("[✗]", "Skill 路径无效，无法删除。")
+            return
+        allowed_roots = [registry.app_skills_dir.resolve()]
+        if registry.workspace_skills_dir is not None:
+            allowed_roots.append(registry.workspace_skills_dir.resolve())
+        if not any(
+            self._path_within_root(skill_path, root) and skill_path.parent == root
+            for root in allowed_roots
+        ):
+            self.add_status_message("[✗]", "Skill 不在允许删除的目录中。")
+            return
+        if not skill_path.exists():
+            self.add_status_message("[!]", f"Skill 已不存在: {skill_path.name}")
+            return
+        try:
+            shutil.rmtree(skill_path)
+        except OSError as error:
+            self.add_status_message("[✗]", f"删除 Skill 失败: {error}")
+            return
+        self._refresh_chat_skills_registry()
+        remaining = self._skill_records_for_page()
+        next_key = ""
+        deleted_key = str(record.get("key") or "")
+        for item in remaining:
+            candidate_key = str(item.get("key") or "")
+            if candidate_key != deleted_key:
+                next_key = candidate_key
+                break
+        self._set_settings_selected_item(next_key)
+        self.add_status_message("[✓]", f"已删除 Skill: {record.get('name')}")
+
+    def _path_within_root(self, path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
 
     def _settings_auto_compact_rows(self) -> list[dict]:
         bool_choices = [("true", "true"), ("false", "false")]

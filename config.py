@@ -154,10 +154,8 @@ class ModelConfig:
 
 @dataclass
 class AppConfig:
-    current_model: str = DEFAULT_MODEL_ALIAS
-    model_list: dict[str, ModelConfig] = field(
-        default_factory=lambda: {DEFAULT_MODEL_ALIAS: ModelConfig()}
-    )
+    current_model: str = ""
+    model_list: dict[str, ModelConfig] = field(default_factory=dict)
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
@@ -186,11 +184,14 @@ class AppConfig:
     def active_model_name(self):
         if self.current_model in self.model_list:
             return self.current_model
-        return next(iter(self.model_list.keys()), DEFAULT_MODEL_ALIAS)
+        return next(iter(self.model_list.keys()), "")
 
     @property
     def active_model(self):
-        return self.model_list[self.active_model_name]
+        active_name = self.active_model_name
+        if active_name and active_name in self.model_list:
+            return self.model_list[active_name]
+        return _model_defaults()
 
     @property
     def api_type(self):
@@ -635,12 +636,9 @@ def _sanitize_config(data):
             if not model_name:
                 continue
             model_list[model_name] = _sanitize_model_config(model_data)
-    if not model_list:
-        model_list = {DEFAULT_MODEL_ALIAS: _model_defaults()}
-
     current_model = str(data.get("current_model") or "").strip()
     if current_model not in model_list:
-        current_model = next(iter(model_list.keys()))
+        current_model = next(iter(model_list.keys()), "")
 
     agent_config = data.get("agent_mode", {})
     if not isinstance(agent_config, dict):
@@ -859,12 +857,9 @@ def delete_model_profile(name):
         raise ValueError("Model profile name cannot be empty.")
     if model_name not in config.model_list:
         raise ValueError(f"Model profile not found: {model_name}")
-    if len(config.model_list) <= 1:
-        raise ValueError("Cannot delete the last model profile.")
-
     del config.model_list[model_name]
     if config.current_model == model_name:
-        config.current_model = next(iter(config.model_list.keys()), DEFAULT_MODEL_ALIAS)
+        config.current_model = next(iter(config.model_list.keys()), "")
     _persist_config(_sanitize_config(config.to_dict()))
 
 
@@ -892,9 +887,11 @@ def rename_model_profile(old_name, new_name):
 def save_config_fields(fields):
     config = _load_existing_config()
     active_name = config.active_model_name
-    active_model = config.model_list[active_name]
+    active_model = config.model_list.get(active_name)
     for key, value in dict(fields or {}).items():
         if key in MODEL_FIELD_KEYS:
+            if active_model is None:
+                raise ValueError("No model profile selected.")
             if key == "api_type":
                 active_model.api_type = normalize_api_type(value)
                 active_model.base_url = _normalize_base_url(

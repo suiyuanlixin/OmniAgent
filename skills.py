@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,16 @@ class SkillRegistry:
 
     def list_skills(self):
         return list(self._load_skills().values())
+
+    def list_skill_records(self):
+        return [self._build_skill_record(skill) for skill in self.list_skills()]
+
+    def skill_record(self, name):
+        skill_key = _normalize_skill_key(name)
+        skill = self._resolve_skill(skill_key)
+        if skill is None or isinstance(skill, list):
+            return None
+        return self._build_skill_record(skill)
 
     def catalog_prompt(self):
         skills = self.list_skills()
@@ -321,6 +332,32 @@ class SkillRegistry:
             0,
         )
 
+    def _build_skill_record(self, skill):
+        skill_md_path = skill.path / "SKILL.md"
+        metadata = _read_skill_metadata(skill_md_path)
+        origin = _read_origin_metadata(skill.path)
+        version = str(origin.get("version") or metadata.get("version") or "").strip()
+        display_name = str(origin.get("display_name") or "").strip() or skill.name
+        return {
+            "name": display_name,
+            "directory_name": skill.name,
+            "key": skill.key,
+            "source": skill.source,
+            "description": skill.description,
+            "triggers": list(skill.triggers),
+            "path": str(skill.path),
+            "files": self._skill_files(skill.path),
+            "skill_md": _read_text_file(skill_md_path),
+            "version": version,
+            "metadata": metadata,
+            "origin": origin,
+            "provider": str(origin.get("source") or "").strip(),
+            "registry": str(origin.get("registry") or "").strip(),
+            "slug": str(origin.get("slug") or "").strip(),
+            "target": str(origin.get("target") or "").strip(),
+            "installed_at": str(origin.get("installed_at") or "").strip(),
+        }
+
 
 def _normalize_skill_key(name):
     value = str(name or "").strip().lower().replace("\\", "/")
@@ -396,3 +433,24 @@ def _parse_frontmatter(text):
         else:
             data[key] = value.strip("\"'")
     return data
+
+
+def _read_text_file(path):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        return f"ERROR: Failed to read {path.name}: {error}"
+
+
+def _read_origin_metadata(skill_dir):
+    for origin_name in (".clawhub", ".skillhub"):
+        origin_path = Path(skill_dir) / origin_name / "origin.json"
+        if not origin_path.is_file():
+            continue
+        try:
+            data = json.loads(origin_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}

@@ -17,6 +17,8 @@ from pathlib import Path, PurePosixPath
 DEFAULT_CLAWHUB_REGISTRY = "https://clawhub.ai"
 DEFAULT_SKILLHUB_REGISTRY = "https://skillhub.space"
 CLAWHUB_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+CLAWHUB_OWNER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+LOCAL_SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SKILLHUB_SLUG_PATTERN = re.compile(
     r"^[a-z0-9][a-z0-9_-]{0,127}(?:/[a-z0-9][a-z0-9_-]{0,127})?$"
 )
@@ -125,6 +127,8 @@ def normalize_skillhub_slug(value):
 
 def normalize_provider_slug(provider, value):
     provider = _normalize_provider(provider)
+    if provider == "clawhub":
+        return _normalize_clawhub_reference(value)
     text = str(value or "").strip().lower().replace("\\", "/")
     prefix = f"{provider}:"
     if text.startswith(prefix):
@@ -161,7 +165,7 @@ def registry_search(provider, query, limit=10, registry=None):
         if not slug:
             continue
         title = _field(item, "displayName", "display_name", "title", "name") or slug
-        owner = _field(item, "owner", "ownerHandle", "publisher", "author")
+        owner = _owner_handle(item)
         description = _field(item, "description", "summary", "readmeSummary") or ""
         downloads = _field(item, "downloads", "installCount", "installs", "score")
         rows.append({
@@ -186,10 +190,17 @@ def registry_inspect(provider, slug, version=None, registry=None):
     provider = _normalize_provider(provider)
     slug = normalize_provider_slug(provider, slug)
     params = {}
+    api_slug = slug
+    if provider == "clawhub":
+        owner_handle, api_slug = _clawhub_reference_parts(slug)
+        if owner_handle:
+            params["ownerHandle"] = owner_handle
     if version and version != "latest":
         params["version"] = str(version)
     data = _http_json(
-        _api_url(provider, registry, f"/api/v1/skills/{_url_path_slug(slug)}", params),
+        _api_url(
+            provider, registry, f"/api/v1/skills/{_url_path_slug(api_slug)}", params
+        ),
         provider,
     )
     skill = (
@@ -212,7 +223,7 @@ def registry_inspect(provider, slug, version=None, registry=None):
         "version": _field(skill, "version", "latestVersion", "latest_version")
         or tag_or_version,
         "title": _field(skill, "displayName", "display_name", "title", "name") or slug,
-        "owner": _field(skill, "owner", "ownerHandle", "publisher", "author") or "",
+        "owner": (_owner_handle(data) or _owner_handle(skill) or ""),
         "description": _field(skill, "description", "summary", "readmeSummary") or "",
         "homepage": _field(skill, "homepage", "url", "sourceUrl", "sourceRepo") or "",
         "files": files,
@@ -230,6 +241,8 @@ def install_clawhub_skill(
     registry=None,
     force=False,
     dry_run=False,
+    local_name=None,
+    display_name=None,
 ):
     return install_registry_skill(
         "clawhub",
@@ -240,6 +253,8 @@ def install_clawhub_skill(
         registry=registry,
         force=force,
         dry_run=dry_run,
+        local_name=local_name,
+        display_name=display_name,
     )
 
 
@@ -251,6 +266,8 @@ def install_skillhub_skill(
     registry=None,
     force=False,
     dry_run=False,
+    local_name=None,
+    display_name=None,
 ):
     return install_registry_skill(
         "skillhub",
@@ -261,6 +278,8 @@ def install_skillhub_skill(
         registry=registry,
         force=force,
         dry_run=dry_run,
+        local_name=local_name,
+        display_name=display_name,
     )
 
 
@@ -273,10 +292,17 @@ def install_registry_skill(
     registry=None,
     force=False,
     dry_run=False,
+    local_name=None,
+    display_name=None,
 ):
     provider = _normalize_provider(provider)
     slug = normalize_provider_slug(provider, slug)
-    local_name = _local_skill_name(provider, slug)
+    if provider == "clawhub":
+        slug = _resolve_clawhub_install_slug(slug, version=version, registry=registry)
+    display_name = _normalize_display_name(display_name)
+    local_name = _normalize_local_skill_name(local_name) or _local_skill_name(
+        provider, slug
+    )
     skills_dir = Path(skills_dir).resolve()
     install_dir = (skills_dir / local_name).resolve()
     _ensure_child(skills_dir, install_dir)
@@ -317,6 +343,7 @@ def install_registry_skill(
             provider,
             slug,
             local_name,
+            display_name,
             target,
             registry,
             resolved_version,
@@ -417,6 +444,11 @@ def _request(url, provider):
 
 def _fetch_skill_file(provider, slug, path, version, registry):
     params = {"path": path}
+    api_slug = slug
+    if provider == "clawhub":
+        owner_handle, api_slug = _clawhub_reference_parts(slug)
+        if owner_handle:
+            params["ownerHandle"] = owner_handle
     if version and version != "latest":
         params["version"] = version
     else:
@@ -426,7 +458,7 @@ def _fetch_skill_file(provider, slug, path, version, registry):
             _api_url(
                 provider,
                 registry,
-                f"/api/v1/skills/{_url_path_slug(slug)}/file",
+                f"/api/v1/skills/{_url_path_slug(api_slug)}/file",
                 params,
             ),
             200000,
@@ -439,22 +471,30 @@ def _fetch_skill_file(provider, slug, path, version, registry):
 
 def _download_skill_archive(provider, slug, version, registry):
     params = {"slug": slug}
+    api_slug = slug
+    if provider == "clawhub":
+        owner_handle, api_slug = _clawhub_reference_parts(slug)
+        params["slug"] = api_slug
+        if owner_handle:
+            params["ownerHandle"] = owner_handle
     if version and version != "latest":
         params["version"] = str(version)
     else:
         params["tag"] = "latest"
 
-    urls = [
-        _api_url(provider, registry, "/api/v1/download", params),
-        _api_url(
-            provider,
-            registry,
-            f"/api/v1/download/{urllib.parse.quote(slug, safe='')}",
-            None,
-        ),
-        _api_url(provider, registry, f"/api/v1/download/{_url_path_slug(slug)}", None),
-    ]
+    urls = [_api_url(provider, registry, "/api/v1/download", params)]
     if provider == "skillhub":
+        urls.extend([
+            _api_url(
+                provider,
+                registry,
+                f"/api/v1/download/{urllib.parse.quote(slug, safe='')}",
+                None,
+            ),
+            _api_url(
+                provider, registry, f"/api/v1/download/{_url_path_slug(slug)}", None
+            ),
+        ])
         urls.extend([
             _api_url(
                 provider, registry, f"/skills/{_url_path_slug(slug)}/download", None
@@ -481,13 +521,58 @@ def _normalize_provider(provider):
 
 
 def _local_skill_name(provider, slug):
+    if provider == "clawhub":
+        return _clawhub_reference_parts(slug)[1]
     if provider == "skillhub":
         return slug.rsplit("/", 1)[-1]
     return slug
 
 
+def _normalize_local_skill_name(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if not LOCAL_SKILL_NAME_PATTERN.match(text):
+        raise SkillInstallError(
+            "Skill name must use lowercase letters, numbers, '-' or '_'."
+        )
+    return text
+
+
+def _normalize_display_name(value):
+    return str(value or "").strip()
+
+
 def _url_path_slug(slug):
     return urllib.parse.quote(str(slug or ""), safe="/")
+
+
+def _normalize_clawhub_reference(value):
+    text = str(value or "").strip().lower().replace("\\", "/")
+    if text.startswith("clawhub:"):
+        text = text.split(":", 1)[1].strip()
+    if not text.startswith("@") or "/" not in text[1:]:
+        raise SkillInstallError("ClawHub skill must use the format @owner/skill-name.")
+    owner_handle, slug = text[1:].split("/", 1)
+    owner_handle = owner_handle.strip()
+    slug = slug.strip("/")
+    if not CLAWHUB_OWNER_PATTERN.match(owner_handle):
+        raise SkillInstallError(f"Invalid ClawHub owner handle: {value}")
+    if not CLAWHUB_SLUG_PATTERN.match(slug):
+        raise SkillInstallError(f"Invalid ClawHub skill slug: {value}")
+    return f"@{owner_handle}/{slug}"
+
+
+def _clawhub_reference_parts(value):
+    text = _normalize_clawhub_reference(value)
+    if text.startswith("@") and "/" in text[1:]:
+        owner_handle, slug = text[1:].split("/", 1)
+        return owner_handle, slug
+    return "", text
+
+
+def _resolve_clawhub_install_slug(slug, version=None, registry=None):
+    return _normalize_clawhub_reference(slug)
 
 
 def _validated_skill_archive(data):
@@ -601,6 +686,7 @@ def _write_origin(
     provider,
     slug,
     local_name,
+    display_name,
     target,
     registry,
     version,
@@ -615,6 +701,7 @@ def _write_origin(
         "registry": _registry_value(provider, registry),
         "slug": slug,
         "local_name": local_name,
+        "display_name": display_name,
         "target": target,
         "version": version,
         "archive_sha256": archive_sha256,
@@ -718,14 +805,26 @@ def _field(data, *names):
     if not isinstance(data, dict):
         return ""
     for name in names:
-        if name in data and data[name] not in {None, ""}:
+        if name in data and data[name] is not None and data[name] != "":
             return data[name]
     for value in data.values():
         if isinstance(value, dict):
             found = _field(value, *names)
-            if found not in {None, ""}:
+            if found is not None and found != "":
                 return found
     return ""
+
+
+def _owner_handle(data):
+    if not isinstance(data, dict):
+        return ""
+    owner = data.get("owner")
+    if isinstance(owner, dict):
+        handle = owner.get("handle") or owner.get("ownerHandle")
+        if handle is not None and handle != "":
+            return str(handle)
+    handle = _field(data, "ownerHandle", "publisher", "author", "handle")
+    return str(handle or "")
 
 
 def _version_from_skill_md(text):

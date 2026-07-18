@@ -303,19 +303,7 @@ Plan mode 是“先想清楚再动手”的协作状态：适合需求还不够�
 
 模板文件只控制对应子智能体的身份、职责和输出风格；工具白名单、最大轮次、`dispatch_subagent` / `update_todo` / `ask_user` 禁用规则仍由代码固定，不会被模板放开。整个 `.omniagent/` 已被 `.gitignore` 忽略，适合存放本机偏好。
 
-设置 agent skills：
-
-```text
-/skills on
-/skills off
-/skills reload
-/skills app on
-/skills workspace on
-/skills catalog on
-/skills max-chars 12000
-```
-
-Agent skills 只在 agent 模式中可用，支持两个来源：程序目录 `skills/` 和工作目录 `.omniagent/skills/`。工作目录来源默认关闭，开启后如果目录不存在会自动创建。每个 skill 使用一个目录，目录名只能包含小写字母、数字、`-` 和 `_`：
+Agent skills 只在 agent 模式中可用，支持两个来源：程序目录 `skills/` 和工作目录 `.omniagent/skills/`。工作目录来源默认关闭，开启后如果目录不存在会自动创建。相关开关和已安装技能浏览器统一在 `Settings -> Skills` 中配置。每个 skill 使用一个目录，目录名只能包含小写字母、数字、`-` 和 `_`：
 
 ```text
 skills/
@@ -344,16 +332,13 @@ enabled: true
 
 Skills 只提供工作流指导，不会执行 skill 里的脚本，也不能覆盖 agent 安全规则、工作目录限制、审批设置或工具限制。程序目录 `skills/` 已被 `.gitignore` 忽略，适合放本机专用指令。
 
-从 ClawHub 或 SkillHub 安装 skills：
+安装 skills：
 
-```text
-/skills search clawhub git --limit 5
-/skills inspect clawhub:git-commit
-/skills install clawhub:git-commit --workspace
-/skills install skillhub:owner/name --app
-```
-
-默认安装到工作目录 `.omniagent/skills/`；使用 `--app` 会安装到程序目录 `skills/`，对所有开启程序目录来源的工作区生效。安装前会展示预览并要求确认，可用 `--dry-run` 只预览、`--force` 覆盖已有 skill、`--yes` 跳过确认、`--version <version>` 指定版本、`--registry <url>` 指定 registry。安装来源和 lock 文件分别写入 `.clawhub/` 或 `.skillhub/`，这些目录已被 `.gitignore` 忽略。
+- 在 `Settings -> Skills -> Installed skills -> Install skill` 中安装。
+- Provider 目前支持 `ClawHub` 和 `SkillHub`。
+- 默认优先安装到工作目录 `.omniagent/skills/`；没有选中项目时可安装到程序目录 `skills/`。
+- 可选填写 `version`、自定义 `registry`，并可开启 `force` 覆盖已有 skill。
+- 安装来源和 lock 文件分别写入 `.clawhub/` 或 `.skillhub/`，这些目录已被 `.gitignore` 忽略。
 
 安全限制：
 

@@ -308,6 +308,12 @@ class SettingsModal(ModalScreen[None]):
         text-align: right;
         content-align: right middle;
     }
+    .settings-control-trigger.placeholder,
+    .settings-control-trigger.placeholder:hover,
+    .settings-control-trigger.placeholder:focus,
+    .settings-control-trigger.placeholder.-active {
+        color: $TEXT_MUTED;
+    }
 
     .settings-nav-trigger,
     .settings-nav-trigger:hover,
@@ -1076,14 +1082,13 @@ class SettingsModal(ModalScreen[None]):
             on_activate = row.get("on_activate")
             if callable(on_activate):
                 result = on_activate()
-                if result == "model_list":
-                    while (
-                        len(self._page_stack) > 1
-                        and self._page_stack[-1] != "model_list"
-                    ):
-                        self._page_stack.pop()
-                elif result == "back":
+                if result == "back":
                     self._go_back()
+                elif isinstance(result, str) and result in self.pages:
+                    while len(self._page_stack) > 1 and self._page_stack[-1] != result:
+                        self._page_stack.pop()
+                    if self._page_stack[-1] != result:
+                        self._page_stack.append(result)
                 self._render_current_page(self._current_query())
         elif edit_type == _EDIT_TOGGLE:
             self._commit_toggle(row_index)
@@ -1152,26 +1157,35 @@ class SettingsModal(ModalScreen[None]):
 
         if self._current_layout() == _LAYOUT_MODEL_LIST:
             footer_rows = 2 if detail_footer.has_class("open") else 0
-            models_needed = max(1, int(self._model_sidebar_content_rows or 0))
+            models_needed = max(0, int(self._model_sidebar_content_rows or 0))
             detail_needed = max(
-                1,
+                0,
                 sum(self._estimated_row_height(row) for row in self._current_rows) or 0,
             )
             panel_needed = max(detail_needed + footer_rows, models_needed + 2)
             panel_height = min(max(1, panel_needed), available_height)
-            detail_height = max(1, panel_height - footer_rows)
-            model_items_height = max(1, panel_height - 2)
+            detail_height = (
+                max(1, panel_height - footer_rows)
+                if detail_needed or footer_rows
+                else 0
+            )
+            model_items_height = max(1, panel_height - 2) if models_needed else 0
             model_detail_scroll.styles.height = detail_height
-            model_detail_scroll.styles.max_height = max(
-                1, available_height - footer_rows
+            model_detail_scroll.styles.max_height = (
+                max(1, available_height - footer_rows) if detail_height else 0
             )
             model_items_scroll.styles.height = model_items_height
-            model_items_scroll.styles.max_height = max(1, available_height - 2)
+            model_items_scroll.styles.max_height = (
+                max(1, available_height - 2) if model_items_height else 0
+            )
             list_scroll.styles.height = 1
             list_scroll.styles.max_height = 1
         else:
             visible_rows = self._visible_rows()
-            list_needed = max(1, len(visible_rows) or 0)
+            list_needed = max(
+                1,
+                sum(self._estimated_row_height(row) for row in visible_rows) or 0,
+            )
             list_height = min(list_needed, available_height)
             list_scroll.styles.height = list_height
             list_scroll.styles.max_height = available_height
@@ -1231,6 +1245,12 @@ class SettingsModal(ModalScreen[None]):
         item_labels = dict(state.get("item_labels") or {})
         item_classes = dict(state.get("item_classes") or {})
         show_group_titles = bool(state.get("show_group_titles", True))
+        empty_list_label = (
+            str(state.get("empty_list_label"))
+            if "empty_list_label" in state
+            else "No items"
+        )
+        blank_detail_when_empty = bool(state.get("blank_detail_when_empty", False))
         self._show_model_group_titles = show_group_titles
         allow_group_collapse = bool(state.get("allow_group_collapse", True))
         if selected_model in all_model_names:
@@ -1252,7 +1272,7 @@ class SettingsModal(ModalScreen[None]):
         for child in list(detail_footer.children):
             child.remove()
 
-        if not groups:
+        if not groups and all_model_names:
             groups = [{"api_type": "", "title": "Models", "models": all_model_names}]
 
         selected_api_type = ""
@@ -1322,8 +1342,11 @@ class SettingsModal(ModalScreen[None]):
                 )
 
         if not all_model_names:
-            model_items.mount(Static("No models", classes="settings-name"))
-            self._model_sidebar_content_rows = 1
+            if empty_list_label:
+                model_items.mount(Static(empty_list_label, classes="settings-name"))
+                self._model_sidebar_content_rows = 1
+            else:
+                self._model_sidebar_content_rows = 0
         else:
             group_gap_rows = max(0, len(groups) - 1)
             self._model_sidebar_content_rows = (
@@ -1335,7 +1358,7 @@ class SettingsModal(ModalScreen[None]):
             row["_render_index"] = row_index
             detail_list.mount(self._build_row_widget(row, row_index))
 
-        if not self._current_rows:
+        if not self._current_rows and not blank_detail_when_empty:
             detail_list.mount(Static("No model settings", classes="settings-name"))
 
         if self._current_footer_actions:
@@ -1495,11 +1518,20 @@ class SettingsModal(ModalScreen[None]):
             trigger_classes = "settings-control-trigger"
             if edit_type == _EDIT_NAV:
                 trigger_classes += " settings-nav-trigger"
+            display_value = self._display_value(row)
+            placeholder_value = str(row.get("placeholder_value") or "")
+            if (
+                edit_type == _EDIT_INPUT
+                and not str(row.get("value") or "")
+                and placeholder_value
+            ):
+                display_value = placeholder_value
+                trigger_classes += " placeholder"
             if accessory_widget is not None:
                 header_children.append(accessory_widget)
             header_children.append(
                 _ValueTrigger(
-                    self._display_value(row),
+                    display_value,
                     markup=False,
                     id=self._trigger_id(row_index),
                     classes=trigger_classes,
@@ -1579,13 +1611,20 @@ class SettingsModal(ModalScreen[None]):
         self._editing_row_index = row_index
         row = self._visible_rows()[row_index]
         current_value = str(row.get("value") or "")
+        placeholder_value = str(row.get("placeholder_value") or "")
 
         row_widget = self.query_one(f"#{self._row_widget_id(row_index)}", Horizontal)
         value_button = row_widget.query_one(".settings-control-trigger", _ValueTrigger)
         value_button.display = False
 
-        input_widget = Input(value=current_value, id="settings-edit-input")
-        input_widget.styles.width = max(len(current_value) + 3, 8)
+        input_kwargs = {
+            "value": current_value,
+            "id": "settings-edit-input",
+        }
+        if placeholder_value:
+            input_kwargs["placeholder"] = placeholder_value
+        input_widget = Input(**input_kwargs)
+        input_widget.styles.width = max(len(current_value or placeholder_value) + 3, 8)
         row_widget.mount(input_widget)
         input_widget.focus()
 
