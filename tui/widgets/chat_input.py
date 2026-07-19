@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from textual import events
 from textual.app import ComposeResult
@@ -18,9 +20,11 @@ from rich.style import Style
 from rich.text import Text
 
 from commands import COMMANDS
+from references import resolve_references
 from tui.data import THINKING_LEVELS, APPROVAL_LEVELS
 from tui.theme import (
     PAGE_BACKGROUND,
+    REFERENCE_BACKGROUND,
     SURFACE_BACKGROUND,
     TEXT_MUTED,
     TEXT_PRIMARY,
@@ -59,6 +63,14 @@ COMMAND_SUGGESTIONS = [
         COMMANDS.items(), key=lambda item: str(item[0]).lower()
     )
 ]
+
+
+@dataclass
+class InputReference:
+    start: int
+    end: int
+    syntax: str
+
 
 try:
     import ctypes
@@ -272,6 +284,8 @@ class MessageTextArea(TextArea):
         self._handling_paste = False
         self._last_paste_text = ""
         self._last_paste_at = 0.0
+        self._input_references = []
+        self._normalizing_references = False
 
     async def _on_key(self, event: events.Key) -> None:
         if self._is_undo_granularity_key(event):
@@ -315,6 +329,7 @@ class MessageTextArea(TextArea):
         self._owner._submit_message_input()
 
     def _replace_via_keyboard(self, insert: str, start, end):
+        start, end = self._expand_reference_locations(start, end, False)
         if (
             not self._handling_paste
             and start == end
@@ -340,6 +355,135 @@ class MessageTextArea(TextArea):
                 cursor = result.end_location
             return result
         return super()._replace_via_keyboard(insert, start, end)
+
+    def _delete_via_keyboard(self, start, end):
+        start, end = self._expand_reference_locations(start, end)
+        return super()._delete_via_keyboard(start, end)
+
+    def replace(self, insert, start, end, *, maintain_selection_offset=True):
+        start_offset = self._location_to_offset(start)
+        end_offset = self._location_to_offset(end)
+        result = super().replace(
+            insert,
+            start,
+            end,
+            maintain_selection_offset=maintain_selection_offset,
+        )
+        if not self._normalizing_references:
+            self._update_reference_offsets(start_offset, end_offset, len(insert))
+        return result
+
+    def load_text(self, text: str) -> None:
+        self._input_references = []
+        super().load_text(text)
+
+    def normalize_references(self, base_dir=None) -> None:
+        if self._normalizing_references:
+            return
+        existing_ranges = [(item.start, item.end) for item in self._input_references]
+        references = [
+            reference
+            for reference in resolve_references(self.text, base_dir)
+            if not any(
+                reference.start < end and reference.end > start
+                for start, end in existing_ranges
+            )
+        ]
+        if not references:
+            return
+        self._normalizing_references = True
+        try:
+            for reference in reversed(references):
+                replacement = f" {reference.display} "
+                start = self._offset_to_location(reference.start)
+                end = self._offset_to_location(reference.end)
+                super().replace(
+                    replacement,
+                    start,
+                    end,
+                    maintain_selection_offset=False,
+                )
+                self._update_reference_offsets(
+                    reference.start, reference.end, len(replacement)
+                )
+                self._input_references.append(
+                    InputReference(
+                        reference.start,
+                        reference.start + len(replacement),
+                        reference.syntax,
+                    )
+                )
+            self._input_references.sort(key=lambda item: item.start)
+        finally:
+            self._normalizing_references = False
+        line_cache = getattr(self, "_line_cache", None)
+        if line_cache is not None:
+            line_cache.clear()
+        self.refresh()
+
+    def serialized_text(self) -> str:
+        value = self.text
+        for reference in reversed(self._input_references):
+            value = value[: reference.start] + reference.syntax + value[reference.end :]
+        return value
+
+    def get_line(self, line_index: int) -> Text:
+        line = super().get_line(line_index)
+        line_start = self._location_to_offset((line_index, 0))
+        line_end = line_start + len(self.document.get_line(line_index))
+        for reference in self._input_references:
+            if reference.start >= line_start and reference.end <= line_end:
+                line.stylize(
+                    Style(color=TEXT_PRIMARY, bgcolor=REFERENCE_BACKGROUND),
+                    reference.start - line_start,
+                    reference.end - line_start,
+                )
+        return line
+
+    def _expand_reference_locations(self, start, end, include_boundaries=True):
+        start_offset = self._location_to_offset(start)
+        end_offset = self._location_to_offset(end)
+        low, high = sorted((start_offset, end_offset))
+        for reference in self._input_references:
+            touches = low < reference.end and high > reference.start
+            at_left = include_boundaries and low == high == reference.start
+            at_right = include_boundaries and low == high == reference.end
+            if touches or at_left or at_right:
+                low = min(low, reference.start)
+                high = max(high, reference.end)
+        if start_offset <= end_offset:
+            return self._offset_to_location(low), self._offset_to_location(high)
+        return self._offset_to_location(high), self._offset_to_location(low)
+
+    def _update_reference_offsets(self, start, end, inserted_length):
+        delta = inserted_length - (end - start)
+        updated = []
+        for reference in self._input_references:
+            if reference.end <= start:
+                updated.append(reference)
+            elif reference.start >= end:
+                updated.append(
+                    InputReference(
+                        reference.start + delta,
+                        reference.end + delta,
+                        reference.syntax,
+                    )
+                )
+        self._input_references = updated
+
+    def _location_to_offset(self, location):
+        row, column = location
+        lines = self.text.split("\n")
+        return sum(len(line) + 1 for line in lines[:row]) + column
+
+    def _offset_to_location(self, offset):
+        remaining = max(0, offset)
+        lines = self.text.split("\n")
+        for row, line in enumerate(lines):
+            if remaining <= len(line):
+                return row, remaining
+            remaining -= len(line) + 1
+        return len(lines) - 1, len(lines[-1])
 
     def _is_undo_granularity_key(self, event: events.Key) -> bool:
         if not self.selection.is_empty:
@@ -534,6 +678,42 @@ class ChatInput(Widget):
         width: 100%;
         height: 1;
         align-horizontal: left;
+    }
+    #add-reference {
+        width: 3;
+        min-width: 3;
+        padding: 0;
+        color: $TEXT_PRIMARY;
+        background: transparent;
+        background-tint: transparent;
+        tint: transparent;
+        text-align: left;
+        content-align: left middle;
+        border: none;
+        border-top: none;
+        border-bottom: none;
+        outline: none;
+        text-style: none;
+    }
+    #add-reference:hover,
+    #add-reference:focus,
+    #add-reference.-active {
+        color: $TEXT_PRIMARY;
+        background: transparent;
+        background-tint: transparent;
+        tint: transparent;
+        content-align: left middle;
+        border: none;
+        border-top: none;
+        border-bottom: none;
+        outline: none;
+        text-style: none;
+    }
+    #input-area #add-reference,
+    #input-area #add-reference:hover,
+    #input-area #add-reference:focus,
+    #input-area #add-reference.-active {
+        color: $TEXT_PRIMARY;
     }
 
     #message-input {
@@ -757,9 +937,15 @@ class ChatInput(Widget):
         self._prompt_syncing = False
 
     class Send(Message):
-        def __init__(self, content: str) -> None:
+        def __init__(self, content: str, display_content: str | None = None) -> None:
             super().__init__()
             self.content = content
+            self.display_content = (
+                content if display_content is None else display_content
+            )
+
+    class ReferenceRequested(Message):
+        pass
 
     class ModelChanged(Message):
         def __init__(self, label: str, value: str) -> None:
@@ -828,9 +1014,11 @@ class ChatInput(Widget):
                     id="message-input",
                     soft_wrap=True,
                     show_line_numbers=False,
+                    highlight_cursor_line=False,
                 )
 
             with Horizontal(id="controls-row"):
+                yield Button("+", id="add-reference")
                 # Plan/Build toggle dropdown
                 with Container(id="plan-drop"):
                     yield Button("Plan", id="plan-trigger")
@@ -857,7 +1045,10 @@ class ChatInput(Widget):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id
-        if btn_id == "plan-opt-plan":
+        if btn_id == "add-reference":
+            if not self.controls_locked and not self.prompt_active:
+                self.post_message(self.ReferenceRequested())
+        elif btn_id == "plan-opt-plan":
             if self.controls_locked:
                 return
             self._set_plan_mode(True)
@@ -1038,16 +1229,42 @@ class ChatInput(Widget):
             self.call_after_refresh(self._update_input_height)
             self.post_message(self.PromptStateChanged(self.prompt_can_submit()))
             return
+        event.text_area.normalize_references(self.reference_base_dir())
         self._refresh_command_menu(event.text_area.text)
         self.call_after_refresh(self._update_input_height)
 
     def _do_send(self) -> None:
         msg_input = self._message_input()
-        content = msg_input.text.strip()
+        content = msg_input.serialized_text().strip()
         if content:
-            self.post_message(self.Send(content))
+            self.post_message(self.Send(content, msg_input.text.strip()))
             msg_input.load_text("")
             self._hide_command_menu()
+
+    def reference_base_dir(self):
+        try:
+            project = self.app._selected_project()
+        except Exception:
+            project = None
+        return Path(project.path).resolve() if project is not None else None
+
+    def insert_reference(self, reference_type: str, path: str) -> bool:
+        syntax = f"[@{reference_type}:{str(path or '').strip()}]"
+        target = self._message_input()
+        references = resolve_references(syntax, self.reference_base_dir())
+        if (
+            len(references) != 1
+            or references[0].start != 0
+            or references[0].end != len(syntax)
+        ):
+            return False
+        start, end = target._expand_reference_locations(*target.selection)
+        target.history.checkpoint()
+        target.replace(syntax, start, end, maintain_selection_offset=False)
+        target.normalize_references(self.reference_base_dir())
+        target.focus()
+        self.call_after_refresh(self._update_input_height)
+        return True
 
     def watch_plan_mode(self, value: bool) -> None:
         self._update_plan_build()

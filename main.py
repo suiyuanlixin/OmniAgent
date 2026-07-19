@@ -3,10 +3,10 @@ import mimetypes
 import re
 from pathlib import Path
 
+from references import resolve_references, reference_path_key
 from tools import MAX_READ_CHARS
 
 
-FILE_REFERENCE_PATTERN = re.compile(r"\[([^\[\]\r\n]+)\]")
 IMAGE_MEDIA_TYPES = {
     "image/jpeg",
     "image/png",
@@ -37,34 +37,11 @@ VIDEO_FILE_MAX_BYTES = 50 * 1024 * 1024
 MULTIMODAL_REQUEST_MAX_BYTES = 64 * 1024 * 1024
 
 
-def _is_file_reference_path(path_text):
-    value = str(path_text or "").strip()
-    if not value:
-        return False
-    if value.startswith(("/", "\\", "~")):
-        return True
-    if re.match(r"^[A-Za-z]:[\\/]", value):
-        return True
-    return value.startswith(("./", ".\\", "../", "..\\"))
-
-
-def _external_file_references(user_input):
-    references = []
-    seen = set()
-    for match in FILE_REFERENCE_PATTERN.finditer(user_input):
-        path_text = match.group(1).strip()
-        if not _is_file_reference_path(path_text):
-            continue
-        if path_text in seen:
-            continue
-        seen.add(path_text)
-        references.append(path_text)
-    return references
-
-
-def _resolve_external_file_reference(path_text):
+def _resolve_external_file_reference(path_text, base_dir=None):
     try:
-        path = Path(path_text).expanduser().resolve(strict=True)
+        source = Path(path_text).expanduser()
+        path = source if source.is_absolute() else Path(base_dir or Path.cwd()) / source
+        path = path.resolve(strict=True)
     except OSError as error:
         raise ValueError(f"Referenced file does not exist: {path_text}") from error
 
@@ -130,8 +107,8 @@ def _detect_reference_media_type(path):
     return "text", ""
 
 
-def _read_external_file_reference(path_text):
-    path = _resolve_external_file_reference(path_text)
+def _read_external_file_reference(path_text, base_dir=None):
+    path = _resolve_external_file_reference(path_text, base_dir)
 
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -146,8 +123,8 @@ def _read_external_file_reference(path_text):
     return path, truncated
 
 
-def _read_external_media_reference(path_text, encoded_bytes_before=0):
-    path = _resolve_external_file_reference(path_text)
+def _read_external_media_reference(path_text, encoded_bytes_before=0, base_dir=None):
+    path = _resolve_external_file_reference(path_text, base_dir)
     kind, mime_type = _detect_reference_media_type(path)
     if kind not in {"audio", "image", "video"}:
         return None
@@ -191,10 +168,30 @@ def _read_external_media_reference(path_text, encoded_bytes_before=0):
     }
 
 
-def attach_external_file_references_with_media(user_input):
-    references = _external_file_references(user_input)
+def attach_external_file_references_with_media(user_input, base_dir=None):
+    parsed = resolve_references(user_input, base_dir)
+    references = []
+    folders = {}
+    seen = set()
+    for reference in parsed:
+        key = (reference.kind, reference_path_key(reference.path))
+        if key in seen:
+            continue
+        seen.add(key)
+        if reference.kind == "folder":
+            folders[reference.display] = reference.path
+        else:
+            references.append(reference)
     if not references:
-        return user_input, []
+        if not folders:
+            return user_input, [], {}
+        folder_lines = "\n".join(f"- {name}" for name in folders)
+        return (
+            f"{user_input}\n\n[Referenced folders]\n{folder_lines}\n"
+            "These folders are available lazily through read-only file tools for this request.",
+            [],
+            folders,
+        )
 
     blocks = [
         (
@@ -205,10 +202,12 @@ def attach_external_file_references_with_media(user_input):
     ]
     media_references = []
     encoded_media_bytes = 0
-    for path_text in references:
+    for reference in references:
+        path_text = reference.source
         media_reference = _read_external_media_reference(
             path_text,
             encoded_media_bytes,
+            base_dir,
         )
         if media_reference:
             media_references.append(media_reference)
@@ -225,10 +224,17 @@ def attach_external_file_references_with_media(user_input):
             )
             continue
 
-        path, content = _read_external_file_reference(path_text)
+        path, content = _read_external_file_reference(path_text, base_dir)
         blocks.append(f"--- File: {path} ---\n{content}\n--- End file: {path} ---")
 
-    return f"{user_input}\n\n" + "\n\n".join(blocks), media_references
+    if folders:
+        folder_lines = "\n".join(f"- {name}" for name in folders)
+        blocks.append(
+            "[Referenced folders]\n"
+            f"{folder_lines}\n"
+            "These folders are available lazily through read-only file tools for this request."
+        )
+    return f"{user_input}\n\n" + "\n\n".join(blocks), media_references, folders
 
 
 def main():

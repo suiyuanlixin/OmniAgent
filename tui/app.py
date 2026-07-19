@@ -36,9 +36,10 @@ from config import (
     save_config_fields,
     supported_reasoning_efforts,
 )
-from installer import install_registry_skill
+from installer import PROVIDERS, install_registry_skill
 from memory import MemoryStore
 from main import attach_external_file_references_with_media
+from references import resolve_references
 from search import TAVILY_SEARCH_DEPTHS, TAVILY_TOPICS, WEB_SEARCH_PROVIDERS
 from session import (
     ProjectRecord,
@@ -70,6 +71,7 @@ from tui.widgets.chat_view import ChatView
 from tui.widgets.memory_modal import MemoryModal
 from tui.widgets.project_modal import ProjectModal
 from tui.widgets.project_picker import ProjectPicker
+from tui.widgets.reference_modal import ReferenceModal
 from tui.widgets.settings import SettingsModal
 from tui.widgets.sidebar import Sidebar
 from tui.widgets.text_area_modal import PromptFileModal, TextAreaModal
@@ -462,6 +464,18 @@ class AgentTUIApp(App):
         options.extend((name, name) for name in self.config.model_list.keys())
         return options
 
+    def _optional_model_choice_groups(self) -> list[dict]:
+        groups = [
+            {
+                "api_type": "auto",
+                "title": "Auto",
+                "models": [AUTO_MODEL_SELECTION],
+                "options": [(AUTO_MODEL_SELECTION, AUTO_MODEL_SELECTION)],
+            }
+        ]
+        groups.extend(self._grouped_model_choices())
+        return groups
+
     def _valid_optional_model_selection(self, value: str) -> str:
         normalized = normalize_optional_model_selection(value)
         if normalized == AUTO_MODEL_SELECTION:
@@ -597,7 +611,9 @@ class AgentTUIApp(App):
         chat_view = self.query_one("#messages-view", ChatView)
         if not is_command:
             self.start_chat()
-            chat_view.add_message("user", event.content)
+            project = self._selected_project()
+            base_dir = project.path if project is not None else None
+            chat_view.add_message("user", event.content, base_dir)
         chat_view.reset_turn_summaries()
         self._set_controls_locked(True)
         self._set_input_enabled(False)
@@ -611,13 +627,27 @@ class AgentTUIApp(App):
             and (not self.current_session_record.get("conversation"))
         )
         if new_session:
-            self._update_new_session_title_from_text(event.content)
+            self._update_new_session_title_from_text(event.display_content)
         worker = threading.Thread(
             target=self._process_user_message,
             args=(event.content,),
             daemon=True,
         )
         worker.start()
+
+    def on_chat_input_reference_requested(
+        self, event: ChatInput.ReferenceRequested
+    ) -> None:
+        self.push_screen(ReferenceModal(), callback=self._handle_reference_result)
+
+    def _handle_reference_result(self, result: dict | None) -> None:
+        if not result:
+            return
+        inserted = self.query_one("#chat-input", ChatInput).insert_reference(
+            str(result.get("type") or ""), str(result.get("path") or "")
+        )
+        if not inserted:
+            self.add_status_message("[✗]", "引用路径不存在或类型不匹配。")
 
     def on_chat_input_model_changed(self, event: ChatInput.ModelChanged) -> None:
         save_config_field("current_model", event.value)
@@ -2365,10 +2395,18 @@ class AgentTUIApp(App):
         draft = dict(self._ensure_skill_install_draft())
         registry = self._skills_registry_for_page()
         provider = str(draft.get("provider") or "clawhub").strip().lower()
-        target_choices = [("App", "app")]
-        if registry.workspace_skills_dir is not None:
-            target_choices.append(("Workspace", "workspace"))
+        target_choices = [("App", "app"), ("Workspace", "workspace")]
+        disabled_targets = (
+            ["workspace"] if registry.workspace_skills_dir is None else []
+        )
         rows = [
+            {
+                "name": "Name",
+                "value": str(draft.get("name") or ""),
+                "keywords": "name local directory",
+                "edit_type": "input",
+                "on_change": lambda v: self._set_add_skill_field("name", v),
+            },
             {
                 "name": "Provider",
                 "value": str(draft.get("provider") or "clawhub"),
@@ -2378,19 +2416,12 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._set_add_skill_field("provider", v),
             },
             {
-                "name": "Name",
-                "value": str(draft.get("name") or ""),
-                "keywords": "name local directory",
-                "edit_type": "input",
-                "on_change": lambda v: self._set_add_skill_field("name", v),
-            },
-            {
                 "name": "Slug",
                 "value": str(draft.get("slug") or ""),
                 "keywords": "slug name owner",
                 "edit_type": "input",
                 "placeholder_value": (
-                    "@owner/skill-name" if provider == "clawhub" else "owner/skill-name"
+                    "@owner/skill-name" if provider == "clawhub" else "skill-name"
                 ),
                 "on_change": lambda v: self._set_add_skill_field("slug", v),
             },
@@ -2400,6 +2431,7 @@ class AgentTUIApp(App):
                 "keywords": "target app workspace",
                 "edit_type": "select",
                 "options": target_choices,
+                "disabled_options": disabled_targets,
                 "on_change": lambda v: self._set_add_skill_field("target", v),
             },
             {
@@ -2415,7 +2447,9 @@ class AgentTUIApp(App):
                 "value": str(draft.get("registry") or ""),
                 "keywords": "registry url",
                 "edit_type": "input",
-                "placeholder_value": "Default",
+                "placeholder_value": str(
+                    PROVIDERS.get(provider, {}).get("default_registry") or ""
+                ),
                 "on_change": lambda v: self._set_add_skill_field("registry", v),
             },
             {
@@ -2558,7 +2592,7 @@ class AgentTUIApp(App):
 
     def _settings_auto_compact_rows(self) -> list[dict]:
         bool_choices = [("true", "true"), ("false", "false")]
-        model_choices = self._model_profile_choices()
+        model_choice_groups = self._optional_model_choice_groups()
         return [
             {
                 "name": "Enable",
@@ -2589,20 +2623,20 @@ class AgentTUIApp(App):
                 ),
                 "keywords": "compact_model",
                 "edit_type": "select",
-                "options": model_choices,
+                "option_groups": model_choice_groups,
                 "on_change": lambda v: self._on_setting_compact_model_changed(v),
             },
         ]
 
     def _settings_memory_rows(self) -> list[dict]:
-        model_choices = self._model_profile_choices()
+        model_choice_groups = self._optional_model_choice_groups()
         return [
             {
                 "name": "Memory model",
                 "value": self._valid_optional_model_selection(self.config.memory_model),
                 "keywords": "memory_model",
                 "edit_type": "select",
-                "options": model_choices,
+                "option_groups": model_choice_groups,
                 "on_change": lambda v: self._on_setting_memory_model_changed(v),
             },
         ]
@@ -3621,14 +3655,17 @@ class AgentTUIApp(App):
                 self._process_command_message(user_text)
                 return
 
-            enriched_text, media_references = (
-                attach_external_file_references_with_media(user_text)
+            project = self._selected_project()
+            base_dir = project.path if project is not None else None
+            enriched_text, media_references, reference_folders = (
+                attach_external_file_references_with_media(user_text, base_dir)
             )
             response = self.chat.send_message(
                 enriched_text,
                 stream_callback_thinking=self.append_stream_thinking,
                 stream_callback_response=self.append_stream_response,
                 media_references=media_references,
+                reference_folders=reference_folders,
             )
             if response and not response.get("agent_stopped"):
                 self.chat.update_session_episodic_memory()
@@ -3852,12 +3889,57 @@ class AgentTUIApp(App):
             if isinstance(saved_transcript, list):
                 transcript = saved_transcript
         if transcript:
-            view.load_transcript(transcript)
+            project = self._selected_project()
+            base_dir = project.path if project is not None else None
+            transcript = self._restore_transcript_reference_content(
+                transcript, history, base_dir
+            )
+            view.load_transcript(transcript, base_dir)
             self.query_one("#chat-input", ChatInput).chat_active = True
             return
         for message in history:
             self._replay_history_message(view, message)
         self.query_one("#chat-input", ChatInput).chat_active = True
+
+    def _restore_transcript_reference_content(
+        self, transcript: list[dict], history: list[dict], base_dir=None
+    ) -> list[dict]:
+        user_contents = [
+            message.get("content", "")
+            for message in history
+            if isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content", ""), str)
+        ]
+        user_index = 0
+        restored = []
+        for entry in transcript:
+            item = dict(entry) if isinstance(entry, dict) else entry
+            if (
+                isinstance(item, dict)
+                and item.get("kind") == "message"
+                and item.get("role") == "user"
+            ):
+                if user_index < len(user_contents):
+                    source = self._reference_display_source(user_contents[user_index])
+                    if resolve_references(source, base_dir):
+                        item["content"] = source
+                user_index += 1
+            restored.append(item)
+        return restored
+
+    @staticmethod
+    def _reference_display_source(content: str) -> str:
+        text = str(content or "")
+        positions = [
+            position
+            for marker in (
+                "\n\n[Referenced external files]",
+                "\n\n[Referenced folders]",
+            )
+            if (position := text.find(marker)) >= 0
+        ]
+        return text[: min(positions)].rstrip() if positions else text
 
     def _replay_history_message(self, view: ChatView, message: dict) -> None:
         if not isinstance(message, dict):
@@ -3878,11 +3960,16 @@ class AgentTUIApp(App):
                 self._replay_tool_result_block(view, block)
             return
 
-        text = clean_display_text_preserve_newlines(content)
+        display_content = (
+            self._reference_display_source(content) if role == "user" else content
+        )
+        text = clean_display_text_preserve_newlines(display_content)
         if role == "user":
             view.reset_turn_summaries()
             if text:
-                view.add_message("user", text)
+                project = self._selected_project()
+                base_dir = project.path if project is not None else None
+                view.add_message("user", text, base_dir)
             return
         if text:
             view.add_status(f"{role.upper()}: {text}")

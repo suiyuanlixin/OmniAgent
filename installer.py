@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 
 
 DEFAULT_CLAWHUB_REGISTRY = "https://clawhub.ai"
-DEFAULT_SKILLHUB_REGISTRY = "https://skillhub.space"
+DEFAULT_SKILLHUB_REGISTRY = "https://api.skillhub.cn"
 CLAWHUB_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 CLAWHUB_OWNER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 LOCAL_SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -133,6 +133,8 @@ def normalize_provider_slug(provider, value):
     prefix = f"{provider}:"
     if text.startswith(prefix):
         text = text.split(":", 1)[1]
+    if provider == "skillhub" and text.startswith("skillhub/"):
+        text = text.split("/", 1)[1]
     if not PROVIDERS[provider]["pattern"].match(text):
         raise SkillInstallError(
             f"Invalid {PROVIDERS[provider]['label']} skill slug: {value}"
@@ -307,11 +309,23 @@ def install_registry_skill(
     install_dir = (skills_dir / local_name).resolve()
     _ensure_child(skills_dir, install_dir)
 
+    registry_version = ""
+    try:
+        registry_info = registry_inspect(
+            provider, slug, version=version, registry=registry
+        )
+    except SkillInstallError:
+        registry_info = None
+    else:
+        registry_version = _normalize_concrete_version(registry_info.get("version"))
+
     archive = _download_skill_archive(provider, slug, version, registry)
     archive_sha256 = hashlib.sha256(archive).hexdigest()
     bundle = _validated_skill_archive(archive)
     warnings = _security_warnings_from_texts(bundle["texts"], bundle["files"])
-    resolved_version = str(version or bundle.get("version") or "latest")
+    resolved_version = (
+        _normalize_concrete_version(bundle.get("version")) or registry_version or ""
+    )
 
     if dry_run:
         return SkillInstallResult(
@@ -347,6 +361,7 @@ def install_registry_skill(
             target,
             registry,
             resolved_version,
+            registry_version,
             archive_sha256,
             bundle["files"],
         )
@@ -386,6 +401,17 @@ def _api_url(provider, registry, path, params=None):
         or os.getenv(PROVIDERS[provider]["registry_env"])
         or PROVIDERS[provider]["default_registry"]
     ).rstrip("/")
+    if provider == "skillhub":
+        parsed = urllib.parse.urlparse(base)
+        host = str(parsed.netloc or "").strip().lower()
+        if host in {
+            "skillhub.cn",
+            "www.skillhub.cn",
+            "skillhub.space",
+            "www.skillhub.space",
+        }:
+            scheme = parsed.scheme or "https"
+            base = f"{scheme}://api.skillhub.cn"
     query = urllib.parse.urlencode(params or {})
     return f"{base}{path}" + (f"?{query}" if query else "")
 
@@ -479,7 +505,7 @@ def _download_skill_archive(provider, slug, version, registry):
             params["ownerHandle"] = owner_handle
     if version and version != "latest":
         params["version"] = str(version)
-    else:
+    elif provider != "skillhub":
         params["tag"] = "latest"
 
     urls = [_api_url(provider, registry, "/api/v1/download", params)]
@@ -629,7 +655,7 @@ def _validated_skill_archive(data):
         "contents": contents,
         "texts": texts,
         "files": sorted(files),
-        "version": _version_from_skill_md(texts.get("SKILL.md", "")),
+        "version": _version_from_meta_json(texts.get("_meta.json", "")),
     }
 
 
@@ -690,6 +716,7 @@ def _write_origin(
     target,
     registry,
     version,
+    registry_version,
     archive_sha256,
     files,
 ):
@@ -704,6 +731,7 @@ def _write_origin(
         "display_name": display_name,
         "target": target,
         "version": version,
+        "registry_version": registry_version,
         "archive_sha256": archive_sha256,
         "installed_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "files": files,
@@ -827,18 +855,21 @@ def _owner_handle(data):
     return str(handle or "")
 
 
-def _version_from_skill_md(text):
-    in_frontmatter = False
-    for line in str(text or "").splitlines():
-        stripped = line.strip()
-        if stripped == "---":
-            if in_frontmatter:
-                return ""
-            in_frontmatter = True
-            continue
-        if in_frontmatter and stripped.startswith("version:"):
-            return stripped.split(":", 1)[1].strip().strip("\"'")
-    return ""
+def _version_from_meta_json(text):
+    try:
+        data = json.loads(str(text or ""))
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return _normalize_concrete_version(data.get("version"))
+
+
+def _normalize_concrete_version(value):
+    text = str(value or "").strip()
+    if not text or text.lower() == "latest":
+        return ""
+    return text
 
 
 def _single_line(text, max_chars):

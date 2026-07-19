@@ -26,6 +26,7 @@ from textual.strip import Strip
 from textual.widgets import Static
 from textual.widget import Widget
 
+from references import resolve_references
 from tui.theme import (
     DIFF_ADD_BG,
     DIFF_ADD_FG,
@@ -33,7 +34,9 @@ from tui.theme import (
     DIFF_DEL_FG,
     INFO_BAR_BACKGROUND,
     PAGE_BACKGROUND,
+    REFERENCE_BACKGROUND,
     SURFACE_BACKGROUND,
+    TEXT_PRIMARY,
     TEXT_MUTED,
     render_css,
 )
@@ -609,7 +612,7 @@ class ChatView(Widget):
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
 
-    def add_message(self, role: str, content: str) -> None:
+    def add_message(self, role: str, content: str, reference_base_dir=None) -> None:
         self._activate_message_output()
         self._stream_target = None
         self._stream_role = None
@@ -623,6 +626,7 @@ class ChatView(Widget):
             role,
             content,
             assistant_markdown_enabled=self._assistant_markdown_enabled,
+            reference_base_dir=reference_base_dir,
         )
         self.query_one("#chat-log", VerticalScroll).mount(row)
         self.call_after_refresh(self._scroll_end)
@@ -934,10 +938,10 @@ class ChatView(Widget):
     def get_transcript(self) -> list[dict]:
         return deepcopy(self._transcript)
 
-    def load_transcript(self, transcript: list[dict]) -> None:
+    def load_transcript(self, transcript: list[dict], reference_base_dir=None) -> None:
         self.clear()
         for entry in list(transcript or []):
-            self._replay_transcript_entry(entry)
+            self._replay_transcript_entry(entry, reference_base_dir)
         self._reset_message_stream()
         self._thought_stream_target = None
         self._thought_stream_content = ""
@@ -961,7 +965,7 @@ class ChatView(Widget):
         entry.update(changes)
         self._transcript[index] = deepcopy(entry)
 
-    def _replay_transcript_entry(self, entry: dict) -> None:
+    def _replay_transcript_entry(self, entry: dict, reference_base_dir=None) -> None:
         if not isinstance(entry, dict):
             return
         kind = str(entry.get("kind") or "")
@@ -971,7 +975,7 @@ class ChatView(Widget):
             if role == "status":
                 self.add_status(content)
             elif role:
-                self.add_message(role, content)
+                self.add_message(role, content, reference_base_dir)
             return
         if kind == "thought":
             self.add_thought(
@@ -1086,7 +1090,10 @@ class ChatView(Widget):
 
 
 def _build_message_widgets(
-    role: str, content: str, assistant_markdown_enabled: bool = True
+    role: str,
+    content: str,
+    assistant_markdown_enabled: bool = True,
+    reference_base_dir=None,
 ):
     row_classes = "message-row"
     bubble_classes = "message-bubble"
@@ -1115,8 +1122,15 @@ def _build_message_widgets(
             expand=False,
         )
     elif role in {"user", "assistant"}:
+        rendered_content, copy_references = (
+            _reference_message_content(content, reference_base_dir)
+            if role == "user"
+            else (content, [])
+        )
         content_widget = SelectableMessageStatic(
-            content,
+            rendered_content,
+            copy_content=content,
+            copy_references=copy_references,
             classes=content_classes,
             markup=False,
             expand=False,
@@ -1142,6 +1156,25 @@ def _build_message_widgets(
             classes=bubble_classes,
         )
     return Horizontal(bubble, classes=row_classes), content_widget
+
+
+def _reference_message_content(content: str, base_dir=None):
+    source = str(content or "")
+    references = resolve_references(source, base_dir)
+    if not references:
+        return Text(source), []
+    result = Text()
+    copy_references = []
+    offset = 0
+    style = Style(color=TEXT_PRIMARY, bgcolor=REFERENCE_BACKGROUND)
+    for reference in references:
+        result.append(source[offset : reference.start])
+        display = f" {reference.display} "
+        result.append(display, style=style)
+        copy_references.append((display, reference.syntax))
+        offset = reference.end
+    result.append(source[offset:])
+    return result, copy_references
 
 
 class TopHalfSpacer(Static):
@@ -1182,8 +1215,10 @@ class SelectableMessageStatic(Static, can_focus=True):
         Binding("ctrl+a", "select_all", show=False, priority=True),
     ]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, copy_content=None, copy_references=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._copy_content = None if copy_content is None else str(copy_content)
+        self._copy_references = list(copy_references or [])
         self._selection_anchor = 0
         self._selection_focus = 0
         self._drag_selecting = False
@@ -1193,9 +1228,9 @@ class SelectableMessageStatic(Static, can_focus=True):
         self._render_cache_styled: Text | None = None
 
     def render(self):
-        start, end = self._selection_range()
-        if start == end:
+        if self._selection_anchor == self._selection_focus:
             return super().render()
+        start, end = self._selection_range()
         text = self._rendered_plain_text().copy()
         text.stylize("reverse", start, end)
         return text
@@ -1246,7 +1281,12 @@ class SelectableMessageStatic(Static, can_focus=True):
             self.release_mouse()
 
     def action_copy_selection(self) -> None:
-        selected = self.selected_text or self._raw_content()
+        if self._selection_anchor == self._selection_focus:
+            selected = self._copy_content or self._raw_content()
+        else:
+            selected = self.selected_text
+            for display, syntax in self._copy_references:
+                selected = selected.replace(display, syntax)
         if not selected:
             return
         self.app.copy_to_clipboard(selected)
@@ -1269,7 +1309,12 @@ class SelectableMessageStatic(Static, can_focus=True):
             self.refresh()
 
     def _raw_content(self) -> str:
-        return str(getattr(self, "content", "") or "")
+        content = getattr(self, "content", "")
+        return content.plain if isinstance(content, Text) else str(content or "")
+
+    def _styled_content(self) -> Text:
+        content = getattr(self, "content", "")
+        return content.copy() if isinstance(content, Text) else Text(str(content or ""))
 
     def _plain_content(self) -> str:
         self._rendered_plain_text()
@@ -1284,7 +1329,7 @@ class SelectableMessageStatic(Static, can_focus=True):
             and self._render_cache_styled is not None
         ):
             return self._render_cache_styled
-        base_text = Text(source)
+        base_text = self._styled_content()
         raw_lines = base_text.split("\n", include_separator=False)
         if not raw_lines:
             raw_lines = [Text("")]

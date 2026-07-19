@@ -388,6 +388,10 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Absolute path or workspace-relative path to the file.",
                 },
+                "reference": {
+                    "type": "string",
+                    "description": "Optional referenced folder label. Paths are relative to that read-only folder.",
+                },
                 "start_line": {
                     "type": "integer",
                     "description": "Optional 1-based first line to read.",
@@ -415,6 +419,10 @@ TOOL_DEFINITIONS = [
                 "path": {
                     "type": "string",
                     "description": "Optional workspace-relative or absolute directory path. Defaults to workspace root.",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "Optional referenced folder label. Paths are relative to that read-only folder.",
                 },
                 "recursive": {
                     "type": "boolean",
@@ -611,6 +619,10 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Optional workspace-relative or absolute directory/file path to search.",
                 },
+                "reference": {
+                    "type": "string",
+                    "description": "Optional referenced folder label. Paths are relative to that read-only folder.",
+                },
                 "include": {
                     "type": "string",
                     "description": "Optional filename glob such as *.py.",
@@ -632,7 +644,11 @@ TOOL_DEFINITIONS = [
                 "pattern": {
                     "type": "string",
                     "description": "Workspace-relative glob pattern, for example **/*.py.",
-                }
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "Optional referenced folder label used as the read-only glob root.",
+                },
             },
             "required": ["pattern"],
         },
@@ -933,6 +949,7 @@ class AgentTools:
         )
         self._display_payload = None
         self._session_original_contents = {}
+        self.reference_folders = {}
         self.begin_agent_session(clear_todos=False)
 
     @property
@@ -1316,6 +1333,15 @@ class AgentTools:
         self.session_mutating_commands = []
         self.output_needs_separator = False
 
+    def set_reference_folders(self, folders=None):
+        self.reference_folders = {
+            str(name): Path(path).resolve(strict=True)
+            for name, path in dict(folders or {}).items()
+        }
+
+    def clear_reference_folders(self):
+        self.reference_folders = {}
+
     def consume_output_separator(self):
         needs_separator = self.output_needs_separator
         self.output_needs_separator = False
@@ -1598,7 +1624,9 @@ class AgentTools:
         return "User answers:\n" + "\n".join(response_lines)
 
     def _read_file(self, tool_input):
-        file_path = self._resolve_path(_required_string(tool_input, "file_path"))
+        file_path = self._resolve_read_path(
+            _required_string(tool_input, "file_path"), tool_input.get("reference")
+        )
         if not file_path.is_file():
             raise AgentToolError(
                 f"File does not exist: {self._display_path(file_path)}"
@@ -1700,7 +1728,9 @@ class AgentTools:
         return result
 
     def _list_dir(self, tool_input):
-        root = self._resolve_path(str(tool_input.get("path") or "."))
+        root = self._resolve_read_path(
+            str(tool_input.get("path") or "."), tool_input.get("reference")
+        )
         if not root.exists():
             raise AgentToolError(f"Path does not exist: {self._display_path(root)}")
         if not root.is_dir():
@@ -2129,7 +2159,9 @@ class AgentTools:
 
     def _grep(self, tool_input):
         pattern = _required_string(tool_input, "pattern")
-        search_path = self._resolve_path(str(tool_input.get("path") or "."))
+        search_path = self._resolve_read_path(
+            str(tool_input.get("path") or "."), tool_input.get("reference")
+        )
         include = str(tool_input.get("include") or "*")
         case_sensitive = _optional_bool(tool_input, "case_sensitive", False)
         flags = 0 if case_sensitive else re.IGNORECASE
@@ -2173,7 +2205,15 @@ class AgentTools:
             raise AgentToolError(
                 "Glob pattern cannot contain parent directory references."
             )
-        if _looks_absolute(pattern):
+        reference = str(tool_input.get("reference") or "").strip()
+        if reference:
+            if _looks_absolute(pattern):
+                raise AgentToolError(
+                    "Referenced-folder glob patterns must be relative."
+                )
+            root = self._reference_root(reference)
+            matches = list(root.glob(pattern))
+        elif _looks_absolute(pattern):
             root = self._resolve_path(pattern)
             matches = [root] if root.exists() else []
         else:
@@ -2183,7 +2223,10 @@ class AgentTools:
         for path in matches:
             try:
                 resolved = path.resolve(strict=False)
-                self._ensure_inside_workspace(resolved)
+                if reference:
+                    self._ensure_inside_root(resolved, self._reference_root(reference))
+                else:
+                    self._ensure_inside_workspace(resolved)
             except AgentToolError:
                 continue
             if resolved.is_file():
@@ -2379,6 +2422,39 @@ class AgentTools:
         resolved = path.resolve(strict=False)
         self._ensure_inside_workspace(resolved)
         return resolved
+
+    def _resolve_read_path(self, path_value, reference=None):
+        reference = str(reference or "").strip()
+        if not reference:
+            return self._resolve_path(path_value)
+        path_text = str(path_value or "").strip()
+        if not path_text:
+            raise AgentToolError("Path cannot be empty.")
+        if _has_parent_reference(path_text) or _looks_absolute(path_text):
+            raise AgentToolError(
+                "Referenced-folder paths must be relative and cannot contain parent references."
+            )
+        root = self._reference_root(reference)
+        resolved = (root / path_text).resolve(strict=False)
+        self._ensure_inside_root(resolved, root)
+        return resolved
+
+    def _reference_root(self, reference):
+        folders = getattr(self, "reference_folders", {})
+        root = folders.get(str(reference))
+        if root is None:
+            raise AgentToolError(f"Referenced folder is unavailable: {reference}")
+        return root
+
+    def _ensure_inside_root(self, path, root):
+        root_value = os.path.normcase(str(root))
+        candidate = os.path.normcase(str(path))
+        try:
+            common = os.path.commonpath([root_value, candidate])
+        except ValueError as error:
+            raise AgentToolError("Path is outside the referenced folder.") from error
+        if common != root_value:
+            raise AgentToolError("Path is outside the referenced folder.")
 
     def _ensure_inside_workspace(self, path):
         workspace = os.path.normcase(str(self.workspace_dir))

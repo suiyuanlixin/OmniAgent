@@ -649,7 +649,9 @@ class OmniAgent:
         stream_callback_thinking=None,
         stream_callback_response=None,
         media_references=None,
+        reference_folders=None,
     ):
+        self.agent_tools.set_reference_folders(reference_folders)
         user_content = self._user_message_content(user_message, media_references)
         self.conversation_history.append({"role": "user", "content": user_content})
         self._record_preference_signal(user_message)
@@ -726,6 +728,8 @@ class OmniAgent:
                 self._separate_after_agent_thinking()
             print_error(f"Request error: {error}")
             return None
+        finally:
+            self.agent_tools.clear_reference_folders()
 
     def _agent_response(self):
         self.agent_running = True
@@ -4332,6 +4336,16 @@ class OmniAgent:
             prompt += (
                 "\n- Use web_search for recent, unstable, or external facts when local files "
                 "are insufficient. Cite source URLs from search results in the final answer."
+            )
+        reference_folders = getattr(self.agent_tools, "reference_folders", {})
+        if reference_folders:
+            labels = ", ".join(reference_folders)
+            prompt += (
+                "\n- The user referenced these folders for this request: "
+                f"{labels}. Access is read-only and lazy. Use read_file, list_dir, grep, "
+                "or glob with the reference parameter set to the exact label and a path "
+                "relative to that folder. Do not use write, patch, shell, or git tools on "
+                "referenced folders. This access expires after the request."
             )
         skills_prompt = self.agent_tools.skills_catalog_prompt()
         if skills_prompt:

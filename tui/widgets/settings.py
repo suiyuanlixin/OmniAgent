@@ -43,6 +43,10 @@ class _ValueTrigger(Static):
     can_focus = True
 
 
+class _SelectGroupToggle(Static):
+    can_focus = False
+
+
 class _ModelItem(Static):
     can_focus = True
 
@@ -418,8 +422,8 @@ class SettingsModal(ModalScreen[None]):
         border: none;
         outline: none;
         color: $TEXT_PRIMARY;
-        text-align: right;
-        content-align: right middle;
+        text-align: left;
+        content-align: left middle;
         padding: 0 1;
         margin: 0;
     }
@@ -434,6 +438,66 @@ class SettingsModal(ModalScreen[None]):
         background-tint: transparent;
         tint: transparent;
         color: $PAGE_BACKGROUND;
+    }
+
+    .settings-option-btn.selected,
+    .settings-option-btn.selected:focus,
+    .settings-option-btn.selected.-active {
+        color: $TEXT_PRIMARY;
+        text-style: bold;
+    }
+
+    .settings-option-btn.selected:hover {
+        background: $TEXT_PRIMARY;
+        color: $PAGE_BACKGROUND;
+    }
+
+    .settings-option-btn-disabled,
+    .settings-option-btn-disabled:hover,
+    .settings-option-btn-disabled:focus,
+    .settings-option-btn-disabled.-active {
+        background: $INFO_BAR_BACKGROUND;
+        color: $TEXT_MUTED;
+    }
+
+    .settings-option-group-title {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $TEXT_MUTED;
+        padding: 0 1;
+        text-align: left;
+        content-align: left middle;
+    }
+
+    .settings-option-group-gap {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+    }
+
+    .settings-select-group-toggle {
+        width: 100%;
+        height: 1;
+        color: $TEXT_MUTED;
+        background: transparent;
+        padding: 0 1 0 1;
+        content-align: left middle;
+    }
+
+    .settings-select-group-toggle:hover {
+        color: $TEXT_PRIMARY;
+    }
+
+    .settings-select-group-list {
+        width: 100%;
+        height: auto;
+        padding: 0;
+        margin: 0;
+    }
+
+    .settings-select-group-list.hidden {
+        display: none;
     }
 
     #settings-edit-input {
@@ -597,6 +661,9 @@ class SettingsModal(ModalScreen[None]):
         self._add_model_draft: dict[str, object] = {}
         self._editing_row_index: int | None = None
         self._select_open_index: int | None = None
+        self._select_group_toggle_api_types: dict[str, str] = {}
+        self._select_group_toggle_list_ids: dict[str, str] = {}
+        self._collapsed_select_groups: dict[str, set[str]] = {}
         self._render_generation: int = 0
         self._current_footer_actions: list[dict] = []
 
@@ -831,9 +898,25 @@ class SettingsModal(ModalScreen[None]):
             if row_index < 0 or row_index >= len(rows):
                 return
             row = rows[row_index]
-            options = list(row.get("options") or [])
+            options = self._select_options(row)
             if 0 <= option_index < len(options):
-                self._commit_select(row_index, str(options[option_index][1]))
+                option_value = str(options[option_index][1])
+                if option_value in self._disabled_option_values(row):
+                    return
+                self._commit_select(row_index, option_value)
+            return
+
+        if control_id.startswith("settings-select-group-toggle-"):
+            api_type = self._select_group_toggle_api_types.get(control_id)
+            list_id = self._select_group_toggle_list_ids.get(control_id)
+            parsed = self._parse_select_group_indices(control_id)
+            if api_type is None or list_id is None or parsed is None:
+                return
+            row_index, _group_index = parsed
+            rows = self._visible_rows()
+            if row_index < 0 or row_index >= len(rows):
+                return
+            self._toggle_select_group(rows[row_index], api_type, list_id)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "settings-search":
@@ -975,6 +1058,18 @@ class SettingsModal(ModalScreen[None]):
     def _model_group_list_id(self, group_index: int) -> str:
         return f"settings-model-group-list-{self._render_generation}-{group_index}"
 
+    def _select_group_toggle_id(self, row_index: int, group_index: int) -> str:
+        return (
+            f"settings-select-group-toggle-"
+            f"{self._render_generation}-{row_index}-{group_index}"
+        )
+
+    def _select_group_list_id(self, row_index: int, group_index: int) -> str:
+        return (
+            f"settings-select-group-list-"
+            f"{self._render_generation}-{row_index}-{group_index}"
+        )
+
     def _footer_action_id(self, action_index: int) -> str:
         return f"settings-footer-action-{self._render_generation}-{action_index}"
 
@@ -1005,6 +1100,17 @@ class SettingsModal(ModalScreen[None]):
         try:
             _generation, row_text, option_text = payload.split("-", 2)
             return int(row_text), int(option_text)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_select_group_indices(self, control_id: str) -> tuple[int, int] | None:
+        prefix = "settings-select-group-toggle-"
+        if not control_id.startswith(prefix):
+            return None
+        payload = control_id[len(prefix) :]
+        try:
+            _generation, row_text, group_text = payload.split("-", 2)
+            return int(row_text), int(group_text)
         except (TypeError, ValueError):
             return None
 
@@ -1066,10 +1172,58 @@ class SettingsModal(ModalScreen[None]):
                 return value
             return ""
         if edit_type == _EDIT_SELECT:
-            for label, opt_value in row.get("options") or []:
+            for label, opt_value in self._select_options(row):
                 if str(opt_value) == value:
                     return str(label)
         return value
+
+    def _select_groups(self, row: dict) -> list[dict]:
+        groups = list(row.get("option_groups") or [])
+        if groups:
+            return groups
+        options = list(row.get("options") or [])
+        if not options:
+            return []
+        return [{"title": "", "options": options}]
+
+    def _select_options(self, row: dict) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = []
+        for group in self._select_groups(row):
+            for label, opt_value in list(group.get("options") or []):
+                options.append((str(label), str(opt_value)))
+        return options
+
+    def _select_group_state_key(self, row: dict) -> str:
+        page_id = str(self._page_stack[-1] if self._page_stack else "")
+        name = str(row.get("name") or "")
+        keywords = str(row.get("keywords") or "")
+        return f"{page_id}:{name}:{keywords}"
+
+    def _collapsed_select_api_types(self, row: dict) -> set[str]:
+        key = self._select_group_state_key(row)
+        collapsed = self._collapsed_select_groups.setdefault(key, set())
+        return set(collapsed)
+
+    def _set_collapsed_select_api_types(self, row: dict, values: set[str]) -> None:
+        key = self._select_group_state_key(row)
+        self._collapsed_select_groups[key] = set(values)
+
+    def _toggle_select_group(self, row: dict, api_type: str, list_id: str) -> None:
+        try:
+            group_list = self.query_one(f"#{list_id}", Vertical)
+        except Exception:
+            return
+        collapsed = self._collapsed_select_api_types(row)
+        if group_list.has_class("hidden"):
+            group_list.remove_class("hidden")
+            collapsed.discard(api_type)
+        else:
+            group_list.add_class("hidden")
+            collapsed.add(api_type)
+        self._set_collapsed_select_api_types(row, collapsed)
+
+    def _disabled_option_values(self, row: dict) -> set[str]:
+        return {str(value) for value in list(row.get("disabled_options") or [])}
 
     def _activate_row(self, row_index: int) -> None:
         row = self._visible_rows()[row_index]
@@ -1399,24 +1553,118 @@ class SettingsModal(ModalScreen[None]):
                 )
             )
         elif edit_type == _EDIT_SELECT:
-            option_buttons = []
+            option_widgets = []
             display_value = self._display_value(row)
+            disabled_options = self._disabled_option_values(row)
             trigger_width = max(len(display_value) + 2, 7)
+            select_groups = self._select_groups(row)
+            grouped_select = bool(row.get("option_groups"))
+            selected_value = str(row.get("value") or "")
+            collapsed_api_types = self._collapsed_select_api_types(row)
+            selected_api_type = ""
+            for group in select_groups:
+                group_api_type = str(group.get("api_type") or "")
+                for _label, opt_value in list(group.get("options") or []):
+                    if str(opt_value) == selected_value:
+                        selected_api_type = group_api_type
+                        break
+                if selected_api_type:
+                    break
+            if selected_api_type:
+                collapsed_api_types.discard(selected_api_type)
+                self._set_collapsed_select_api_types(row, collapsed_api_types)
             option_width = max(
-                (len(str(label)) for label, _ in row.get("options") or []),
+                (
+                    len(str(label))
+                    for group in select_groups
+                    for label, _ in list(group.get("options") or [])
+                ),
                 default=0,
             )
+            option_width = max(
+                option_width,
+                max((len(str(group.get("title") or "")) for group in select_groups), default=0),
+            )
             option_width = max(option_width, len(display_value)) + 2
-            for option_index, (label, opt_value) in enumerate(row.get("options") or []):
-                option_buttons.append(
-                    _OptionItem(
-                        str(label),
-                        id=self._option_id(row_index, option_index),
-                        classes="settings-option-btn",
+            flat_option_index = 0
+            self._select_group_toggle_api_types = {
+                key: value
+                for key, value in self._select_group_toggle_api_types.items()
+                if not key.startswith(f"settings-select-group-toggle-{self._render_generation}-{row_index}-")
+            }
+            self._select_group_toggle_list_ids = {
+                key: value
+                for key, value in self._select_group_toggle_list_ids.items()
+                if not key.startswith(f"settings-select-group-toggle-{self._render_generation}-{row_index}-")
+            }
+            for group_index, group in enumerate(select_groups):
+                title = str(group.get("title") or "")
+                api_type = str(group.get("api_type") or "")
+                if grouped_select and title:
+                    if group_index > 0:
+                        option_widgets.append(
+                            Static("", classes="settings-select-group-gap settings-option-group-gap")
+                        )
+                    toggle_id = self._select_group_toggle_id(row_index, group_index)
+                    list_id = self._select_group_list_id(row_index, group_index)
+                    self._select_group_toggle_api_types[toggle_id] = api_type
+                    self._select_group_toggle_list_ids[toggle_id] = list_id
+                    option_widgets.append(
+                        _SelectGroupToggle(
+                            title,
+                            id=toggle_id,
+                            classes="settings-select-group-toggle",
+                        )
                     )
-                )
+                    list_classes = "settings-select-group-list"
+                    if api_type in collapsed_api_types:
+                        list_classes += " hidden"
+                    group_list_children = []
+                    for label, opt_value in list(group.get("options") or []):
+                        option_classes = "settings-option-btn"
+                        if str(opt_value) in disabled_options:
+                            option_classes += " settings-option-btn-disabled"
+                        if str(opt_value) == selected_value:
+                            option_classes += " selected"
+                        group_list_children.append(
+                            _OptionItem(
+                                str(label),
+                                id=self._option_id(row_index, flat_option_index),
+                                classes=option_classes,
+                            )
+                        )
+                        flat_option_index += 1
+                    group_list = Vertical(
+                        *group_list_children,
+                        id=list_id,
+                        classes=list_classes,
+                    )
+                    option_widgets.append(group_list)
+                    continue
+                if title:
+                    if group_index > 0:
+                        option_widgets.append(
+                            Static("", classes="settings-option-group-gap")
+                        )
+                    option_widgets.append(
+                        Static(title, classes="settings-option-group-title")
+                    )
+                for label, opt_value in list(group.get("options") or []):
+                    option_classes = "settings-option-btn"
+                    if str(opt_value) in disabled_options:
+                        option_classes += " settings-option-btn-disabled"
+                    if str(opt_value) == selected_value:
+                        option_classes += " selected"
+                    option_widgets.append(
+                        _OptionItem(
+                            str(label),
+                            id=self._option_id(row_index, flat_option_index),
+                            classes=option_classes,
+                        )
+                    )
+                    flat_option_index += 1
             options_container = Vertical(
-                *option_buttons,
+                *option_widgets,
                 id=self._options_id(row_index),
                 classes="settings-options",
             )

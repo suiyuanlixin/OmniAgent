@@ -336,7 +336,13 @@ class SkillRegistry:
         skill_md_path = skill.path / "SKILL.md"
         metadata = _read_skill_metadata(skill_md_path)
         origin = _read_origin_metadata(skill.path)
-        version = str(origin.get("version") or metadata.get("version") or "").strip()
+        meta_version = _read_meta_version(skill.path / "_meta.json")
+        version = (
+            _normalize_concrete_version(origin.get("version"))
+            or meta_version
+            or _normalize_concrete_version(origin.get("registry_version"))
+            or ""
+        )
         display_name = str(origin.get("display_name") or "").strip() or skill.name
         return {
             "name": display_name,
@@ -454,3 +460,20 @@ def _read_origin_metadata(skill_dir):
         if isinstance(data, dict):
             return data
     return {}
+
+
+def _read_meta_version(meta_file):
+    try:
+        data = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return _normalize_concrete_version(data.get("version"))
+
+
+def _normalize_concrete_version(value):
+    text = str(value or "").strip()
+    if not text or text.lower() == "latest":
+        return ""
+    return text
