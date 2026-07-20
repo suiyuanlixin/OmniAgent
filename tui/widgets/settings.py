@@ -33,6 +33,7 @@ _EDIT_ACTION = "action"
 
 _LAYOUT_LIST = "list"
 _LAYOUT_MODEL_LIST = "model_list"
+_LAYOUT_ARCHIVED_CHATS = "archived_chats"
 
 
 class _OptionItem(Static):
@@ -60,6 +61,14 @@ class _ModelGroupTitle(Static):
 
 
 class _FooterAction(Static):
+    can_focus = True
+
+
+class _ArchivedChatAction(Static):
+    can_focus = True
+
+
+class _ArchivedBulkAction(Static):
     can_focus = True
 
 
@@ -197,12 +206,126 @@ class SettingsModal(ModalScreen[None]):
     }
 
     #settings-search {
-        width: 100%;
+        width: 1fr;
+        min-width: 0;
         height: 1;
         border: none;
         background: transparent;
         color: $TEXT_PRIMARY;
         padding: 0;
+    }
+
+    #settings-search-row {
+        height: 1;
+    }
+
+    #settings-header-select-wrap {
+        display: none;
+        width: auto;
+        min-width: 0;
+        margin-left: 0;
+    }
+    #settings-header-select-wrap.visible {
+        display: block;
+    }
+    #settings-archived-bulk-wrap {
+        display: none;
+        width: auto;
+        min-width: 0;
+        margin-left: 0;
+    }
+    #settings-archived-bulk-wrap.visible {
+        display: block;
+    }
+    #settings-header-select-drop {
+        width: auto;
+        min-width: 0;
+        height: 1;
+    }
+    #settings-header-select-trigger,
+    #settings-header-select-trigger:hover,
+    #settings-header-select-trigger:focus,
+    #settings-header-select-trigger.-active {
+        width: auto;
+        min-width: 12;
+        height: 1;
+        background: $SURFACE_BACKGROUND;
+        background-tint: $SURFACE_BACKGROUND;
+        tint: transparent;
+        border: none;
+        outline: none;
+        color: $TEXT_PRIMARY;
+        padding: 0 1;
+        text-align: left;
+        content-align: left middle;
+    }
+    #settings-header-select-options {
+        display: none;
+        width: auto;
+        min-width: 0;
+        height: auto;
+        background: $INFO_BAR_BACKGROUND;
+        border: none;
+        padding: 0;
+        overlay: screen;
+        constrain: none inside;
+        align-horizontal: right;
+    }
+    #settings-header-select-options.open {
+        display: block;
+    }
+    .settings-header-select-option {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        background-tint: $INFO_BAR_BACKGROUND;
+        tint: transparent;
+        border: none;
+        outline: none;
+        color: $TEXT_PRIMARY;
+        padding: 0 1;
+        content-align: left middle;
+    }
+    .settings-header-select-option.selected {
+        text-style: bold;
+    }
+    .settings-header-select-option:hover,
+    .settings-header-select-option:focus,
+    .settings-header-select-option.-active {
+        background: $TEXT_PRIMARY;
+        background-tint: transparent;
+        tint: transparent;
+        color: $PAGE_BACKGROUND;
+    }
+    .settings-header-select-separator {
+        width: 100%;
+        height: 1;
+        background: $INFO_BAR_BACKGROUND;
+        color: $TEXT_MUTED;
+        content-align: center middle;
+    }
+    #settings-archived-bulk-action {
+        width: auto;
+        min-width: 10;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        background: transparent;
+        padding: 0 1;
+        text-align: center;
+        content-align: center middle;
+    }
+    #settings-archived-bulk-action:hover,
+    #settings-archived-bulk-action:focus,
+    #settings-archived-bulk-action.-active {
+        background: $TEXT_PRIMARY;
+        color: $PAGE_BACKGROUND;
+    }
+    #settings-archived-bulk-action.disabled,
+    #settings-archived-bulk-action.disabled:hover,
+    #settings-archived-bulk-action.disabled:focus,
+    #settings-archived-bulk-action.disabled.-active {
+        background: transparent;
+        color: $TEXT_MUTED;
     }
 
     .settings-row {
@@ -635,6 +758,49 @@ class SettingsModal(ModalScreen[None]):
         background: $TEXT_PRIMARY;
         color: $PAGE_BACKGROUND;
     }
+
+    .settings-archived-group-gap {
+        width: 100%;
+        height: 1;
+        background: transparent;
+    }
+    .settings-archived-group-title {
+        width: 100%;
+        height: 1;
+        color: $TEXT_MUTED;
+        background: transparent;
+        padding: 0;
+        content-align: left middle;
+    }
+    .settings-archived-row {
+        width: 100%;
+        height: 1;
+        margin: 0;
+    }
+    .settings-archived-title {
+        width: 1fr;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        background: transparent;
+        padding: 0;
+        content-align: left middle;
+    }
+    .settings-archived-action {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        background: transparent;
+        padding: 0 1;
+        text-align: center;
+        content-align: center middle;
+    }
+    .settings-archived-action:hover,
+    .settings-archived-action:focus,
+    .settings-archived-action.-active {
+        background: $TEXT_PRIMARY;
+        color: $PAGE_BACKGROUND;
+    }
     """
     )
 
@@ -666,6 +832,10 @@ class SettingsModal(ModalScreen[None]):
         self._collapsed_select_groups: dict[str, set[str]] = {}
         self._render_generation: int = 0
         self._current_footer_actions: list[dict] = []
+        self._header_select_options: list[dict] = []
+        self._archived_chat_actions: list[dict] = []
+        self._archived_bulk_paths: list[str] = []
+        self._list_content_rows: int = 0
 
         self.pages.setdefault(
             "add_model",
@@ -697,6 +867,20 @@ class SettingsModal(ModalScreen[None]):
                                     placeholder="Search settings",
                                     id="settings-search",
                                 )
+                                with Container(id="settings-header-select-wrap"):
+                                    with Container(id="settings-header-select-drop"):
+                                        yield _ValueTrigger(
+                                            "",
+                                            id="settings-header-select-trigger",
+                                        )
+                                        yield Vertical(
+                                            id="settings-header-select-options"
+                                        )
+                                with Container(id="settings-archived-bulk-wrap"):
+                                    yield _ArchivedBulkAction(
+                                        "",
+                                        id="settings-archived-bulk-action",
+                                    )
                             yield Static(
                                 id="settings-search-gap", classes="settings-gap"
                             )
@@ -740,6 +924,10 @@ class SettingsModal(ModalScreen[None]):
         control_id = self._click_target_id(event)
         if not control_id:
             return
+        if control_id != "settings-header-select-trigger" and not control_id.startswith(
+            "settings-header-select-option-"
+        ):
+            self._close_header_select()
 
         if control_id == "settings-close-btn":
             if len(self._page_stack) > 1:
@@ -818,6 +1006,50 @@ class SettingsModal(ModalScreen[None]):
             on_activate = action.get("on_activate")
             if callable(on_activate):
                 on_activate()
+            self._render_current_page(self._current_query())
+            return
+
+        if control_id == "settings-header-select-trigger":
+            self._toggle_header_select()
+            return
+
+        if control_id.startswith("settings-header-select-option-"):
+            index = self._parse_row_index(control_id, "settings-header-select-option-")
+            if index is None or index >= len(self._header_select_options):
+                return
+            option = self._header_select_options[index]
+            if (
+                bool(option.get("disabled"))
+                or str(option.get("type") or "") == "separator"
+            ):
+                return
+            on_change = self._current_page().get("on_header_select_change")
+            if callable(on_change):
+                on_change(str(option.get("value") or ""))
+            self._close_header_select()
+            self._render_current_page(self._current_query())
+            return
+
+        if control_id.startswith("settings-archived-action-"):
+            index = self._parse_row_index(control_id, "settings-archived-action-")
+            if index is None or index >= len(self._archived_chat_actions):
+                return
+            action = self._archived_chat_actions[index]
+            on_archived_action = self._current_page().get("on_archived_action")
+            if callable(on_archived_action):
+                on_archived_action(
+                    str(action.get("session_path") or ""),
+                    str(action.get("action") or ""),
+                )
+            self._render_current_page(self._current_query())
+            return
+
+        if control_id == "settings-archived-bulk-action":
+            if not self._archived_bulk_paths:
+                return
+            on_bulk_remove = self._current_page().get("on_archived_bulk_remove")
+            if callable(on_bulk_remove):
+                on_bulk_remove(list(self._archived_bulk_paths))
             self._render_current_page(self._current_query())
             return
 
@@ -920,6 +1152,7 @@ class SettingsModal(ModalScreen[None]):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "settings-search":
+            self._close_header_select()
             self._editing_row_index = None
             self._select_open_index = None
             self._render_current_page(event.value)
@@ -979,12 +1212,15 @@ class SettingsModal(ModalScreen[None]):
             pass
 
     def _render_current_page(self, query: str) -> None:
+        self._close_header_select()
         self._close_select_options()
         if self._editing_row_index is not None:
             self._finish_input_edit()
         self._update_chrome()
         if self._current_layout() == _LAYOUT_MODEL_LIST:
             self._render_model_page()
+        elif self._current_layout() == _LAYOUT_ARCHIVED_CHATS:
+            self._render_archived_chats_page(query)
         else:
             self._render_list_page(query)
         self.call_after_refresh(self._update_layout_constraints)
@@ -997,22 +1233,43 @@ class SettingsModal(ModalScreen[None]):
         add_button = self.query_one("#settings-model-add-top", _ModelAction)
         body = self.query_one("#settings-body", Vertical)
         search_row = self.query_one("#settings-search-row", Horizontal)
+        search_input = self.query_one("#settings-search", Input)
         search_gap = self.query_one("#settings-search-gap", Static)
         list_panel = self.query_one("#settings-list-panel", Vertical)
         model_panel = self.query_one("#settings-model-panel", Horizontal)
+        header_select_wrap = self.query_one("#settings-header-select-wrap", Container)
+        archived_bulk_wrap = self.query_one("#settings-archived-bulk-wrap", Container)
+        archived_bulk_action = self.query_one(
+            "#settings-archived-bulk-action", _ArchivedBulkAction
+        )
 
         title.update(str(page.get("title") or "Settings"))
         back_button.add_class("hidden")
         close_button.update("esc")
         add_button.update(str(page.get("add_label") or "Add model"))
+        search_input.placeholder = str(
+            page.get("search_placeholder") or "Search settings"
+        )
 
         show_search = bool(page.get("show_search", True)) and (
-            self._current_layout() == _LAYOUT_LIST
+            self._current_layout() in {_LAYOUT_LIST, _LAYOUT_ARCHIVED_CHATS}
         )
         search_row.display = show_search
         search_gap.display = show_search
-        list_panel.display = self._current_layout() == _LAYOUT_LIST
+        list_panel.display = self._current_layout() in {
+            _LAYOUT_LIST,
+            _LAYOUT_ARCHIVED_CHATS,
+        }
         model_panel.display = self._current_layout() == _LAYOUT_MODEL_LIST
+        if self._current_layout() == _LAYOUT_ARCHIVED_CHATS:
+            header_select_wrap.add_class("visible")
+            archived_bulk_wrap.add_class("visible")
+        else:
+            header_select_wrap.remove_class("visible")
+            archived_bulk_wrap.remove_class("visible")
+            self._header_select_options = []
+            self._archived_bulk_paths = []
+        archived_bulk_action.remove_class("disabled")
         body.styles.padding = (
             (0, 1, 0, 0)
             if self._current_layout() == _LAYOUT_MODEL_LIST
@@ -1072,6 +1329,9 @@ class SettingsModal(ModalScreen[None]):
 
     def _footer_action_id(self, action_index: int) -> str:
         return f"settings-footer-action-{self._render_generation}-{action_index}"
+
+    def _archived_action_id(self, action_index: int) -> str:
+        return f"settings-archived-action-{self._render_generation}-{action_index}"
 
     def _modalities_add_id(self, row_index: int) -> str:
         return f"settings-modal-add-{self._render_generation}-{row_index}"
@@ -1161,6 +1421,88 @@ class SettingsModal(ModalScreen[None]):
                 return str(control_id)
             control = getattr(control, "parent", None)
         return ""
+
+    def _header_select_option_id(self, option_index: int) -> str:
+        return f"settings-header-select-option-{self._render_generation}-{option_index}"
+
+    def _toggle_header_select(self) -> None:
+        if not self._header_select_options:
+            return
+        options_container = self.query_one("#settings-header-select-options", Vertical)
+        if options_container.has_class("open"):
+            options_container.remove_class("open")
+        else:
+            options_container.add_class("open")
+
+    def _close_header_select(self) -> None:
+        try:
+            options_container = self.query_one(
+                "#settings-header-select-options", Vertical
+            )
+        except Exception:
+            return
+        options_container.remove_class("open")
+
+    def _set_header_select_state(
+        self,
+        *,
+        label: str,
+        options: list[dict],
+        selected_value: str = "",
+    ) -> None:
+        wrap = self.query_one("#settings-header-select-wrap", Container)
+        trigger = self.query_one("#settings-header-select-trigger", _ValueTrigger)
+        drop = self.query_one("#settings-header-select-drop", Container)
+        options_container = self.query_one("#settings-header-select-options", Vertical)
+        self._header_select_options = [dict(option) for option in list(options or [])]
+        wrap.add_class("visible")
+        trigger_label = str(label or "").strip() or "All project"
+        trigger.update(trigger_label)
+        trigger_width = max(12, len(trigger_label) + 2)
+        drop.styles.width = trigger_width
+        drop.styles.min_width = trigger_width
+        trigger.styles.width = trigger_width
+        trigger.styles.min_width = trigger_width
+
+        longest_label = max([
+            len(trigger_label),
+            *[
+                len(str(option.get("label") or ""))
+                for option in self._header_select_options
+                if str(option.get("type") or "") != "separator"
+            ],
+        ])
+        option_width = max(14, longest_label + 2)
+        options_container.styles.width = option_width
+        options_container.styles.min_width = option_width
+        options_container.styles.offset = (trigger_width - option_width, 0)
+
+        for child in list(options_container.children):
+            child.remove()
+
+        separator_text = "\u2500" * max(1, option_width - 2)
+        for index, option in enumerate(self._header_select_options):
+            if str(option.get("type") or "") == "separator":
+                options_container.mount(
+                    Static(separator_text, classes="settings-header-select-separator")
+                )
+                continue
+            classes = "settings-header-select-option"
+            if str(option.get("value") or "") == selected_value:
+                classes += " selected"
+            options_container.mount(
+                _OptionItem(
+                    str(option.get("label") or ""),
+                    id=self._header_select_option_id(index),
+                    classes=classes,
+                )
+            )
+
+    def _archived_state(self, query: str) -> dict:
+        state = self._current_page().get("state") or {}
+        if callable(state):
+            state = state(query)
+        return dict(state or {})
 
     def _display_value(self, row: dict) -> str:
         value = str(row.get("value") or "")
@@ -1335,11 +1677,7 @@ class SettingsModal(ModalScreen[None]):
             list_scroll.styles.height = 1
             list_scroll.styles.max_height = 1
         else:
-            visible_rows = self._visible_rows()
-            list_needed = max(
-                1,
-                sum(self._estimated_row_height(row) for row in visible_rows) or 0,
-            )
+            list_needed = max(1, int(self._list_content_rows or 0))
             list_height = min(list_needed, available_height)
             list_scroll.styles.height = list_height
             list_scroll.styles.max_height = available_height
@@ -1368,6 +1706,7 @@ class SettingsModal(ModalScreen[None]):
         self._current_footer_actions = []
         self._render_generation += 1
         self._current_rows = self._page_rows()
+        self._list_content_rows = 0
         for child in list(settings_list.children):
             child.remove()
 
@@ -1382,10 +1721,103 @@ class SettingsModal(ModalScreen[None]):
             row["_visible"] = True
             row["_render_index"] = visible_count
             settings_list.mount(self._build_row_widget(row, visible_count))
+            self._list_content_rows += self._estimated_row_height(row)
             visible_count += 1
 
         if visible_count == 0:
             settings_list.mount(Static("No matching settings", classes="settings-name"))
+            self._list_content_rows = 1
+
+    def _render_archived_chats_page(self, query: str) -> None:
+        settings_list = self.query_one("#settings-list", Vertical)
+        try:
+            detail_footer = self.query_one("#settings-model-detail-footer", Horizontal)
+            for child in list(detail_footer.children):
+                child.remove()
+            detail_footer.remove_class("open")
+        except Exception:
+            pass
+        self._current_rows = []
+        self._current_footer_actions = []
+        self._archived_chat_actions = []
+        self._list_content_rows = 0
+        self._render_generation += 1
+        for child in list(settings_list.children):
+            child.remove()
+
+        state = self._archived_state(query)
+        self._archived_bulk_paths = [
+            str(path or "").strip()
+            for path in list(state.get("bulk_remove_paths") or [])
+            if str(path or "").strip()
+        ]
+        self._set_header_select_state(
+            label=str(state.get("filter_label") or "All project"),
+            options=list(state.get("filter_options") or []),
+            selected_value=str(state.get("filter_value") or ""),
+        )
+        bulk_action = self.query_one(
+            "#settings-archived-bulk-action", _ArchivedBulkAction
+        )
+        bulk_label = str(state.get("bulk_remove_label") or "Remove all")
+        bulk_action.update(bulk_label)
+        bulk_action.styles.width = max(10, len(bulk_label) + 2)
+        bulk_action.styles.min_width = max(10, len(bulk_label) + 2)
+        bulk_action.set_class(not self._archived_bulk_paths, "disabled")
+
+        groups = list(state.get("groups") or [])
+        if not groups:
+            settings_list.mount(
+                Static(
+                    str(state.get("empty_label") or "No archived chats"),
+                    classes="settings-name",
+                )
+            )
+            self._list_content_rows = 1
+            return
+
+        for group_index, group in enumerate(groups):
+            if group_index > 0:
+                settings_list.mount(Static("", classes="settings-archived-group-gap"))
+                self._list_content_rows += 1
+            settings_list.mount(
+                Static(
+                    str(group.get("title") or ""),
+                    classes="settings-archived-group-title",
+                )
+            )
+            self._list_content_rows += 1
+            for session in list(group.get("sessions") or []):
+                remove_index = len(self._archived_chat_actions)
+                self._archived_chat_actions.append({
+                    "action": "remove",
+                    "session_path": str(session.get("session_path") or ""),
+                })
+                unarchive_index = len(self._archived_chat_actions)
+                self._archived_chat_actions.append({
+                    "action": "unarchive",
+                    "session_path": str(session.get("session_path") or ""),
+                })
+                settings_list.mount(
+                    Horizontal(
+                        Static(
+                            str(session.get("title") or "New Chat"),
+                            classes="settings-archived-title",
+                        ),
+                        _ArchivedChatAction(
+                            "Remove",
+                            id=self._archived_action_id(remove_index),
+                            classes="settings-archived-action",
+                        ),
+                        _ArchivedChatAction(
+                            "Unarchive",
+                            id=self._archived_action_id(unarchive_index),
+                            classes="settings-archived-action",
+                        ),
+                        classes="settings-archived-row",
+                    )
+                )
+                self._list_content_rows += 1
 
     def _render_model_page(self) -> None:
         state = self._model_state()
@@ -1583,19 +2015,26 @@ class SettingsModal(ModalScreen[None]):
             )
             option_width = max(
                 option_width,
-                max((len(str(group.get("title") or "")) for group in select_groups), default=0),
+                max(
+                    (len(str(group.get("title") or "")) for group in select_groups),
+                    default=0,
+                ),
             )
             option_width = max(option_width, len(display_value)) + 2
             flat_option_index = 0
             self._select_group_toggle_api_types = {
                 key: value
                 for key, value in self._select_group_toggle_api_types.items()
-                if not key.startswith(f"settings-select-group-toggle-{self._render_generation}-{row_index}-")
+                if not key.startswith(
+                    f"settings-select-group-toggle-{self._render_generation}-{row_index}-"
+                )
             }
             self._select_group_toggle_list_ids = {
                 key: value
                 for key, value in self._select_group_toggle_list_ids.items()
-                if not key.startswith(f"settings-select-group-toggle-{self._render_generation}-{row_index}-")
+                if not key.startswith(
+                    f"settings-select-group-toggle-{self._render_generation}-{row_index}-"
+                )
             }
             for group_index, group in enumerate(select_groups):
                 title = str(group.get("title") or "")
@@ -1603,7 +2042,10 @@ class SettingsModal(ModalScreen[None]):
                 if grouped_select and title:
                     if group_index > 0:
                         option_widgets.append(
-                            Static("", classes="settings-select-group-gap settings-option-group-gap")
+                            Static(
+                                "",
+                                classes="settings-select-group-gap settings-option-group-gap",
+                            )
                         )
                     toggle_id = self._select_group_toggle_id(row_index, group_index)
                     list_id = self._select_group_list_id(row_index, group_index)

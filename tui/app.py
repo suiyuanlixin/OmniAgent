@@ -46,10 +46,12 @@ from session import (
     SESSION_TITLE_STATE_GENERATED,
     SESSION_TITLE_STATE_TEMPORARY,
     add_project,
+    archive_session,
     archive_project_sessions,
     create_session,
     delete_session,
     get_project_by_name,
+    list_archived_sessions,
     list_pinned_projects,
     list_pinned_sessions,
     list_sessions,
@@ -61,6 +63,7 @@ from session import (
     rename_project,
     rename_session,
     save_session_record,
+    unarchive_session,
     unpin_project,
     unpin_session,
 )
@@ -456,6 +459,7 @@ class AgentTUIApp(App):
         self._suppress_stream_output = False
         self._prompt_request: _InlinePromptRequest | None = None
         self._title_summary_sessions: set[str] = set()
+        self._archived_project_filter = "__all__"
 
     @property
     def config(self):
@@ -767,7 +771,7 @@ class AgentTUIApp(App):
         if not session_path or action not in {
             "pin",
             "unpin",
-            "delete",
+            "archive",
             "load",
             "rename",
         }:
@@ -779,9 +783,9 @@ class AgentTUIApp(App):
             elif action == "unpin":
                 unpin_session(session_path)
                 self.add_status_message("[✓]", "已取消置顶。")
-            elif action == "delete":
-                self._delete_session_record(session_path)
-                self.add_status_message("[✓]", "已删除对话。")
+            elif action == "archive":
+                self._archive_session_record(session_path)
+                self.add_status_message("[✓]", "已归档对话。")
             elif action == "rename":
                 renamed = rename_session(session_path, value)
                 if (
@@ -850,14 +854,14 @@ class AgentTUIApp(App):
                     self.current_session_record["project"] = updated.to_dict()
                 self.add_status_message("[✓]", "已重命名项目。")
             elif action == "archive":
-                deleted_count = archive_project_sessions(project_slug)
+                archived_count = archive_project_sessions(project_slug)
                 if (
                     current_session_project is not None
                     and current_session_project.slug == project_slug
                 ):
                     self._clear_loaded_session_state(refresh_sidebar=False)
                 self.add_status_message(
-                    "[✓]", f"已归档项目对话，共删除 {deleted_count} 个对话。"
+                    "[✓]", f"已归档项目对话，共归档 {archived_count} 个对话。"
                 )
             elif action == "remove":
                 removed = remove_project(project_slug)
@@ -1718,6 +1722,137 @@ class AgentTUIApp(App):
             return
         self.add_status_message("[✓]", f"已保存 {USER_PROMPT_FILE}")
 
+    def _normalize_archived_project_filter(self, value: str) -> str:
+        filter_value = str(value or "").strip()
+        if filter_value == "__none__":
+            return "__none__"
+        valid_slugs = {project.slug for project in load_projects()}
+        if filter_value in valid_slugs:
+            return filter_value
+        return "__all__"
+
+    def _archived_project_filter_options(self) -> list[dict]:
+        projects = load_projects()
+        options = [{"label": "All project", "value": "__all__"}]
+        options.append({"type": "separator"})
+        options.extend(
+            {"label": project.name, "value": project.slug} for project in projects
+        )
+        options.append({"type": "separator"})
+        options.append({"label": "Without project", "value": "__none__"})
+        return options
+
+    def _archived_project_filter_label(self) -> str:
+        filter_value = self._normalize_archived_project_filter(
+            self._archived_project_filter
+        )
+        if filter_value == "__none__":
+            return "Without project"
+        if filter_value == "__all__":
+            return "All project"
+        for project in load_projects():
+            if project.slug == filter_value:
+                return project.name
+        return "All project"
+
+    def _on_archived_project_filter_changed(self, value: str) -> None:
+        self._archived_project_filter = self._normalize_archived_project_filter(value)
+
+    def _on_archived_chat_action(self, session_path: str, action: str) -> None:
+        action_name = str(action or "").strip().lower()
+        session_path = str(session_path or "").strip()
+        if not session_path:
+            return
+        if action_name == "unarchive":
+            self._unarchive_session_record(session_path)
+            self.add_status_message("[✓]", "已取消归档对话。")
+        elif action_name == "remove":
+            self._delete_session_record(session_path)
+            self.add_status_message("[✓]", "已永久删除对话。")
+        else:
+            return
+        self._refresh_project_views()
+
+    def _on_archived_bulk_remove(self, session_paths: list[str]) -> None:
+        paths = [
+            str(path or "").strip()
+            for path in list(session_paths or [])
+            if str(path or "").strip()
+        ]
+        if not paths:
+            return
+        for session_path in paths:
+            self._delete_session_record(session_path)
+        self._refresh_project_views()
+        self.add_status_message("[✓]", f"已永久删除 {len(paths)} 个对话。")
+
+    def _settings_archived_chats_state(self, query: str = "") -> dict:
+        self._archived_project_filter = self._normalize_archived_project_filter(
+            self._archived_project_filter
+        )
+        normalized_query = " ".join(str(query or "").strip().lower().split())
+        selected_filter = self._archived_project_filter
+        project_order = {
+            project.slug: index for index, project in enumerate(load_projects())
+        }
+        groups_by_key: dict[str, dict] = {}
+        filtered_session_paths: list[str] = []
+
+        for session in list_archived_sessions():
+            session_path = str(session.get("session_path") or "").strip()
+            if not session_path:
+                continue
+            project_data = session.get("project") or {}
+            project_name = str(project_data.get("name") or "").strip()
+            project_slug = str(project_data.get("slug") or "").strip()
+            group_value = project_slug if project_name else "__none__"
+            if selected_filter == "__none__" and project_name:
+                continue
+            if (
+                selected_filter not in {"__all__", "__none__"}
+                and project_slug != selected_filter
+            ):
+                continue
+
+            title = str(session.get("title") or "New Chat")
+            search_text = f"{title} {project_name}".lower()
+            if normalized_query and normalized_query not in search_text:
+                continue
+            filtered_session_paths.append(session_path)
+
+            if group_value not in groups_by_key:
+                if project_name:
+                    order = (
+                        0,
+                        project_order.get(project_slug, len(project_order)),
+                        project_name.lower(),
+                    )
+                    group_title = project_name
+                else:
+                    order = (2, 0, "")
+                    group_title = "Without project"
+                groups_by_key[group_value] = {
+                    "title": group_title,
+                    "order": order,
+                    "sessions": [],
+                }
+
+            groups_by_key[group_value]["sessions"].append({
+                "title": title,
+                "session_path": session_path,
+            })
+
+        groups = sorted(groups_by_key.values(), key=lambda item: item["order"])
+        return {
+            "filter_label": self._archived_project_filter_label(),
+            "filter_value": selected_filter,
+            "filter_options": self._archived_project_filter_options(),
+            "bulk_remove_label": "Remove all",
+            "bulk_remove_paths": filtered_session_paths,
+            "groups": groups,
+            "empty_label": "No archived chats",
+        }
+
     def _settings_pages(self) -> dict[str, dict]:
         return {
             "root": {
@@ -1729,6 +1864,15 @@ class AgentTUIApp(App):
                 "title": "General",
                 "layout": "list",
                 "rows": self._settings_general_rows,
+            },
+            "archived_chats": {
+                "title": "Archived chats",
+                "layout": "archived_chats",
+                "search_placeholder": "Search archived chats",
+                "state": self._settings_archived_chats_state,
+                "on_header_select_change": self._on_archived_project_filter_changed,
+                "on_archived_bulk_remove": self._on_archived_bulk_remove,
+                "on_archived_action": self._on_archived_chat_action,
             },
             "model_list": {
                 "title": "Model list",
@@ -1850,6 +1994,13 @@ class AgentTUIApp(App):
                 "keywords": "web search web_search",
                 "edit_type": "nav",
                 "target_page": "web_search",
+            },
+            {
+                "name": "Archived chats",
+                "value": ">",
+                "keywords": "archived chats archive chat history",
+                "edit_type": "nav",
+                "target_page": "archived_chats",
             },
         ]
 
@@ -3601,6 +3752,14 @@ class AgentTUIApp(App):
         if refresh_sidebar:
             self._refresh_project_views()
 
+    def _archive_session_record(self, session_path: str) -> None:
+        current_path = str(
+            (self.current_session_record or {}).get("session_path") or ""
+        ).strip()
+        archive_session(session_path)
+        if current_path and current_path == str(session_path).strip():
+            self._clear_loaded_session_state(refresh_sidebar=False)
+
     def _delete_session_record(self, session_path: str) -> None:
         current_path = str(
             (self.current_session_record or {}).get("session_path") or ""
@@ -3608,6 +3767,9 @@ class AgentTUIApp(App):
         delete_session(session_path)
         if current_path and current_path == str(session_path).strip():
             self._clear_loaded_session_state(refresh_sidebar=False)
+
+    def _unarchive_session_record(self, session_path: str) -> None:
+        unarchive_session(session_path)
 
     def _ensure_ready_for_message(self) -> None:
         if self.current_session_record is None:

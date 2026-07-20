@@ -695,10 +695,10 @@ class Sidebar(Vertical):
 
         delete_item = Static(
             "Archive chat",
-            id=f"session-action-delete-{item_id}",
+            id=f"session-action-archive-{item_id}",
             classes=menu_item_classes,
         )
-        delete_item.data_action = "delete"
+        delete_item.data_action = "archive"
         delete_item.data_path = session_path
 
         entry = Vertical(

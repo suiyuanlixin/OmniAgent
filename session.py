@@ -20,7 +20,7 @@ PINNED_INDEX_FILE = SESSIONS_DIR / "pinned.json"
 PINNED_PROJECT_INDEX_FILE = SESSIONS_DIR / "pinned_projects.json"
 PROJECTS_DIR = SESSIONS_DIR / "projects"
 ORPHAN_SESSIONS_DIR = SESSIONS_DIR / "orphan"
-SESSION_VERSION = "4.0.0"
+SESSION_VERSION = "5.0.0"
 SESSION_TITLE_STATE_MANUAL = "manual"
 SESSION_TITLE_STATE_TEMPORARY = "temporary"
 SESSION_TITLE_STATE_GENERATED = "generated"
@@ -93,6 +93,18 @@ def normalize_session_path(session_path):
     except OSError:
         return ""
     return str(path)
+
+
+def is_session_archived(record):
+    return bool(str((record or {}).get("archived_at") or "").strip())
+
+
+def _sort_sessions(sessions):
+    sessions.sort(
+        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    return sessions
 
 
 def _load_pinned_index():
@@ -217,7 +229,7 @@ def list_pinned_sessions():
     missing = False
     for session_path in list_pinned_session_paths():
         record = load_session(session_path)
-        if record is None:
+        if record is None or is_session_archived(record):
             missing = True
             continue
         sessions.append(record)
@@ -403,6 +415,7 @@ def create_session(project=None, title="", model_name=""):
         "model_name": str(model_name or "").strip(),
         "created_at": now,
         "updated_at": now,
+        "archived_at": "",
         "project": project.to_dict() if isinstance(project, ProjectRecord) else None,
         "conversation": [],
         "history_path": str(paths["history"]),
@@ -470,7 +483,7 @@ def save_conversation(conversation_history, model_name, session_record=None):
     return True
 
 
-def list_sessions(project=None):
+def list_sessions(project=None, include_archived=False):
     ensure_session_storage()
     directory = _project_sessions_dir(project)
     if not directory.exists():
@@ -486,13 +499,27 @@ def list_sessions(project=None):
         data["session_path"] = str(path)
         history_path = path.with_suffix(".history.jsonl")
         data["history_path"] = str(history_path)
+        if (not include_archived) and is_session_archived(data):
+            continue
         sessions.append(data)
 
-    sessions.sort(
-        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
-        reverse=True,
+    return _sort_sessions(sessions)
+
+
+def list_archived_sessions():
+    sessions = []
+    for project in load_projects():
+        sessions.extend(
+            session
+            for session in list_sessions(project, include_archived=True)
+            if is_session_archived(session)
+        )
+    sessions.extend(
+        session
+        for session in list_sessions(None, include_archived=True)
+        if is_session_archived(session)
     )
-    return sessions
+    return _sort_sessions(sessions)
 
 
 def load_session(session_path):
@@ -521,15 +548,40 @@ def rename_session(session_path, new_title):
     return record
 
 
+def archive_session(session_path):
+    path = Path(str(session_path))
+    record = load_session(path)
+    if not record:
+        raise ValueError("Session not found.")
+    if is_session_archived(record):
+        return record
+    record["archived_at"] = datetime.now().isoformat(timespec="seconds")
+    normalized = normalize_session_path(path)
+    if normalized:
+        unpin_session(normalized)
+    _safe_write_json(path, record)
+    return record
+
+
+def unarchive_session(session_path):
+    path = Path(str(session_path))
+    record = load_session(path)
+    if not record:
+        raise ValueError("Session not found.")
+    record["archived_at"] = ""
+    _safe_write_json(path, record)
+    return record
+
+
 def archive_project_sessions(project_slug):
     project = get_project_by_slug(project_slug)
     if project is None:
         raise ValueError("Project not found.")
-    deleted = 0
+    archived = 0
     for record in list_sessions(project):
-        delete_session(str(record.get("session_path") or ""))
-        deleted += 1
-    return deleted
+        archive_session(str(record.get("session_path") or ""))
+        archived += 1
+    return archived
 
 
 def delete_session(session_path):
@@ -559,7 +611,8 @@ def remove_project(project_slug):
     if project is None:
         raise ValueError("Project not found.")
 
-    archive_project_sessions(slug)
+    for record in list_sessions(project, include_archived=True):
+        delete_session(str(record.get("session_path") or ""))
     unpin_project(slug)
 
     projects = [row for row in load_projects() if row.slug != slug]
