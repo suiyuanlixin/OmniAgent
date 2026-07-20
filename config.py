@@ -72,7 +72,7 @@ REASONING_EFFORTS_BY_API = {
     API_TYPE_ANTHROPIC: ("low", "medium", "high", "xhigh", "max"),
     API_TYPE_GLM: ("low", "medium", "high", "xhigh", "max"),
     API_TYPE_GEMINI: ("minimal", "low", "medium", "high"),
-    API_TYPE_OLLAMA: ("low", "medium", "high", "max"),
+    API_TYPE_OLLAMA: ("low", "medium", "high"),
 }
 SUPPORTED_API_TYPES = {
     API_TYPE_GLM,
@@ -420,8 +420,8 @@ def normalize_reasoning_effort_for_api(api_type, effort):
     elif normalized == API_TYPE_OLLAMA:
         if parsed == "minimal":
             return "low"
-        if parsed == "xhigh":
-            return "max"
+        if parsed in {"xhigh", "max"}:
+            return "high"
     supported = supported_reasoning_efforts(normalized)
     return supported[-1] if supported else ""
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from rich.markup import escape as escape_markup
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -460,6 +461,7 @@ class AgentTUIApp(App):
         self._prompt_request: _InlinePromptRequest | None = None
         self._title_summary_sessions: set[str] = set()
         self._archived_project_filter = "__all__"
+        self._interrupt_send_payload: tuple[str, str] | None = None
 
     @property
     def config(self):
@@ -617,10 +619,28 @@ class AgentTUIApp(App):
 
     def on_chat_input_send(self, event: ChatInput.Send) -> None:
         if self.chat_busy:
-            self.add_status_message("[!]", "上一条消息还在处理中。")
+            self.query_one("#chat-input", ChatInput).enqueue_pending_message(
+                event.content,
+                event.display_content,
+            )
             return
+        self._dispatch_user_message(event.content, event.display_content)
 
-        is_command = str(event.content or "").startswith("/")
+    def on_chat_input_direct_send_requested(
+        self, event: ChatInput.DirectSendRequested
+    ) -> None:
+        if self.chat_busy and self.chat is not None:
+            self._interrupt_send_payload = (event.content, event.display_content)
+            self._interrupt_active_response()
+            return
+        self._dispatch_user_message(event.content, event.display_content)
+
+    def _dispatch_user_message(
+        self, content: str, display_content: str | None = None
+    ) -> None:
+        display_content = content if display_content is None else display_content
+
+        is_command = str(content or "").startswith("/")
         if not is_command:
             try:
                 self._ensure_ready_for_message()
@@ -633,11 +653,11 @@ class AgentTUIApp(App):
             self.start_chat()
             project = self._selected_project()
             base_dir = project.path if project is not None else None
-            chat_view.add_message("user", event.content, base_dir)
+            chat_view.add_message("user", content, base_dir)
         chat_view.reset_turn_summaries()
         self._set_controls_locked(True)
-        self._set_input_enabled(False)
         self.chat_busy = True
+        self.query_one("#chat-input", ChatInput).set_chat_busy(True)
         self._suppress_stream_output = False
         self._message_started_at = perf_counter()
         self._thinking_started_at = None
@@ -647,11 +667,11 @@ class AgentTUIApp(App):
             and (not self.current_session_record.get("conversation"))
         )
         if new_session:
-            self._update_new_session_title_from_text(event.display_content)
+            self._update_new_session_title_from_text(display_content)
             self._maybe_schedule_session_title_summary()
         worker = threading.Thread(
             target=self._process_user_message,
-            args=(event.content,),
+            args=(content,),
             daemon=True,
         )
         worker.start()
@@ -909,16 +929,7 @@ class AgentTUIApp(App):
         if self._prompt_request is not None:
             self._dismiss_inline_prompt()
             return
-        if self.chat_busy and self.chat is not None:
-            self._suppress_stream_output = True
-            self._pause_thinking_elapsed_timer()
-            self._call_ui(
-                self._finish_thought_stream_widget,
-                self._elapsed_since_thinking(),
-            )
-            self._thinking_started_at = None
-            self._stream_kind = None
-            self.chat.request_agent_stop()
+        if self._interrupt_active_response():
             return
         if self.sidebar_visible:
             self.toggle_sidebar()
@@ -972,7 +983,7 @@ class AgentTUIApp(App):
         self._call_ui(self._show_notification, text)
 
     def _show_notification(self, text: str) -> None:
-        self.notify(text, severity="information")
+        self.notify(escape_markup(text), severity="information")
 
     def add_thinking_message(self, content) -> None:
         if self._suppress_stream_output:
@@ -1688,6 +1699,34 @@ class AgentTUIApp(App):
     def _set_input_enabled(self, enabled: bool) -> None:
         widget = self.query_one("#message-input", TextArea)
         widget.disabled = not enabled
+
+    def _interrupt_active_response(self) -> bool:
+        if not (self.chat_busy and self.chat is not None):
+            return False
+        self._suppress_stream_output = True
+        self._pause_thinking_elapsed_timer()
+        self._call_ui(
+            self._finish_thought_stream_widget,
+            self._elapsed_since_thinking(),
+        )
+        self._thinking_started_at = None
+        self._stream_kind = None
+        self.chat.request_agent_stop()
+        return True
+
+    def _maybe_dispatch_pending_message(self) -> None:
+        if self.chat_busy:
+            return
+        chat_input = self.query_one("#chat-input", ChatInput)
+        payload = self._interrupt_send_payload
+        if payload is not None:
+            self._interrupt_send_payload = None
+            self._dispatch_user_message(payload[0], payload[1])
+            return
+        queued = chat_input.pop_next_pending_message()
+        if queued is None:
+            return
+        self._dispatch_user_message(queued[0], queued[1])
 
     def _open_settings(self, page_id: str = "root") -> None:
         self.push_screen(
@@ -3725,6 +3764,7 @@ class AgentTUIApp(App):
         self._set_todo_panel_items([])
         self._stream_kind = None
         self._suppress_stream_output = False
+        self._interrupt_send_payload = None
         self._set_input_enabled(True)
         self._set_context_label(0, self.config.context_window_tokens)
         self._set_controls_locked(False)
@@ -3738,6 +3778,8 @@ class AgentTUIApp(App):
         interrupt_hint = self.query_one("#interrupt-hint", Horizontal)
         project_title = self.query_one("#project-title", Static)
         chat_input.chat_active = False
+        chat_input.set_chat_busy(False)
+        chat_input.clear_pending_messages()
         chat_input.set_prompt_state(active=False)
         chat_input.remove_class("stretch")
         info_bar_shell.remove_class("stretch")
@@ -3890,6 +3932,7 @@ class AgentTUIApp(App):
     def _finish_open_settings_page_command(self, page_id: str) -> None:
         self.chat_busy = False
         self._suppress_stream_output = False
+        self.query_one("#chat-input", ChatInput).set_chat_busy(False)
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
@@ -3898,6 +3941,7 @@ class AgentTUIApp(App):
     def _finish_open_memory_command(self) -> None:
         self.chat_busy = False
         self._suppress_stream_output = False
+        self.query_one("#chat-input", ChatInput).set_chat_busy(False)
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
@@ -3906,6 +3950,7 @@ class AgentTUIApp(App):
     def _after_command(self, base: str, should_continue) -> None:
         self.chat_busy = False
         self._suppress_stream_output = False
+        self.query_one("#chat-input", ChatInput).set_chat_busy(False)
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
@@ -3918,6 +3963,7 @@ class AgentTUIApp(App):
             self.add_status_message("[✓]", "对话历史已清空。")
             return
         self._persist_current_session()
+        self._maybe_dispatch_pending_message()
 
     def _finish_response(self, response) -> None:
         self._pause_thinking_elapsed_timer()
@@ -3926,6 +3972,7 @@ class AgentTUIApp(App):
         )
         self.chat_busy = False
         self._suppress_stream_output = False
+        self.query_one("#chat-input", ChatInput).set_chat_busy(False)
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
@@ -3934,6 +3981,7 @@ class AgentTUIApp(App):
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
+        self._maybe_dispatch_pending_message()
 
     def _maybe_show_changed_files(self) -> None:
         if self.chat is None:
@@ -3953,6 +4001,7 @@ class AgentTUIApp(App):
         )
         self.chat_busy = False
         self._suppress_stream_output = False
+        self.query_one("#chat-input", ChatInput).set_chat_busy(False)
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
@@ -3960,6 +4009,7 @@ class AgentTUIApp(App):
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
+        self._maybe_dispatch_pending_message()
 
     def _display_response(self, response) -> None:
         if not response:

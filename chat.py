@@ -204,6 +204,18 @@ def _with_persistent_memory(base_prompt, memory_store):
     return f"{base_prompt}\n\n{memory_block}"
 
 
+def _format_stream_error_message(error):
+    text = str(error or "").strip()
+    if not text:
+        return "流式请求失败。"
+    if "validation errors for ChatRequest" in text and "think." in text:
+        return "流式请求失败：当前 Ollama thinking 强度仅支持 low / medium / high。"
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), text)
+    if len(first_line) > 180:
+        first_line = first_line[:177].rstrip() + "..."
+    return f"流式请求失败：{first_line}"
+
+
 class OmniAgent:
     def __init__(
         self,
@@ -1351,7 +1363,7 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
-            print_error(f"Stream error: {error}")
+            print_error(_format_stream_error_message(error))
             return None
 
     def _stream_chat_completion_normal_web_search_turn(
@@ -1596,7 +1608,7 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
-            print_error(f"Stream error: {error}")
+            print_error(_format_stream_error_message(error))
             return None
 
     def _stream_ollama_normal_web_search_turn(
@@ -1834,7 +1846,7 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
-            print_error(f"Stream error: {error}")
+            print_error(_format_stream_error_message(error))
             return None
 
     def _stream_anthropic_normal_web_search_turn(
@@ -3667,7 +3679,7 @@ class OmniAgent:
             }
 
         except Exception as error:
-            print_error(f"Stream error: {error}")
+            print_error(_format_stream_error_message(error))
             return None
 
     def _stream_ollama_response(
@@ -3758,7 +3770,7 @@ class OmniAgent:
             }
 
         except Exception as error:
-            print_error(f"Stream error: {error}")
+            print_error(_format_stream_error_message(error))
             return None
 
     def _stream_anthropic_response(
@@ -3951,7 +3963,7 @@ class OmniAgent:
             }
 
         except Exception as error:
-            print_error(f"Stream error: {error}")
+            print_error(_format_stream_error_message(error))
             return None
 
     def _parse_response(self, response):

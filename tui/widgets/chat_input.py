@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -43,6 +44,7 @@ PLAN_OPTIONS_WIDTH = (
 )
 COMMAND_MENU_MAX_HEIGHT = 10
 INPUT_MAX_HEIGHT = 10
+MAX_PENDING_MESSAGES = 5
 MODIFIER_LATCH_WINDOW = 0.12
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
@@ -70,6 +72,13 @@ class InputReference:
     start: int
     end: int
     syntax: str
+
+
+@dataclass
+class PendingMessageEntry:
+    message_id: int
+    content: str
+    display_content: str
 
 
 try:
@@ -242,6 +251,45 @@ class PromptOptionRow(Static, can_focus=False):
         event.stop()
 
 
+class PendingMessageRow(Static, can_focus=False):
+    class Selected(Message):
+        def __init__(self, message_id: int) -> None:
+            super().__init__()
+            self.message_id = int(message_id)
+
+    def __init__(self, message_id: int, text: str) -> None:
+        super().__init__("", classes="pending-item")
+        self.message_id = int(message_id)
+        self.label_text = str(text or "")
+
+    def render(self) -> Text:
+        width = max(1, self.size.width)
+        display_text = " ".join(self.label_text.splitlines())
+        content = Text(no_wrap=True, overflow="crop")
+        content.append(
+            display_text,
+            style=Style(color=TEXT_PRIMARY, bgcolor=SURFACE_BACKGROUND),
+        )
+        content.truncate(width, overflow="crop", pad=True)
+        return content
+
+    def on_click(self, event: events.Click) -> None:
+        self.post_message(self.Selected(self.message_id))
+        event.stop()
+
+
+class PendingSendButton(Button):
+    def __init__(self, message_id: int) -> None:
+        super().__init__("↑", classes="pending-send")
+        self.message_id = int(message_id)
+
+
+class PendingDeleteButton(Button):
+    def __init__(self, message_id: int) -> None:
+        super().__init__("×", classes="pending-delete")
+        self.message_id = int(message_id)
+
+
 class ModelGroupToggle(Static, can_focus=False):
     pass
 
@@ -286,6 +334,9 @@ class MessageTextArea(TextArea):
         self._last_paste_at = 0.0
         self._input_references = []
         self._normalizing_references = False
+        self._suppress_placeholder = False
+        self._placeholder_background = SURFACE_BACKGROUND
+        self.pending_message_id: int | None = None
 
     async def _on_key(self, event: events.Key) -> None:
         if self._is_undo_granularity_key(event):
@@ -326,7 +377,7 @@ class MessageTextArea(TextArea):
         self._owner._insert_message_newline(self)
 
     def action_chat_submit(self) -> None:
-        self._owner._submit_message_input()
+        self._owner._submit_text_area(self)
 
     def _replace_via_keyboard(self, insert: str, start, end):
         start, end = self._expand_reference_locations(start, end, False)
@@ -512,8 +563,11 @@ class MessageTextArea(TextArea):
     def render_line(self, y: int):
         if y == 0 and not self.text:
             width = max(1, self.size.width)
-            hint = self._owner.input_placeholder()
-            placeholder_style = Style(color=TEXT_MUTED, bgcolor=SURFACE_BACKGROUND)
+            hint = "" if self._suppress_placeholder else self._owner.input_placeholder(self)
+            placeholder_style = Style(
+                color=TEXT_MUTED,
+                bgcolor=self._placeholder_background,
+            )
             padded_hint = hint[:width].ljust(width)
             theme = self._theme
             if theme:
@@ -622,6 +676,137 @@ class ChatInput(Widget):
         height: auto;
         padding: 0 0 1 0;
         background: $SURFACE_BACKGROUND;
+    }
+
+    #pending-shell {
+        display: none;
+        width: 100%;
+        height: auto;
+        margin: 0;
+        background: $SURFACE_BACKGROUND;
+        padding: 0 1 0 1;
+    }
+    #pending-top-gap {
+        display: none;
+        color: $SURFACE_BACKGROUND;
+        background: $PAGE_BACKGROUND;
+    }
+    #pending-top-gap.visible {
+        display: block;
+    }
+    #pending-shell.visible {
+        display: block;
+    }
+    #pending-list {
+        width: 100%;
+        height: auto;
+        max-height: 5;
+        background: transparent;
+        overflow-y: hidden;
+    }
+    #pending-list .pending-row {
+        width: 100%;
+        height: 1;
+        min-height: 1;
+        background: $SURFACE_BACKGROUND;
+    }
+    #pending-list PendingMessageRow {
+        width: 1fr;
+        height: 1;
+        min-height: 1;
+        padding: 0 1;
+        background: $SURFACE_BACKGROUND;
+    }
+    #pending-list #pending-empty {
+        width: 100%;
+        height: 1;
+        color: $TEXT_MUTED;
+        background: $SURFACE_BACKGROUND;
+        padding: 0 1;
+    }
+    #pending-list MessageTextArea {
+        width: 1fr;
+        height: 1;
+        min-height: 1;
+        max-height: 1;
+        border: none;
+        background: $SURFACE_BACKGROUND;
+        color: $TEXT_PRIMARY;
+        padding: 0 1;
+        overflow-y: hidden;
+        scrollbar-size: 0 0;
+        & .text-area--cursor-line {
+            background: $SURFACE_BACKGROUND;
+        }
+        & .text-area--selection {
+            background: $TEXT_PRIMARY;
+            color: $SURFACE_BACKGROUND;
+        }
+    }
+    #pending-list MessageTextArea:focus {
+        border: none;
+        background: $SURFACE_BACKGROUND;
+    }
+    #pending-list .pending-delete {
+        min-width: 3;
+        height: 1;
+        padding: 0;
+        margin: 0;
+        border: none;
+        background: $TEXT_PRIMARY;
+        background-tint: transparent;
+        tint: transparent;
+        color: $SURFACE_BACKGROUND;
+        text-align: center;
+        content-align: center middle;
+    }
+    #pending-list .pending-send {
+        width: 3;
+        min-width: 3;
+        height: 1;
+        padding: 0;
+        margin: 0 1 0 0;
+        border: none;
+        background: transparent;
+        background-tint: transparent;
+        tint: transparent;
+        color: $TEXT_PRIMARY;
+        text-align: center;
+        content-align: center middle;
+    }
+    #pending-list .pending-delete:hover,
+    #pending-list .pending-delete:focus,
+    #pending-list .pending-delete.-active,
+    #pending-list .pending-send:hover,
+    #pending-list .pending-send:focus,
+    #pending-list .pending-send.-active {
+        border: none;
+    }
+    #pending-list .pending-delete:hover,
+    #pending-list .pending-delete:focus,
+    #pending-list .pending-delete.-active {
+        background: $TEXT_PRIMARY;
+        background-tint: transparent;
+        tint: transparent;
+        color: $SURFACE_BACKGROUND;
+    }
+    #pending-list .pending-send:hover,
+    #pending-list .pending-send:focus,
+    #pending-list .pending-send.-active {
+        background: transparent;
+        background-tint: transparent;
+        tint: transparent;
+        color: $TEXT_PRIMARY;
+    }
+    #pending-list .pending-delete:disabled,
+    #pending-list .pending-send:disabled {
+        color: $TEXT_MUTED;
+    }
+    #pending-list .pending-send:disabled {
+        background: transparent;
+        background-tint: transparent;
+        tint: transparent;
+        color: $TEXT_MUTED;
     }
 
     #command-menu-shell {
@@ -935,6 +1120,10 @@ class ChatInput(Widget):
         self._prompt_custom_selected = False
         self._prompt_saved_text = ""
         self._prompt_syncing = False
+        self._pending_messages: list[PendingMessageEntry] = []
+        self._next_pending_message_id = 1
+        self._editing_pending_message_id: int | None = None
+        self._chat_busy = False
 
     class Send(Message):
         def __init__(self, content: str, display_content: str | None = None) -> None:
@@ -946,6 +1135,14 @@ class ChatInput(Widget):
 
     class ReferenceRequested(Message):
         pass
+
+    class DirectSendRequested(Message):
+        def __init__(self, content: str, display_content: str | None = None) -> None:
+            super().__init__()
+            self.content = content
+            self.display_content = (
+                content if display_content is None else display_content
+            )
 
     class ModelChanged(Message):
         def __init__(self, label: str, value: str) -> None:
@@ -992,6 +1189,7 @@ class ChatInput(Widget):
         if os.name == "nt":
             self._modifier_timer = self.set_interval(0.02, self._sample_modifier_keys)
         self.call_after_refresh(self._update_input_height)
+        self.call_after_refresh(self._update_pending_shell)
 
     def on_unmount(self) -> None:
         if self._modifier_timer is not None:
@@ -1001,6 +1199,9 @@ class ChatInput(Widget):
         with Vertical(id="command-menu-shell"):
             yield BottomHalfRowSpacer(id="command-menu-top-edge")
             yield VerticalScroll(id="command-menu")
+        yield BottomHalfRowSpacer(id="pending-top-gap")
+        with Horizontal(id="pending-shell"):
+            yield Vertical(id="pending-list")
         with Vertical(id="input-area"):
             with Vertical(id="prompt-shell"):
                 yield BottomHalfRowSpacer(id="prompt-top-edge")
@@ -1014,7 +1215,6 @@ class ChatInput(Widget):
                     id="message-input",
                     soft_wrap=True,
                     show_line_numbers=False,
-                    highlight_cursor_line=False,
                 )
 
             with Horizontal(id="controls-row"):
@@ -1045,7 +1245,11 @@ class ChatInput(Widget):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id
-        if btn_id == "add-reference":
+        if isinstance(event.button, PendingSendButton):
+            self._request_direct_send_for_message(event.button.message_id)
+        elif isinstance(event.button, PendingDeleteButton):
+            self._remove_pending_message(event.button.message_id)
+        elif btn_id == "add-reference":
             if not self.controls_locked and not self.prompt_active:
                 self.post_message(self.ReferenceRequested())
         elif btn_id == "plan-opt-plan":
@@ -1127,6 +1331,10 @@ class ChatInput(Widget):
             self._select_prompt_custom(focus=True)
         else:
             self._select_prompt_option(event.index)
+        event.stop()
+
+    def on_pending_message_row_selected(self, event: PendingMessageRow.Selected) -> None:
+        self._start_pending_edit(event.message_id)
         event.stop()
 
     def _set_plan_mode(self, plan: bool) -> None:
@@ -1216,7 +1424,12 @@ class ChatInput(Widget):
             self._collapsed_model_api_types.add(api_type)
 
     def on_text_area_changed(self, event) -> None:
-        if getattr(getattr(event, "text_area", None), "id", None) != "message-input":
+        text_area = getattr(event, "text_area", None)
+        text_area_id = getattr(text_area, "id", None)
+        if getattr(text_area, "pending_message_id", None) is not None:
+            self._update_direct_send_button_state()
+            return
+        if text_area_id != "message-input":
             return
         if self.prompt_active:
             if (
@@ -1228,18 +1441,22 @@ class ChatInput(Widget):
             self._hide_command_menu()
             self.call_after_refresh(self._update_input_height)
             self.post_message(self.PromptStateChanged(self.prompt_can_submit()))
+            self._update_direct_send_button_state()
             return
         event.text_area.normalize_references(self.reference_base_dir())
         self._refresh_command_menu(event.text_area.text)
         self.call_after_refresh(self._update_input_height)
+        self._update_direct_send_button_state()
 
     def _do_send(self) -> None:
-        msg_input = self._message_input()
-        content = msg_input.serialized_text().strip()
-        if content:
-            self.post_message(self.Send(content, msg_input.text.strip()))
-            msg_input.load_text("")
-            self._hide_command_menu()
+        if self._chat_busy and len(self._pending_messages) >= MAX_PENDING_MESSAGES:
+            self._notify_pending_limit_reached()
+            return
+        payload = self._take_message_input_payload()
+        if payload is None:
+            return
+        content, display_content = payload
+        self.post_message(self.Send(content, display_content))
 
     def reference_base_dir(self):
         try:
@@ -1512,7 +1729,7 @@ class ChatInput(Widget):
         if modifiers in (set(), {"ctrl", "shift"}):
             event.stop()
             event.prevent_default()
-            self._submit_message_input()
+            self._submit_text_area(text_area)
             return True
         return False
 
@@ -1521,6 +1738,13 @@ class ChatInput(Widget):
         start, end = target.selection
         target._replace_via_keyboard("\n", start, end)
         self.call_after_refresh(self._update_input_height)
+
+    def _submit_text_area(self, text_area: MessageTextArea | None = None) -> None:
+        target = text_area or self._message_input()
+        if target.pending_message_id is not None:
+            self._commit_pending_edit()
+            return
+        self._submit_message_input()
 
     def _submit_message_input(self) -> None:
         if self.prompt_active:
@@ -1543,6 +1767,151 @@ class ChatInput(Widget):
             line_width = max(1, cell_len(line))
             height += max(1, (line_width + width - 1) // width)
         text_area.styles.height = max(1, min(INPUT_MAX_HEIGHT, height))
+
+    def _take_message_input_payload(self) -> tuple[str, str] | None:
+        msg_input = self._message_input()
+        content = msg_input.serialized_text().strip()
+        if not content:
+            return None
+        display_content = msg_input.text.strip()
+        msg_input.load_text("")
+        self._hide_command_menu()
+        self.call_after_refresh(self._update_input_height)
+        self._update_direct_send_button_state()
+        return content, display_content
+
+    def _has_message_input_payload(self) -> bool:
+        msg_input = self._message_input()
+        return bool(msg_input.serialized_text().strip())
+
+    def _request_direct_send_for_message(self, message_id: int) -> None:
+        payload = self._remove_pending_message(message_id)
+        if payload is None:
+            return
+        self.post_message(self.DirectSendRequested(payload[0], payload[1]))
+
+    def _pending_entry(self, message_id: int) -> PendingMessageEntry | None:
+        for entry in self._pending_messages:
+            if entry.message_id == message_id:
+                return entry
+        return None
+
+    def _start_pending_edit(self, message_id: int) -> None:
+        if self._pending_entry(message_id) is None:
+            return
+        self._commit_pending_edit()
+        self._editing_pending_message_id = message_id
+        self._rebuild_pending_list()
+        self.call_after_refresh(self._focus_pending_editor)
+
+    def _focus_pending_editor(self) -> None:
+        if self._editing_pending_message_id is None:
+            return
+        editor = self._find_pending_editor(self._editing_pending_message_id)
+        if editor is None:
+            return
+        editor.focus()
+
+    def _commit_pending_edit(self) -> None:
+        if self._editing_pending_message_id is None or not self.is_mounted:
+            return
+        editor = self._find_pending_editor(self._editing_pending_message_id)
+        if editor is None:
+            self._editing_pending_message_id = None
+            self._update_pending_shell()
+            return
+        content = editor.serialized_text().strip()
+        display_content = editor.text.strip()
+        updated_entries: list[PendingMessageEntry] = []
+        for entry in self._pending_messages:
+            if entry.message_id != self._editing_pending_message_id:
+                updated_entries.append(entry)
+                continue
+            if content:
+                updated_entries.append(
+                    PendingMessageEntry(
+                        message_id=entry.message_id,
+                        content=content,
+                        display_content=display_content,
+                    )
+                )
+        self._pending_messages = updated_entries
+        self._editing_pending_message_id = None
+        self._update_pending_shell()
+
+    def _rebuild_pending_list(self) -> None:
+        if not self.is_mounted:
+            return
+        container = self.query_one("#pending-list", Vertical)
+        container.remove_children()
+        for entry in self._pending_messages:
+            if entry.message_id == self._editing_pending_message_id:
+                editor = MessageTextArea(
+                    self,
+                    entry.content,
+                    soft_wrap=False,
+                    show_line_numbers=False,
+                    classes="pending-editor",
+                )
+                editor.pending_message_id = entry.message_id
+                editor._suppress_placeholder = True
+                editor._placeholder_background = SURFACE_BACKGROUND
+                editor.normalize_references(self.reference_base_dir())
+                container.mount(
+                    Horizontal(
+                        editor,
+                        PendingSendButton(entry.message_id),
+                        PendingDeleteButton(entry.message_id),
+                        classes="pending-row",
+                    )
+                )
+            else:
+                container.mount(
+                    Horizontal(
+                        PendingMessageRow(entry.message_id, entry.display_content),
+                        PendingSendButton(entry.message_id),
+                        PendingDeleteButton(entry.message_id),
+                        classes="pending-row",
+                    )
+                )
+
+    def _find_pending_editor(
+        self, message_id: int
+    ) -> MessageTextArea | None:
+        for editor in self.query("#pending-list MessageTextArea"):
+            if getattr(editor, "pending_message_id", None) == message_id:
+                return editor
+        return None
+
+    def _ensure_ui_thread(self, callback, *args) -> bool:
+        if threading.current_thread() is threading.main_thread():
+            return True
+        if not self.is_mounted:
+            return False
+        try:
+            self.app.call_from_thread(callback, *args)
+        except Exception:
+            return False
+        return False
+
+    def _update_pending_shell(self) -> None:
+        if not self.is_mounted:
+            return
+        top_gap = self.query_one("#pending-top-gap", BottomHalfRowSpacer)
+        shell = self.query_one("#pending-shell", Horizontal)
+        show_shell = bool(self._pending_messages)
+        if show_shell:
+            top_gap.add_class("visible")
+            shell.add_class("visible")
+        else:
+            top_gap.remove_class("visible")
+            shell.remove_class("visible")
+            self._editing_pending_message_id = None
+        self._rebuild_pending_list()
+        self._update_direct_send_button_state()
+
+    def _update_direct_send_button_state(self) -> None:
+        return
 
     def _sample_modifier_keys(self) -> None:
         now = perf_counter()
@@ -1771,10 +2140,93 @@ class ChatInput(Widget):
         trigger.label = selected_label
         self._fit_trigger_to_label(prefix)
 
-    def input_placeholder(self) -> str:
+    def input_placeholder(self, text_area: MessageTextArea | None = None) -> str:
         if self.prompt_active and self._prompt_allow_custom:
             return self._prompt_custom_placeholder
         return "Type a message"
+
+    def set_chat_busy(self, busy: bool) -> None:
+        if not self._ensure_ui_thread(self.set_chat_busy, busy):
+            return
+        self._chat_busy = bool(busy)
+        self._update_pending_shell()
+
+    def has_pending_messages(self) -> bool:
+        return bool(self._pending_messages)
+
+    def pending_message_count(self) -> int:
+        return len(self._pending_messages)
+
+    def clear_pending_messages(self) -> None:
+        if not self._ensure_ui_thread(self.clear_pending_messages):
+            return
+        self._pending_messages = []
+        self._editing_pending_message_id = None
+        self._update_pending_shell()
+
+    def enqueue_pending_message(
+        self, content: str, display_content: str | None = None
+    ) -> None:
+        if not self._ensure_ui_thread(
+            self.enqueue_pending_message,
+            content,
+            display_content,
+        ):
+            return
+        normalized_content = str(content or "").strip()
+        normalized_display = (
+            normalized_content
+            if display_content is None
+            else str(display_content or "").strip()
+        )
+        if not normalized_content:
+            return
+        if len(self._pending_messages) >= MAX_PENDING_MESSAGES:
+            self._notify_pending_limit_reached()
+            return
+        self._pending_messages.append(
+            PendingMessageEntry(
+                message_id=self._next_pending_message_id,
+                content=normalized_content,
+                display_content=normalized_display,
+            )
+        )
+        self._next_pending_message_id += 1
+        self._editing_pending_message_id = None
+        self._update_pending_shell()
+
+    def pop_next_pending_message(self) -> tuple[str, str] | None:
+        self._commit_pending_edit()
+        if not self._pending_messages:
+            self._update_pending_shell()
+            return None
+        entry = self._pending_messages.pop(0)
+        if self._editing_pending_message_id == entry.message_id:
+            self._editing_pending_message_id = None
+        self._update_pending_shell()
+        return entry.content, entry.display_content
+
+    def _remove_pending_message(self, message_id: int) -> tuple[str, str] | None:
+        self._commit_pending_edit()
+        for index, entry in enumerate(self._pending_messages):
+            if entry.message_id != message_id:
+                continue
+            removed = self._pending_messages.pop(index)
+            if self._editing_pending_message_id == removed.message_id:
+                self._editing_pending_message_id = None
+            self._update_pending_shell()
+            return removed.content, removed.display_content
+        self._update_pending_shell()
+        return None
+
+    def _notify_pending_limit_reached(self) -> None:
+        try:
+            self.app.add_status_message(
+                "[!]",
+                f"最多只能追加 {MAX_PENDING_MESSAGES} 条消息。",
+            )
+        except Exception:
+            pass
 
     def set_prompt_state(
         self,
