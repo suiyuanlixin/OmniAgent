@@ -21,6 +21,9 @@ PINNED_PROJECT_INDEX_FILE = SESSIONS_DIR / "pinned_projects.json"
 PROJECTS_DIR = SESSIONS_DIR / "projects"
 ORPHAN_SESSIONS_DIR = SESSIONS_DIR / "orphan"
 SESSION_VERSION = "4.0.0"
+SESSION_TITLE_STATE_MANUAL = "manual"
+SESSION_TITLE_STATE_TEMPORARY = "temporary"
+SESSION_TITLE_STATE_GENERATED = "generated"
 
 
 @dataclass
@@ -511,6 +514,9 @@ def rename_session(session_path, new_title):
     if not title:
         raise ValueError("Chat title cannot be empty.")
     record["title"] = title
+    record["title_state"] = SESSION_TITLE_STATE_MANUAL
+    record.pop("title_seed_text", None)
+    record["title_summary_pending"] = False
     _safe_write_json(path, record)
     return record
 

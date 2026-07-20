@@ -141,6 +141,11 @@ COMPACTION_SYSTEM_PROMPT = """你负责压缩聊天上下文。
 MEMORY_UPDATE_SYSTEM_PROMPT = """你负责更新持久记忆。
 只返回 JSON。遵循持久记忆和偏好记忆，尤其语言偏好。事实准确；情景记忆可以有人情味，但不能编造。"""
 
+SESSION_TITLE_SYSTEM_PROMPT = """你负责为新对话生成一个简短标题。
+只返回标题文本，不要引号、句号、前缀、编号或解释。
+标题要概括用户这句话的核心任务，尽量短，适合显示在侧边栏。"""
+SESSION_TITLE_MAX_TOKENS = 64
+
 
 def _ensure_user_prompt_file():
     prompt_path = Path(USER_PROMPT_FILE)
@@ -3000,6 +3005,79 @@ class OmniAgent:
         )
         message = response.choices[0].message
         return _clean_content_text(self._get_field(message, "content", "") or "")
+
+    def generate_session_title(self, user_message):
+        source_text = clean_display_text(user_message or "")
+        fallback_title = " ".join(source_text.split())[:60] if source_text else "New Chat"
+        if not source_text:
+            return fallback_title
+
+        prompt = (
+            "请根据这条用户消息生成一个对话标题。\n"
+            "要求：突出任务主体，避免复述语气词，尽量短。\n\n"
+            f"用户消息：\n{source_text}\n\n"
+            "只返回标题。"
+        )
+        memory_model = self._memory_model_name()
+        try:
+            title = self._create_session_title(prompt, memory_model)
+        except Exception as error:
+            print_warn(f"Failed to generate session title: {error}")
+            return fallback_title
+        normalized = self._normalize_session_title(title)
+        return normalized or fallback_title
+
+    def _create_session_title(self, prompt, memory_model):
+        messages = [
+            {"role": "system", "content": SESSION_TITLE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        temperature = min(float(self.temperature), 0.2)
+
+        if self.api_type == API_TYPE_ANTHROPIC:
+            response = self.client.messages.create(
+                model=memory_model,
+                max_tokens=SESSION_TITLE_MAX_TOKENS,
+                temperature=temperature,
+                system=SESSION_TITLE_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return self._anthropic_response_text(response)
+
+        if self.api_type == API_TYPE_OLLAMA:
+            response = self.client.chat(
+                **self._ollama_chat_kwargs(
+                    model=memory_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=SESSION_TITLE_MAX_TOKENS,
+                    include_reasoning=False,
+                )
+            )
+            message = self._get_field(response, "message", {})
+            return str(self._get_field(message, "content", "") or "")
+
+        response = self.client.chat.completions.create(
+            **self._chat_completion_kwargs(
+                model=memory_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=SESSION_TITLE_MAX_TOKENS,
+                include_reasoning=False,
+            )
+        )
+        message = response.choices[0].message
+        return _clean_content_text(self._get_field(message, "content", "") or "")
+
+    @staticmethod
+    def _normalize_session_title(title):
+        text = clean_display_text(title or "")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        text = lines[0] if lines else ""
+        text = re.sub(r"^(标题|Title)\s*[:：-]\s*", "", text, flags=re.IGNORECASE)
+        text = text.strip(" \"'`[](){}<>:：，,。.!！？；;")
+        text = " ".join(text.split())
+        return text[:60] if text else ""
 
     def _print_memory_update_result(self, memory_update):
         if not memory_update:

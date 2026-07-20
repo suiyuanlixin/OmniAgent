@@ -737,6 +737,15 @@ class ChatView(Widget):
         self._shell_block = None
         self._questions_block = None
 
+    def clear_message_selection(self) -> None:
+        widgets = [
+            *self.query(SelectableMessageStatic),
+            *self.query(MarkdownMessageStatic),
+        ]
+        for widget in widgets:
+            if widget._selection_anchor != widget._selection_focus:
+                widget.clear_selection()
+
     def _scroll_end(self) -> None:
         self.query_one("#chat-log", VerticalScroll).scroll_end(animate=False)
 

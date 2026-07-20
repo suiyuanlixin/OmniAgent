@@ -43,6 +43,8 @@ from references import resolve_references
 from search import TAVILY_SEARCH_DEPTHS, TAVILY_TOPICS, WEB_SEARCH_PROVIDERS
 from session import (
     ProjectRecord,
+    SESSION_TITLE_STATE_GENERATED,
+    SESSION_TITLE_STATE_TEMPORARY,
     add_project,
     archive_project_sessions,
     create_session,
@@ -67,7 +69,11 @@ from tui.data import PROJECT_LOGO
 from tui.runtime import clear_bridge, render_console_text, set_bridge
 from tui.theme import render_css
 from tui.widgets.chat_input import ChatInput, HalfRowSpacer
-from tui.widgets.chat_view import ChatView
+from tui.widgets.chat_view import (
+    ChatView,
+    MarkdownMessageStatic,
+    SelectableMessageStatic,
+)
 from tui.widgets.memory_modal import MemoryModal
 from tui.widgets.project_modal import ProjectModal
 from tui.widgets.project_picker import ProjectPicker
@@ -449,6 +455,7 @@ class AgentTUIApp(App):
         self._thinking_elapsed_timer = None
         self._suppress_stream_output = False
         self._prompt_request: _InlinePromptRequest | None = None
+        self._title_summary_sessions: set[str] = set()
 
     @property
     def config(self):
@@ -585,6 +592,15 @@ class AgentTUIApp(App):
         if event.control.id == "sidebar-toggle":
             self.toggle_sidebar()
 
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        control = event.control
+        if isinstance(control, (SelectableMessageStatic, MarkdownMessageStatic)):
+            return
+        try:
+            self.query_one("#messages-view", ChatView).clear_message_selection()
+        except Exception:
+            return
+
     def on_chat_input_prompt_state_changed(
         self, event: ChatInput.PromptStateChanged
     ) -> None:
@@ -628,6 +644,7 @@ class AgentTUIApp(App):
         )
         if new_session:
             self._update_new_session_title_from_text(event.display_content)
+            self._maybe_schedule_session_title_summary()
         worker = threading.Thread(
             target=self._process_user_message,
             args=(event.content,),
@@ -774,9 +791,7 @@ class AgentTUIApp(App):
                     ).strip()
                     == session_path
                 ):
-                    self.current_session_record["title"] = str(
-                        renamed.get("title") or ""
-                    )
+                    self.current_session_record = renamed
                 self.add_status_message("[✓]", "已重命名对话。")
             elif action == "load":
                 record = load_session(session_path)
@@ -3866,7 +3881,88 @@ class AgentTUIApp(App):
         if str(record.get("title") or "").strip() not in {"", "New Chat"}:
             return
         record["title"] = self._session_title_from_text(text)
+        record["title_state"] = SESSION_TITLE_STATE_TEMPORARY
+        record["title_seed_text"] = str(text or "")
+        record["title_summary_pending"] = True
         self.current_session_record = save_session_record(record)
+        self._refresh_project_views()
+
+    def _maybe_schedule_session_title_summary(self) -> None:
+        if self.current_session_record is None:
+            return
+        record = dict(self.current_session_record)
+        if (
+            str(record.get("title_state") or "").strip()
+            != SESSION_TITLE_STATE_TEMPORARY
+        ):
+            return
+        session_path = str(record.get("session_path") or "").strip()
+        seed_text = str(record.get("title_seed_text") or "").strip()
+        expected_title = str(record.get("title") or "").strip()
+        if not session_path or not seed_text or not expected_title:
+            return
+        if session_path in self._title_summary_sessions:
+            return
+        chat = self._build_chat(record)
+        self._title_summary_sessions.add(session_path)
+        worker = threading.Thread(
+            target=self._generate_session_title_summary,
+            args=(chat, session_path, seed_text, expected_title),
+            daemon=True,
+        )
+        worker.start()
+
+    def _generate_session_title_summary(
+        self,
+        chat: OmniAgent,
+        session_path: str,
+        seed_text: str,
+        expected_title: str,
+    ) -> None:
+        try:
+            generated_title = chat.generate_session_title(seed_text)
+            self._call_ui(
+                self._apply_generated_session_title,
+                session_path,
+                generated_title,
+                expected_title,
+            )
+        finally:
+            self._call_ui(self._clear_pending_title_summary, session_path)
+
+    def _clear_pending_title_summary(self, session_path: str) -> None:
+        self._title_summary_sessions.discard(str(session_path or "").strip())
+
+    def _apply_generated_session_title(
+        self,
+        session_path: str,
+        generated_title: str,
+        expected_title: str,
+    ) -> None:
+        record = load_session(session_path)
+        if not record:
+            return
+        if (
+            str(record.get("title_state") or "").strip()
+            != SESSION_TITLE_STATE_TEMPORARY
+        ):
+            return
+        if str(record.get("title") or "").strip() != str(expected_title or "").strip():
+            return
+        title = self._session_title_from_text(generated_title)
+        if title == "New Chat":
+            return
+        record["title"] = title
+        record["title_state"] = SESSION_TITLE_STATE_GENERATED
+        record.pop("title_seed_text", None)
+        record["title_summary_pending"] = False
+        updated = save_session_record(record)
+        if (
+            self.current_session_record is not None
+            and str(self.current_session_record.get("session_path") or "").strip()
+            == str(session_path or "").strip()
+        ):
+            self.current_session_record = updated
         self._refresh_project_views()
 
     def _session_title_from_history(self, history: list[dict]) -> str:
