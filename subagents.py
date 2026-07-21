@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -309,6 +310,7 @@ class SubagentRunner:
         execute_tool: Callable[[str, dict[str, Any]], str],
         compact_tool_result: Callable[[str], str] | None = None,
         max_tool_calls: int | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.parent = parent_agent
         self.spec = spec
@@ -321,32 +323,112 @@ class SubagentRunner:
         )
         self.tool_calls_used = 0
         self.allowed_tool_names = set(spec.tool_names)
+        self.transcript: list[dict[str, Any]] = []
+        self.event_callback = event_callback
+        self._streamed_thinking = False
+        self._streamed_text = False
+        self._stream_thinking_content = ""
+        self._stream_text_content = ""
+
+    def _record_event(self, event: dict[str, Any]) -> None:
+        self.transcript.append(event)
+        if self.event_callback is not None:
+            self.event_callback(event)
+
+    def _persist_stream_event(self, event: dict[str, Any]) -> None:
+        event = dict(event)
+        event["_persist_only"] = True
+        self._record_event(event)
 
     def run(self, task: str) -> str:
         history: list[dict[str, Any]] = [{"role": "user", "content": task}]
         final_response = ""
+        self.transcript = []
+        self._record_event({"kind": "message", "role": "user", "content": task})
 
         for _round_index in range(1, self.spec.max_turns + 1):
-            if self.parent.api_type == API_TYPE_ANTHROPIC:
-                assistant_message, _thinking, text, tool_calls = self._anthropic_turn(
-                    history
-                )
-            elif self.parent.api_type == API_TYPE_OLLAMA:
-                assistant_message, _thinking, text, tool_calls = self._ollama_turn(
-                    history
-                )
-            else:
-                assistant_message, _thinking, text, tool_calls = self._chat_turn(
-                    history
-                )
+            self._streamed_thinking = False
+            self._streamed_text = False
+            self._stream_thinking_content = ""
+            self._stream_text_content = ""
+            turn_started_at = time.monotonic()
+            if self.parent.thinking_mode:
+                self._stream_event("thought_start", "")
+            try:
+                if self.parent.api_type == API_TYPE_ANTHROPIC:
+                    assistant_message, _thinking, text, tool_calls = self._anthropic_turn(
+                        history
+                    )
+                elif self.parent.api_type == API_TYPE_OLLAMA:
+                    assistant_message, _thinking, text, tool_calls = self._ollama_turn(
+                        history
+                    )
+                else:
+                    assistant_message, _thinking, text, tool_calls = self._chat_turn(
+                        history
+                    )
+            except Exception as error:
+                if self.parent.thinking_mode:
+                    self._record_event({"kind": "thought_end"})
+                self._record_event({
+                    "kind": "message",
+                    "role": "status",
+                    "content": f"Subagent error: {error}",
+                })
+                raise
+            turn_elapsed_seconds = time.monotonic() - turn_started_at
+            if self.parent.thinking_mode:
+                self._record_event({"kind": "thought_end"})
 
             history.append(assistant_message)
+            if _thinking and self._streamed_thinking:
+                self._persist_stream_event({
+                    "kind": "thought",
+                    "content": _thinking,
+                    "elapsed_seconds": turn_elapsed_seconds,
+                })
+            elif _thinking:
+                self._record_event({
+                    "kind": "thought",
+                    "content": _thinking,
+                    "elapsed_seconds": turn_elapsed_seconds,
+                })
+            if text and self._streamed_text:
+                self._persist_stream_event({
+                    "kind": "message",
+                    "role": "assistant",
+                    "content": text,
+                })
+            elif text:
+                self._record_event({
+                    "kind": "message",
+                    "role": "assistant",
+                    "content": text,
+                })
+            for tool_call in tool_calls:
+                self._record_event({
+                    "kind": "tool_call",
+                    "name": str(tool_call.get("name") or ""),
+                    "arguments": tool_call.get(
+                        "input", tool_call.get("arguments", {})
+                    ),
+                })
             final_response += text
 
             if not tool_calls:
-                return final_response.strip() or (
-                    f"Subagent '{self.spec.name}' completed without a text summary."
+                summary = final_response.strip()
+                if summary:
+                    return summary
+                message = (
+                    f"ERROR: Subagent '{self.spec.name}' returned an empty response "
+                    "without text or tool calls."
                 )
+                self._record_event({
+                    "kind": "message",
+                    "role": "status",
+                    "content": message,
+                })
+                return message
 
             if self.tool_calls_used + len(tool_calls) > self.max_tool_calls:
                 return (
@@ -362,24 +444,138 @@ class SubagentRunner:
         )
 
     def _chat_turn(self, history: list[dict[str, Any]]):
-        response = self.parent.client.chat.completions.create(
-            **self.parent._chat_completion_kwargs(
-                messages=self._messages(history),
-                tools=self.tool_schemas,
+        stream_error = None
+        response = None
+        try:
+            response = self.parent.client.chat.completions.create(
+                **self.parent._chat_completion_kwargs(
+                    messages=self._messages(history),
+                    tools=self.tool_schemas,
+                    stream=True,
+                )
             )
+        except Exception as error:
+            stream_error = error
+        if response is not None:
+            try:
+                return self._consume_chat_stream(response)
+            except Exception as error:
+                stream_error = stream_error or error
+        try:
+            response = self.parent.client.chat.completions.create(
+                **self.parent._chat_completion_kwargs(
+                    messages=self._messages(history),
+                    tools=self.tool_schemas,
+                )
+            )
+        except Exception as error:
+            if stream_error is not None:
+                raise RuntimeError(
+                    f"stream request failed: {stream_error}; "
+                    f"fallback request failed: {error}"
+                ) from error
+            raise
+        result = self.parent._chat_message_parts(response.choices[0].message)
+        if not any(str(part or "").strip() for part in result[1:3]) and not result[3]:
+            if stream_error is not None:
+                raise RuntimeError(
+                    f"stream request failed: {stream_error}; fallback returned empty response"
+                )
+        return result
+
+    def _consume_chat_stream(self, response):
+        field_thinking = ""
+        tagged_thinking = ""
+        raw_thinking = ""
+        content = ""
+        raw_content = ""
+        tool_parts = {}
+        for chunk in response:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            reasoning, next_field_thinking, raw_thinking = (
+                self.parent._stream_reasoning_delta(
+                    delta, field_thinking, raw_thinking
+                )
+            )
+            if reasoning:
+                field_thinking = next_field_thinking
+                if self.parent.thinking_mode:
+                    self._stream_event("thought_delta", str(reasoning))
+            text, content, raw_content = self.parent._stream_content_delta(
+                self.parent._get_field(delta, "content", "") or "",
+                content,
+                raw_content,
+            )
+            tagged_reasoning, tagged_thinking = (
+                self.parent._stream_tagged_reasoning_delta(
+                    raw_content, tagged_thinking
+                )
+            )
+            if tagged_reasoning and self.parent.thinking_mode:
+                self._stream_event("thought_delta", str(tagged_reasoning))
+            if text:
+                self._stream_event("message_delta", str(text))
+            self.parent._update_chat_stream_tool_call_parts(
+                tool_parts,
+                self.parent._get_field(delta, "tool_calls", None) or [],
+            )
+        thinking = self.parent._combine_stream_reasoning_text(
+            field_thinking, tagged_thinking
         )
-        message = response.choices[0].message
-        return self.parent._chat_message_parts(message)
+        assistant_tool_calls, tool_calls = self.parent._chat_stream_tool_calls(
+            tool_parts
+        )
+        message = self.parent._chat_stream_assistant_message(
+            content, thinking, raw_content=raw_content
+        )
+        if assistant_tool_calls:
+            message["tool_calls"] = assistant_tool_calls
+        return message, thinking, content, tool_calls
 
     def _ollama_turn(self, history: list[dict[str, Any]]):
         response = self.parent.client.chat(
             **self.parent._ollama_chat_kwargs(
                 messages=self._messages(history),
                 tools=self.tool_schemas,
+                stream=True,
             )
         )
-        message = self.parent._get_field(response, "message", {})
-        return self.parent._ollama_message_parts(message)
+        content = ""
+        thinking = ""
+        tool_parts = {}
+        for chunk in response:
+            message = self.parent._get_field(chunk, "message", {}) or {}
+            reasoning = self.parent._get_field(message, "thinking", "") or ""
+            if reasoning and self.parent.thinking_mode:
+                thinking += str(reasoning)
+                self._stream_event("thought_delta", str(reasoning))
+            elif reasoning:
+                thinking += str(reasoning)
+            text = self.parent._get_field(message, "content", "") or ""
+            if text:
+                content += str(text)
+                self._stream_event("message_delta", str(text))
+            self.parent._update_ollama_stream_tool_call_parts(
+                tool_parts,
+                self.parent._get_field(message, "tool_calls", None) or [],
+            )
+        assistant_tool_calls, parsed_tools = self.parent._ollama_stream_tool_calls(
+            tool_parts
+        )
+        parsed_thinking = self.parent._clean_stream_reasoning_text(thinking)
+        parsed_message = self.parent._ollama_assistant_message(
+            content, parsed_thinking, assistant_tool_calls
+        )
+        if not content.strip() and not parsed_thinking.strip() and not parsed_tools:
+            raise RuntimeError(
+                f"Ollama subagent '{self.spec.name}' returned an empty response."
+            )
+        return parsed_message, parsed_thinking, content, parsed_tools
 
     def _anthropic_turn(self, history: list[dict[str, Any]]):
         blocks = []
@@ -409,12 +605,18 @@ class SubagentRunner:
                             "type": "thinking",
                             "thinking": initial_reasoning,
                         })
+                        if self.parent.thinking_mode:
+                            self._stream_event(
+                                "thought_delta", str(initial_reasoning)
+                            )
                     block = {"type": "text", "text": ""}
                 elif (
                     self.parent._is_anthropic_reasoning_block_type(block_type)
                     or initial_reasoning
                 ):
                     block = {"type": "thinking", "thinking": initial_reasoning}
+                    if initial_reasoning and self.parent.thinking_mode:
+                        self._stream_event("thought_delta", str(initial_reasoning))
                 elif block_type == "tool_use":
                     block = {
                         "type": "tool_use",
@@ -434,13 +636,17 @@ class SubagentRunner:
                 delta_type = self.parent._get_field(delta, "type", "")
                 block = blocks[active_block_index]
                 if delta_type == "text_delta":
-                    block["text"] = block.get("text", "") + (
-                        self.parent._get_field(delta, "text", "") or ""
-                    )
+                    text_delta = self.parent._get_field(delta, "text", "") or ""
+                    block["text"] = block.get("text", "") + text_delta
+                    if text_delta:
+                        self._stream_text_content += str(text_delta)
+                        self._stream_event("message_delta", str(text_delta))
                 elif self.parent._is_anthropic_reasoning_delta_type(delta_type):
-                    block["thinking"] = block.get(
-                        "thinking", ""
-                    ) + self.parent._anthropic_delta_reasoning_text(delta)
+                    thinking_delta = self.parent._anthropic_delta_reasoning_text(delta)
+                    block["thinking"] = block.get("thinking", "") + thinking_delta
+                    if thinking_delta and self.parent.thinking_mode:
+                        self._stream_thinking_content += str(thinking_delta)
+                        self._stream_event("thought_delta", str(thinking_delta))
                 elif delta_type == "signature_delta":
                     block["signature"] = block.get("signature", "") + (
                         self.parent._get_field(delta, "signature", "") or ""
@@ -462,7 +668,25 @@ class SubagentRunner:
         for block in blocks:
             block.pop("_input_json", None)
         thinking, text, tool_uses = self.parent._parse_anthropic_blocks(blocks)
+        if not str(text or "").strip() and not tool_uses:
+            raise RuntimeError(
+                f"Anthropic subagent '{self.spec.name}' returned an empty response."
+            )
         return {"role": "assistant", "content": blocks}, thinking, text, tool_uses
+
+    def _stream_event(self, kind: str, content: str) -> None:
+        if kind == "thought_start":
+            if self.event_callback is not None:
+                self.event_callback({"kind": kind, "content": ""})
+            return
+        if not str(content or "").strip():
+            return
+        if kind == "thought_delta":
+            self._streamed_thinking = True
+        elif kind == "message_delta":
+            self._streamed_text = True
+        if self.event_callback is not None:
+            self.event_callback({"kind": kind, "content": content})
 
     def _append_tool_results(
         self,
@@ -508,7 +732,17 @@ class SubagentRunner:
     def _run_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
         self.tool_calls_used += 1
         if name in FORBIDDEN_SUBAGENT_TOOL_NAMES or name not in self.allowed_tool_names:
-            return f"ERROR: Tool '{name}' is not available to subagent '{self.spec.name}'."
+            result = (
+                f"ERROR: Tool '{name}' is not available to subagent '{self.spec.name}'."
+            )
+            self._record_event({
+                "kind": "tool_result",
+                "name": str(name or ""),
+                "content": result,
+                "is_error": True,
+                "display": None,
+            })
+            return result
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments or "{}")
@@ -517,7 +751,21 @@ class SubagentRunner:
         if not isinstance(arguments, dict):
             arguments = {}
         result = self.execute_tool(name, arguments)
-        return self.compact_tool_result(str(result or ""))
+        display = None
+        agent_tools = getattr(self.parent, "agent_tools", None)
+        consume_display = getattr(agent_tools, "consume_display_payload", None)
+        if callable(consume_display):
+            display = consume_display()
+        full_result = str(result or "")
+        compact_result = self.compact_tool_result(full_result)
+        self._record_event({
+            "kind": "tool_result",
+            "name": str(name or ""),
+            "content": full_result,
+            "is_error": full_result.startswith("ERROR:"),
+            "display": display,
+        })
+        return compact_result
 
     def _messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [{"role": "system", "content": self.spec.system_prompt}, *history]

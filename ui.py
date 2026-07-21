@@ -213,6 +213,24 @@ def add_web_search_entry(content):
         bridge.add_web_search_entry(content)
 
 
+def add_subagent_entry(agent_type, transcript):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_subagent_entry(agent_type, transcript)
+
+
+def start_subagent_entry(entry_id, agent_type):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.start_subagent_entry(entry_id, agent_type)
+
+
+def append_subagent_event(entry_id, event):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.append_subagent_event(entry_id, event)
+
+
 def print_stream_response_start(model_name):
     bridge = get_bridge()
     if bridge is not None:

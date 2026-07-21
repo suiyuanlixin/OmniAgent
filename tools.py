@@ -948,6 +948,7 @@ class AgentTools:
             web_search_topic,
         )
         self._display_payload = None
+        self.suppress_visible_output = False
         self._session_original_contents = {}
         self.reference_folders = {}
         self.begin_agent_session(clear_todos=False)
@@ -1711,7 +1712,8 @@ class AgentTools:
             "max_chars",
         )
         self._before_visible_output()
-        add_web_fetch_entry(url)
+        if not self.suppress_visible_output:
+            add_web_fetch_entry(url)
         self._display_payload = {
             "kind": "web_fetch",
             "url": url,
@@ -1811,7 +1813,8 @@ class AgentTools:
             "diff": diff,
         }
         self._before_visible_output()
-        add_write_entry(self._display_path(file_path), additions, deletions, diff)
+        if not self.suppress_visible_output:
+            add_write_entry(self._display_path(file_path), additions, deletions, diff)
         return f"Wrote {len(content)} characters to {self._display_path(file_path)}."
 
     def _edit_file(self, tool_input):
@@ -1857,7 +1860,8 @@ class AgentTools:
             "diff": diff,
         }
         self._before_visible_output()
-        add_edit_entry(self._display_path(file_path), additions, deletions, diff)
+        if not self.suppress_visible_output:
+            add_edit_entry(self._display_path(file_path), additions, deletions, diff)
         return (
             f"Edited {self._display_path(file_path)} ({replace_count} replacement(s))."
         )
@@ -1918,7 +1922,8 @@ class AgentTools:
             "diff": diff,
         }
         self._before_visible_output()
-        add_edit_entry(self._display_path(file_path), additions, deletions, diff)
+        if not self.suppress_visible_output:
+            add_edit_entry(self._display_path(file_path), additions, deletions, diff)
         return (
             f"Patched {self._display_path(file_path)} (lines {start_line}-{end_line})."
         )
@@ -1955,7 +1960,8 @@ class AgentTools:
             "diff": diff,
         }
         self._before_visible_output()
-        add_edit_entry(self._display_path(file_path), additions, deletions, diff)
+        if not self.suppress_visible_output:
+            add_edit_entry(self._display_path(file_path), additions, deletions, diff)
         return f"Applied unified patch to {self._display_path(file_path)}."
 
     def _bash(self, tool_input):
@@ -2003,7 +2009,8 @@ class AgentTools:
                 "output": result,
             }
             self._before_visible_output()
-            add_shell_entry(command, result)
+            if not self.suppress_visible_output:
+                add_shell_entry(command, result)
             return result
         if (
             risk_level == "confirm"
@@ -2029,7 +2036,8 @@ class AgentTools:
             "output": result,
         }
         self._before_visible_output()
-        add_shell_entry(command, result)
+        if not self.suppress_visible_output:
+            add_shell_entry(command, result)
         return result
 
     def _local_http_check(self, tool_input):
@@ -2104,7 +2112,8 @@ class AgentTools:
                 "output": result,
             }
             self._before_visible_output()
-            add_shell_entry(cmd_str, result)
+            if not self.suppress_visible_output:
+                add_shell_entry(cmd_str, result)
             return result
         finally:
             _terminate_process(process)
@@ -2119,7 +2128,8 @@ class AgentTools:
             "output": result,
         }
         self._before_visible_output()
-        add_shell_entry(cmd_str, result)
+        if not self.suppress_visible_output:
+            add_shell_entry(cmd_str, result)
         return result
 
     def _git_diff(self, tool_input):
@@ -2154,7 +2164,8 @@ class AgentTools:
             "output": result,
         }
         self._before_visible_output()
-        add_shell_entry(cmd_str, result)
+        if not self.suppress_visible_output:
+            add_shell_entry(cmd_str, result)
         return result
 
     def _grep(self, tool_input):
@@ -2369,7 +2380,8 @@ class AgentTools:
 
         query = _required_string(tool_input, "query")
         self._before_visible_output()
-        add_web_search_entry(query)
+        if not self.suppress_visible_output:
+            add_web_search_entry(query)
         self._display_payload = {
             "kind": "web_search",
             "content": query,
@@ -2576,6 +2588,8 @@ class AgentTools:
         )
 
     def _before_visible_output(self):
+        if self.suppress_visible_output:
+            return
         if self.visible_output_callback:
             self.visible_output_callback()
         self.output_needs_separator = True

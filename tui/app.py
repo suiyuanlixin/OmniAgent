@@ -260,7 +260,7 @@ class AgentTUIApp(App):
     #chat-input-wrap {
         width: 100%;
         height: auto;
-        min-width: 46;
+        min-width: 0;
         padding: 1 1 0 1;
         align-horizontal: center;
     }
@@ -270,18 +270,20 @@ class AgentTUIApp(App):
     #chat-input-wrap > #chat-input {
         margin: 0;
     }
+    #chat-input-wrap.with-todos > #chat-input {
+        margin: 0 1;
+    }
 
     #info-bar-wrap {
         width: 100%;
         height: auto;
-        min-width: 46;
+        min-width: 0;
         padding: 0 1;
         align-horizontal: center;
     }
-
     #info-bar-shell {
         width: 100%;
-        min-width: 44;
+        min-width: 0;
         max-width: 78;
         height: auto;
     }
@@ -1052,6 +1054,10 @@ class AgentTUIApp(App):
             has_items,
             "with-todos",
         )
+        self.query_one("#info-bar-wrap", Container).set_class(
+            has_items,
+            "with-todos",
+        )
 
     def set_context_usage(self, input_tokens, context_window_tokens) -> None:
         self._call_ui(self._set_context_label, input_tokens, context_window_tokens)
@@ -1238,6 +1244,7 @@ class AgentTUIApp(App):
 
     def _open_inline_prompt(self, request: _InlinePromptRequest) -> None:
         self._prompt_request = request
+        self.query_one("#todos-panel-wrap", TodosPanel).add_class("prompt-active")
         self._show_current_prompt_question()
 
     def _show_current_prompt_question(self) -> None:
@@ -1334,6 +1341,7 @@ class AgentTUIApp(App):
             return
         request.cancelled = bool(cancelled)
         self._prompt_request = None
+        self.query_one("#todos-panel-wrap", TodosPanel).remove_class("prompt-active")
         self.query_one("#chat-input", ChatInput).set_prompt_state(active=False)
         self._set_input_enabled(not self.chat_busy)
         self._sync_prompt_actions()
@@ -1506,6 +1514,32 @@ class AgentTUIApp(App):
 
     def _append_web_search_entry(self, content: str) -> None:
         self.query_one("#messages-view", ChatView).add_web_search_entry(content)
+
+    def add_subagent_entry(self, agent_type: str, transcript: list[dict]) -> None:
+        self._call_ui(self._append_subagent_entry, agent_type, transcript)
+
+    def _append_subagent_entry(
+        self, agent_type: str, transcript: list[dict]
+    ) -> None:
+        self.query_one("#messages-view", ChatView).add_subagent_entry(
+            agent_type, transcript
+        )
+
+    def start_subagent_entry(self, entry_id: str, agent_type: str) -> None:
+        self._call_ui(self._start_subagent_entry, entry_id, agent_type)
+
+    def _start_subagent_entry(self, entry_id: str, agent_type: str) -> None:
+        self.query_one("#messages-view", ChatView).start_subagent_entry(
+            entry_id, agent_type
+        )
+
+    def append_subagent_event(self, entry_id: str, event: dict) -> None:
+        self._call_ui(self._append_subagent_event, entry_id, event)
+
+    def _append_subagent_event(self, entry_id: str, event: dict) -> None:
+        self.query_one("#messages-view", ChatView).append_subagent_event(
+            entry_id, event
+        )
 
     def _start_stream_widget(self, role: str, prefix: str) -> None:
         self.query_one("#messages-view", ChatView).start_stream(
@@ -4456,6 +4490,14 @@ class AgentTUIApp(App):
             output = display.get("output", "")
             if command:
                 view.add_shell_entry(command, output)
+                return True
+        if kind == "subagent":
+            agent_type = clean_display_text_preserve_newlines(
+                display.get("agent_type", "")
+            )
+            transcript = display.get("transcript")
+            if agent_type and isinstance(transcript, list):
+                view.add_subagent_entry(agent_type, transcript)
                 return True
         return False
 

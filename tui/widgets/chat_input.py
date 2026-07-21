@@ -594,7 +594,7 @@ class ChatInput(Widget):
         """
     ChatInput {
         width: 100%;
-        min-width: 44;
+        min-width: 0;
         max-width: 78;
         height: auto;
         padding: 0;
@@ -660,7 +660,7 @@ class ChatInput(Widget):
         width: 100%;
         height: auto;
         background: $SURFACE_BACKGROUND;
-        margin-top: 1;
+        margin-top: 0;
     }
     #prompt-options PromptOptionRow {
         width: 100%;

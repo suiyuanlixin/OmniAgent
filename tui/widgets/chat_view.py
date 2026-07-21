@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from functools import lru_cache
 import re
+import time
 from datetime import datetime
 
 from pygments.lexers import get_lexer_for_filename
@@ -276,6 +277,41 @@ class ChatView(Widget):
     }
     QuestionsBlock > .questions-content.hidden {
         display: none;
+    }
+
+    SubagentBlock {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: transparent;
+    }
+    SubagentBlock > .subagent-toggle {
+        width: auto;
+        height: 1;
+        min-width: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+    }
+    SubagentBlock > .subagent-content {
+        width: 100%;
+        height: auto;
+        margin-top: 0;
+        padding: 0 0 0 2;
+        background: transparent;
+    }
+    SubagentBlock > .subagent-content.hidden {
+        display: none;
+    }
+    SubagentBlock ChatView,
+    SubagentBlock ChatView #chat-log {
+        width: 100%;
+        height: auto;
+        background: transparent;
     }
 
     .web-summary-entry {
@@ -590,11 +626,14 @@ class ChatView(Widget):
     """
     )
 
-    def __init__(self, *args, markdown_enabled: bool = True, **kwargs):
+    def __init__(
+        self, *args, markdown_enabled: bool = True, user_spacer: bool = True, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.messages = []
         self._transcript: list[dict] = []
         self._assistant_markdown_enabled = bool(markdown_enabled)
+        self._user_spacer = bool(user_spacer)
         self._stream_target = None
         self._stream_role = None
         self._stream_content = ""
@@ -608,6 +647,8 @@ class ChatView(Widget):
         self._write_block: WrittenBlock | None = None
         self._shell_block: ShellBlock | None = None
         self._questions_block: QuestionsBlock | None = None
+        self._subagent_blocks: dict[str, SubagentBlock] = {}
+        self._subagent_transcript_indices: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
@@ -618,7 +659,7 @@ class ChatView(Widget):
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
-        if role == "user":
+        if role == "user" and self._user_spacer:
             self.query_one("#chat-log", VerticalScroll).mount(
                 Static("", classes="message-spacer")
             )
@@ -736,6 +777,8 @@ class ChatView(Widget):
         self._write_block = None
         self._shell_block = None
         self._questions_block = None
+        self._subagent_blocks.clear()
+        self._subagent_transcript_indices.clear()
 
     def clear_message_selection(self) -> None:
         widgets = [
@@ -938,6 +981,45 @@ class ChatView(Widget):
         })
         self.call_after_refresh(self._scroll_end)
 
+    def add_subagent_entry(self, agent_type: str, transcript: list[dict]) -> None:
+        self._activate_aux_output("subagent")
+        block = SubagentBlock(agent_type, transcript, self._assistant_markdown_enabled)
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "subagent",
+            "agent_type": str(agent_type or ""),
+            "transcript": deepcopy(list(transcript or [])),
+        })
+        self.call_after_refresh(self._scroll_end)
+
+    def start_subagent_entry(self, entry_id: str, agent_type: str) -> None:
+        self._activate_aux_output("subagent")
+        block = SubagentBlock(agent_type, [], self._assistant_markdown_enabled)
+        entry_id = str(entry_id)
+        self._subagent_blocks[entry_id] = block
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "subagent",
+            "agent_type": str(agent_type or ""),
+            "transcript": [],
+        })
+        self._subagent_transcript_indices[entry_id] = len(self._transcript) - 1
+        self.call_after_refresh(self._scroll_end)
+
+    def append_subagent_event(self, entry_id: str, event: dict) -> None:
+        entry_id = str(entry_id)
+        block = self._subagent_blocks.get(entry_id)
+        if block is None or not isinstance(event, dict):
+            return
+        block.add_event(event)
+        transcript_index = self._subagent_transcript_indices.get(entry_id)
+        if transcript_index is not None:
+            self._update_transcript_entry(
+                transcript_index,
+                transcript=deepcopy(block.persistent_transcript()),
+            )
+        self.call_after_refresh(self._scroll_end)
+
     def _reset_message_stream(self) -> None:
         self._stream_target = None
         self._stream_role = None
@@ -1036,6 +1118,12 @@ class ChatView(Widget):
             self.add_changed_files_entry([
                 dict(file_info or {}) for file_info in list(entry.get("files") or [])
             ])
+            return
+        if kind == "subagent":
+            self.add_subagent_entry(
+                str(entry.get("agent_type") or ""),
+                list(entry.get("transcript") or []),
+            )
 
     def add_web_fetch_entry(self, url: str) -> None:
         self._activate_aux_output("web_fetch")
@@ -1663,6 +1751,7 @@ class ThoughtBlock(Vertical):
         if control.has_class("thought-toggle") or control.has_class("thought-content"):
             self.expanded = not self.expanded
             self._refresh()
+            event.stop()
 
     def set_content(self, content) -> None:
         if content is None:
@@ -1728,6 +1817,7 @@ class ExploredBlock(Vertical):
         ):
             self.expanded = not self.expanded
             self._refresh()
+            event.stop()
 
     def add_entry(self, tool_name: str, description: str) -> None:
         self.entries.append((str(tool_name), str(description)))
@@ -1791,6 +1881,7 @@ class QuestionsBlock(Vertical):
         ):
             self.expanded = not self.expanded
             self._refresh()
+            event.stop()
 
     def add_entry(self, question: str, answer: str) -> None:
         self.entries.append((str(question or ""), str(answer or "")))
@@ -1821,6 +1912,223 @@ class QuestionsBlock(Vertical):
             content.remove_class("hidden")
         else:
             content.add_class("hidden")
+
+
+class SubagentBlock(Vertical):
+    def __init__(
+        self,
+        agent_type: str,
+        transcript: list[dict],
+        markdown_enabled: bool,
+    ):
+        super().__init__()
+        self.agent_type = str(agent_type or "subagent")
+        self.transcript = deepcopy(list(transcript or []))
+        self.markdown_enabled = bool(markdown_enabled)
+        self.expanded = False
+        self._toggle_widget: Static | None = None
+        self._content_widget: Vertical | None = None
+        self._chat_view: ChatView | None = None
+        self._loaded = False
+        self._thinking_started_at: float | None = None
+        self._thinking_timer = None
+
+    def compose(self) -> ComposeResult:
+        self._toggle_widget = Static(
+            self._header_label(), classes="subagent-toggle", markup=True
+        )
+        self._chat_view = ChatView(
+            markdown_enabled=self.markdown_enabled, user_spacer=False
+        )
+        self._content_widget = Vertical(
+            self._chat_view, classes="subagent-content hidden"
+        )
+        yield self._toggle_widget
+        yield self._content_widget
+
+    def on_mount(self) -> None:
+        self._refresh()
+        self._thinking_timer = self.set_interval(
+            0.1, self._refresh_thought_elapsed, pause=False
+        )
+        self._load_transcript()
+
+    def on_click(self, event: events.Click) -> None:
+        control = event.control
+        if hasattr(control, "has_class") and control.has_class("subagent-toggle"):
+            self.expanded = not self.expanded
+            self._refresh()
+        else:
+            self.expanded = False
+            self._refresh()
+        event.stop()
+
+    def _header_label(self) -> str:
+        marker = "»" if not self.expanded else "«"
+        return f"{marker} [white]Subagent[/white] [gray]{_escape_markup(self.agent_type)}[/gray]"
+
+    def _refresh(self) -> None:
+        if self._toggle_widget is not None:
+            self._toggle_widget.update(self._header_label())
+        if self._content_widget is None:
+            return
+        if self.expanded:
+            self._content_widget.remove_class("hidden")
+        else:
+            self._content_widget.add_class("hidden")
+
+    def _load_transcript(self) -> None:
+        if self._chat_view is not None:
+            self._chat_view.load_transcript(_subagent_chat_transcript(self.transcript))
+            self._loaded = True
+
+    def add_event(self, event: dict) -> None:
+        self.transcript.append(deepcopy(event))
+        if event.get("_persist_only"):
+            return
+        if not self._loaded or self._chat_view is None:
+            return
+        kind = str(event.get("kind") or "")
+        content = str(event.get("content") or "")
+        if kind == "thought_start":
+            return
+        if kind == "thought_end":
+            self._finish_thought_stream()
+            return
+        if kind == "thought_delta":
+            if self._thinking_started_at is None:
+                self._thinking_started_at = time.monotonic()
+                self._chat_view.start_thought_stream()
+            self._chat_view.append_thought_stream(content)
+            return
+        if kind == "message_delta":
+            self._finish_thought_stream()
+            self._chat_view.append_stream(content, role="assistant")
+            return
+        if kind in {"tool_call", "tool_result"}:
+            self._finish_thought_stream()
+        for entry in _subagent_chat_transcript([event]):
+            self._chat_view._replay_transcript_entry(entry)
+
+    def persistent_transcript(self) -> list[dict]:
+        return [
+            deepcopy(event)
+            for event in self.transcript
+            if str(event.get("kind") or "")
+            not in {"thought_start", "thought_delta", "message_delta"}
+        ]
+
+    def _refresh_thought_elapsed(self) -> None:
+        if self._thinking_started_at is None or self._chat_view is None:
+            return
+        self._chat_view.update_thought_stream_elapsed(
+            max(0.0, time.monotonic() - self._thinking_started_at)
+        )
+
+    def _finish_thought_stream(self) -> None:
+        if self._thinking_started_at is None or self._chat_view is None:
+            return
+        self._chat_view.finish_thought_stream(
+            max(0.0, time.monotonic() - self._thinking_started_at)
+        )
+        self._thinking_started_at = None
+
+
+def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
+    entries: list[dict] = []
+    for entry in transcript:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("_persist_only"):
+            entry = dict(entry)
+            entry.pop("_persist_only", None)
+        kind = str(entry.get("kind") or "")
+        if kind in {"thought_start", "thought_delta", "message_delta"}:
+            continue
+        if kind in {"message", "thought"}:
+            entries.append(entry)
+            continue
+        if kind == "tool_call":
+            name = str(entry.get("name") or "")
+            arguments = entry.get("arguments", {})
+            description = _subagent_explored_description(name, arguments)
+            if description:
+                entries.append({
+                    "kind": "explored_entry",
+                    "tool_name": name,
+                    "description": description,
+                })
+            continue
+        if kind != "tool_result":
+            continue
+        display = entry.get("display")
+        if isinstance(display, dict):
+            display_kind = str(display.get("kind") or "")
+            if display_kind == "web_fetch":
+                entries.append({"kind": "web_fetch", "url": display.get("url", "")})
+                continue
+            if display_kind == "web_search":
+                entries.append({"kind": "web_search", "content": display.get("content", "")})
+                continue
+            if display_kind in {"file_edit", "file_write"}:
+                entries.append({
+                    "kind": "edit" if display_kind == "file_edit" else "write",
+                    "file_path": display.get("file_path", ""),
+                    "additions": display.get("additions", 0),
+                    "deletions": display.get("deletions", 0),
+                    "diff": display.get("diff", ""),
+                })
+                continue
+            if display_kind == "shell":
+                entries.append({
+                    "kind": "shell",
+                    "command": display.get("command", ""),
+                    "output": display.get("output", ""),
+                })
+                continue
+    return entries
+
+
+def _subagent_explored_description(name: str, arguments) -> str:
+    if not isinstance(arguments, dict):
+        return ""
+    if name == "read_file":
+        parts = ["[white]Read[/white]"]
+        file_path = _escape_markup(arguments.get("file_path") or "")
+        if file_path:
+            parts.append(f"[gray]{file_path}[/gray]")
+        start_line = arguments.get("start_line")
+        end_line = arguments.get("end_line")
+        if start_line is not None and end_line is not None:
+            parts.append(f"[gray]offset={start_line} limit={end_line}[/gray]")
+        elif start_line is not None:
+            parts.append(f"[gray]offset={start_line}[/gray]")
+        return " ".join(parts)
+    if name == "read_program_docs":
+        return "[white]Read program docs[/white]"
+    if name == "list_skills":
+        return "[white]List skills[/white]"
+    if name == "read_skill":
+        parts = ["[white]Read skill[/white]"]
+        skill_name = _escape_markup(arguments.get("name") or "")
+        if skill_name:
+            parts.append(f"[gray]{skill_name}[/gray]")
+        return " ".join(parts)
+    if name == "grep":
+        parts = ["[white]Grep[/white]"]
+        pattern = _escape_markup(arguments.get("pattern") or "")
+        if pattern:
+            parts.append(f"[gray]{pattern}[/gray]")
+        if arguments.get("include"):
+            parts.append(f"[gray]include={_escape_markup(arguments['include'])}[/gray]")
+        if arguments.get("path"):
+            parts.append(f"[gray]path={_escape_markup(arguments['path'])}[/gray]")
+        return " ".join(parts)
+    if name == "glob":
+        return f"[white]Glob[/white] [gray]{_escape_markup(arguments.get('pattern') or '')}[/gray]"
+    if name == "list_dir":
+        return f"[white]List dir[/white] [gray]{_escape_markup(arguments.get('path') or '.')}[/gray]"
+    return ""
 
 
 class EditedBlock(Vertical):

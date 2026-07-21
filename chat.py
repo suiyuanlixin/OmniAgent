@@ -2,11 +2,13 @@ import json
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ui import (
     add_explored_entry,
+    append_subagent_event,
     clean_and_print_stream_response,
     clean_display_text,
     finish_thinking_round,
@@ -19,6 +21,7 @@ from ui import (
     print_warn,
     set_todo_panel,
     set_context_usage,
+    start_subagent_entry,
 )
 from config import (
     API_TYPE_ANTHROPIC,
@@ -979,6 +982,14 @@ class OmniAgent:
             tool_calls,
             response_streamed,
         )
+
+    @staticmethod
+    def _combine_stream_reasoning_text(field_thinking, tagged_thinking):
+        return _combine_reasoning_text(field_thinking, tagged_thinking)
+
+    @staticmethod
+    def _clean_stream_reasoning_text(thinking):
+        return _clean_reasoning_text(thinking)
 
     def _chat_completion_agent_response(self):
         full_thinking = ""
@@ -3491,25 +3502,36 @@ class OmniAgent:
         )
         label = _single_line(purpose or task, 120)
         self._before_agent_visible_output()
-        print_info(f"Dispatching subagent {spec.name}: {label}")
-
+        entry_id = uuid.uuid4().hex
+        start_subagent_entry(entry_id, spec.name)
         runner = SubagentRunner(
             parent_agent=self,
             spec=spec,
             tool_schemas=self._subagent_tool_schemas(spec),
-            execute_tool=self.agent_tools.execute,
+            execute_tool=self._execute_subagent_tool,
             compact_tool_result=_compact_tool_result_for_context,
+            event_callback=lambda event: append_subagent_event(entry_id, event),
         )
         try:
             result = runner.run(subagent_task)
         except Exception as error:
-            print_warn(f"Subagent {spec.name} failed: {error}")
             return _error_text(f"Subagent '{spec.name}' failed: {error}")
 
-        print_info(
-            f"Subagent {spec.name} completed; returning {len(result)} characters."
-        )
+        self.agent_tools._display_payload = {
+            "kind": "subagent",
+            "agent_type": spec.name,
+            "purpose": label,
+            "transcript": runner.transcript,
+        }
         return result
+
+    def _execute_subagent_tool(self, name, tool_input):
+        previous = self.agent_tools.suppress_visible_output
+        self.agent_tools.suppress_visible_output = True
+        try:
+            return self.agent_tools.execute(name, tool_input)
+        finally:
+            self.agent_tools.suppress_visible_output = previous
 
     def _execute_teammate(
         self,

@@ -65,18 +65,22 @@ class TodosPanel(Widget):
         display: none;
         width: 100%;
         height: auto;
-        min-width: 46;
-        padding: 0 1 0 1;
+        min-width: 0;
+        padding: 0;
+        margin: 0 1;
         align-horizontal: center;
         background: $PAGE_BACKGROUND;
     }
     TodosPanel.visible {
         display: block;
     }
+    TodosPanel.prompt-active {
+        display: none;
+    }
 
     TodosPanel > #todos-shell {
         width: 100%;
-        min-width: 44;
+        min-width: 0;
         max-width: 78;
         height: auto;
         background: $PAGE_BACKGROUND;
@@ -92,13 +96,14 @@ class TodosPanel(Widget):
     TodosPanel > #todos-shell > #todos-panel {
         width: 100%;
         height: auto;
-        padding: 0 2 0 2;
+        padding: 0;
         background: $INFO_BAR_BACKGROUND;
     }
 
     #todos-header {
-        width: 100%;
+        width: 1fr;
         height: 1;
+        margin: 0 2;
         background: $INFO_BAR_BACKGROUND;
     }
 
@@ -110,11 +115,13 @@ class TodosPanel(Widget):
     }
 
     #todos-current {
-        width: auto;
+        width: 1fr;
+        min-width: 0;
         height: 1;
         color: $TEXT_MUTED;
         background: $INFO_BAR_BACKGROUND;
         margin-left: 1;
+        overflow: hidden;
     }
     #todos-current.hidden {
         display: none;
@@ -128,14 +135,16 @@ class TodosPanel(Widget):
 
     #todos-toggle {
         width: auto;
+        min-width: 1;
         height: 1;
         color: $TEXT_PRIMARY;
         background: $INFO_BAR_BACKGROUND;
     }
 
     #todos-list {
-        width: 100%;
+        width: 1fr;
         height: auto;
+        margin: 0 2;
         background: $INFO_BAR_BACKGROUND;
     }
     #todos-list.hidden {
