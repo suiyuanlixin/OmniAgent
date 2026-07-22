@@ -236,9 +236,7 @@ class SubagentRegistry:
         return dict(_ALIASES)
 
     def describe(self) -> str:
-        lines = [
-            f"- {spec.name}: {spec.description}" for spec in self._specs.values()
-        ]
+        lines = [f"- {spec.name}: {spec.description}" for spec in self._specs.values()]
         if _ALIASES:
             aliases = ", ".join(
                 f"{alias} -> {target}" for alias, target in sorted(_ALIASES.items())
@@ -356,8 +354,8 @@ class SubagentRunner:
                 self._stream_event("thought_start", "")
             try:
                 if self.parent.api_type == API_TYPE_ANTHROPIC:
-                    assistant_message, _thinking, text, tool_calls = self._anthropic_turn(
-                        history
+                    assistant_message, _thinking, text, tool_calls = (
+                        self._anthropic_turn(history)
                     )
                 elif self.parent.api_type == API_TYPE_OLLAMA:
                     assistant_message, _thinking, text, tool_calls = self._ollama_turn(
@@ -409,9 +407,7 @@ class SubagentRunner:
                 self._record_event({
                     "kind": "tool_call",
                     "name": str(tool_call.get("name") or ""),
-                    "arguments": tool_call.get(
-                        "input", tool_call.get("arguments", {})
-                    ),
+                    "arguments": tool_call.get("input", tool_call.get("arguments", {})),
                 })
             final_response += text
 
@@ -498,9 +494,7 @@ class SubagentRunner:
             if delta is None:
                 continue
             reasoning, next_field_thinking, raw_thinking = (
-                self.parent._stream_reasoning_delta(
-                    delta, field_thinking, raw_thinking
-                )
+                self.parent._stream_reasoning_delta(delta, field_thinking, raw_thinking)
             )
             if reasoning:
                 field_thinking = next_field_thinking
@@ -512,9 +506,7 @@ class SubagentRunner:
                 raw_content,
             )
             tagged_reasoning, tagged_thinking = (
-                self.parent._stream_tagged_reasoning_delta(
-                    raw_content, tagged_thinking
-                )
+                self.parent._stream_tagged_reasoning_delta(raw_content, tagged_thinking)
             )
             if tagged_reasoning and self.parent.thinking_mode:
                 self._stream_event("thought_delta", str(tagged_reasoning))
@@ -596,9 +588,7 @@ class SubagentRunner:
             if chunk_type == "content_block_start":
                 content_block = self.parent._get_field(chunk, "content_block")
                 block_type = self.parent._get_field(content_block, "type", "")
-                initial_reasoning = self.parent._anthropic_reasoning_text(
-                    content_block
-                )
+                initial_reasoning = self.parent._anthropic_reasoning_text(content_block)
                 if block_type == "text":
                     if initial_reasoning:
                         blocks.append({
@@ -606,9 +596,7 @@ class SubagentRunner:
                             "thinking": initial_reasoning,
                         })
                         if self.parent.thinking_mode:
-                            self._stream_event(
-                                "thought_delta", str(initial_reasoning)
-                            )
+                            self._stream_event("thought_delta", str(initial_reasoning))
                     block = {"type": "text", "text": ""}
                 elif (
                     self.parent._is_anthropic_reasoning_block_type(block_type)

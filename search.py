@@ -180,11 +180,16 @@ def format_tavily_response(data, query="", key_source=""):
         if score is not None:
             block.append(f"Score: {score}")
         if content:
-            block.append("Content: " + _truncate(" ".join(content.split()), MAX_SEARCH_RESULT_CONTENT_CHARS))
+            block.append(
+                "Content: "
+                + _truncate(" ".join(content.split()), MAX_SEARCH_RESULT_CONTENT_CHARS)
+            )
         if raw_content:
             block.append(
                 "Raw content: "
-                + _truncate(" ".join(raw_content.split()), MAX_SEARCH_RESULT_CONTENT_CHARS)
+                + _truncate(
+                    " ".join(raw_content.split()), MAX_SEARCH_RESULT_CONTENT_CHARS
+                )
             )
         result_lines.append("\n".join(block))
 

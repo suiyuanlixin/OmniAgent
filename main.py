@@ -1,6 +1,5 @@
 import base64
 import mimetypes
-import re
 from pathlib import Path
 
 from references import resolve_references, reference_path_key

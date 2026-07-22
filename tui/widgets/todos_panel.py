@@ -39,19 +39,22 @@ class TodoLine(Static):
         content = str(item.get("content") or "").strip()
         symbol = _todo_status_symbol(status)
         completed = status == "completed"
+        background = (
+            self.styles.background.hex
+            if self.styles.background is not None
+            else INFO_BAR_BACKGROUND
+        )
 
         text = Text(no_wrap=True, overflow="crop")
         symbol_color = TEXT_MUTED if completed else TEXT_PRIMARY
         text_color = TEXT_MUTED if completed else TEXT_PRIMARY
 
-        text.append(
-            symbol, style=Style(color=symbol_color, bgcolor=INFO_BAR_BACKGROUND)
-        )
-        text.append(" ", style=Style(color=text_color, bgcolor=INFO_BAR_BACKGROUND))
+        text.append(symbol, style=Style(color=symbol_color, bgcolor=background))
+        text.append(" ", style=Style(color=text_color, bgcolor=background))
         start = len(text)
         text.append(
             content,
-            style=Style(color=text_color, bgcolor=INFO_BAR_BACKGROUND),
+            style=Style(color=text_color, bgcolor=background),
         )
         if completed and len(text) > start:
             text.stylize("strike", start, len(text))

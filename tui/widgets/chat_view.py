@@ -42,6 +42,7 @@ from tui.theme import (
     render_css,
 )
 from tui.widgets.chat_input import HalfRowSpacer, BottomHalfRowSpacer
+from tui.widgets.todos_panel import TodoLine
 
 
 def _patch_rich_markdown_tables() -> None:
@@ -276,6 +277,75 @@ class ChatView(Widget):
         background: transparent;
     }
     QuestionsBlock > .questions-content.hidden {
+        display: none;
+    }
+
+    TodosBlock {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    TodosBlock > .todos-toggle {
+        width: auto;
+        height: 1;
+        min-width: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+    }
+    TodosBlock > .todos-toggle:hover,
+    TodosBlock > .todos-toggle:focus-within {
+        background: transparent;
+        color: $TEXT_MUTED;
+    }
+
+    TodosBlock > .todos-content {
+        width: 100%;
+        height: auto;
+        padding: 0;
+        color: $TEXT_MUTED;
+        background: transparent;
+    }
+    TodosBlock > .todos-content > .todos-top-spacer {
+        color: $SURFACE_BACKGROUND;
+        background: $PAGE_BACKGROUND;
+    }
+    TodosBlock > .todos-content > .todos-panel {
+        width: 100%;
+        height: auto;
+        padding: 0;
+        background: $SURFACE_BACKGROUND;
+    }
+    TodosBlock > .todos-content > .todos-panel > .todos-summary {
+        width: 1fr;
+        height: 1;
+        margin: 0 2;
+        color: $TEXT_PRIMARY;
+        background: $SURFACE_BACKGROUND;
+    }
+    TodosBlock > .todos-content > .todos-panel > .todos-list {
+        width: 1fr;
+        height: auto;
+        margin: 0 2;
+        background: $SURFACE_BACKGROUND;
+    }
+    TodosBlock > .todos-content > .todos-panel > .todos-list > TodoLine {
+        width: 100%;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        background: $SURFACE_BACKGROUND;
+    }
+    TodosBlock > .todos-content > .todos-bottom-spacer {
+        color: $SURFACE_BACKGROUND;
+        background: $PAGE_BACKGROUND;
+    }
+    TodosBlock > .todos-content.hidden {
         display: none;
     }
 
@@ -981,6 +1051,19 @@ class ChatView(Widget):
         })
         self.call_after_refresh(self._scroll_end)
 
+    def add_todo_entry(
+        self, items: list[dict] | None, summary: dict | None = None
+    ) -> None:
+        self._activate_aux_output("todo")
+        block = TodosBlock(items or [], summary)
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "todo",
+            "items": [dict(item or {}) for item in list(items or [])],
+            "summary": dict(summary or {}),
+        })
+        self.call_after_refresh(self._scroll_end)
+
     def add_subagent_entry(self, agent_type: str, transcript: list[dict]) -> None:
         self._activate_aux_output("subagent")
         block = SubagentBlock(agent_type, transcript, self._assistant_markdown_enabled)
@@ -1084,6 +1167,12 @@ class ChatView(Widget):
             self.add_question_entry(
                 str(entry.get("question") or ""),
                 str(entry.get("answer") or ""),
+            )
+            return
+        if kind == "todo":
+            self.add_todo_entry(
+                [dict(item or {}) for item in list(entry.get("items") or [])],
+                dict(entry.get("summary") or {}),
             )
             return
         if kind == "web_fetch":
@@ -1914,6 +2003,78 @@ class QuestionsBlock(Vertical):
             content.add_class("hidden")
 
 
+class TodosBlock(Vertical):
+    def __init__(self, items: list[dict], summary: dict | None = None):
+        super().__init__()
+        self.items = [dict(item or {}) for item in list(items or [])]
+        self.summary = dict(summary or {})
+        self.expanded = False
+        self._toggle_widget: Static | None = None
+        self._content_widget: Vertical | None = None
+        self._summary_widget: Static | None = None
+        self._list_widget: Vertical | None = None
+
+    def compose(self) -> ComposeResult:
+        self._toggle_widget = Static(
+            self._header_label(), classes="todos-toggle", markup=True
+        )
+        self._summary_widget = Static("", classes="todos-summary")
+        self._list_widget = Vertical(classes="todos-list")
+        yield self._toggle_widget
+        with Vertical(classes="todos-content hidden") as content:
+            yield BottomHalfRowSpacer(classes="todos-top-spacer")
+            with Vertical(classes="todos-panel"):
+                yield self._summary_widget
+                yield self._list_widget
+            yield HalfRowSpacer(classes="todos-bottom-spacer")
+        self._content_widget = content
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def on_click(self, event: events.Click) -> None:
+        self.expanded = not self.expanded
+        self._refresh()
+        event.stop()
+
+    def _header_label(self) -> str:
+        total = int(self.summary.get("total", len(self.items)) or 0)
+        completed = int(self.summary.get("completed", 0) or 0)
+        if self.expanded:
+            return "[gray]#[/] [white]Todos[/white]"
+        return (
+            f"[gray]#[/] [white]Todos[/white] "
+            f"[gray]{completed} of {total} todos completed[/gray]"
+        )
+
+    def _refresh(self) -> None:
+        toggle = self._toggle_widget
+        content = self._content_widget
+        summary = self._summary_widget
+        rows = self._list_widget
+        if toggle is None or content is None or summary is None or rows is None:
+            return
+        toggle.update(self._header_label())
+        completed = int(self.summary.get("completed", 0) or 0)
+        total = int(self.summary.get("total", len(self.items)) or 0)
+        summary.update(f"{completed} of {total} todos completed")
+        existing = list(rows.children)
+        target = len(self.items)
+        while len(existing) > target:
+            existing.pop().remove()
+        while len(existing) < target:
+            line = TodoLine()
+            rows.mount(line)
+            existing.append(line)
+        for line, item in zip(existing, self.items):
+            if isinstance(line, TodoLine):
+                line.set_item(item)
+        if self.expanded:
+            content.remove_class("hidden")
+        else:
+            content.add_class("hidden")
+
+
 class SubagentBlock(Vertical):
     def __init__(
         self,
@@ -2068,7 +2229,10 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
                 entries.append({"kind": "web_fetch", "url": display.get("url", "")})
                 continue
             if display_kind == "web_search":
-                entries.append({"kind": "web_search", "content": display.get("content", "")})
+                entries.append({
+                    "kind": "web_search",
+                    "content": display.get("content", ""),
+                })
                 continue
             if display_kind in {"file_edit", "file_write"}:
                 entries.append({

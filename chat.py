@@ -213,7 +213,9 @@ def _format_stream_error_message(error):
         return "流式请求失败。"
     if "validation errors for ChatRequest" in text and "think." in text:
         return "流式请求失败：当前 Ollama thinking 强度仅支持 low / medium / high。"
-    first_line = next((line.strip() for line in text.splitlines() if line.strip()), text)
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()), text
+    )
     if len(first_line) > 180:
         first_line = first_line[:177].rstrip() + "..."
     return f"流式请求失败：{first_line}"
@@ -3031,7 +3033,9 @@ class OmniAgent:
 
     def generate_session_title(self, user_message):
         source_text = clean_display_text(user_message or "")
-        fallback_title = " ".join(source_text.split())[:60] if source_text else "New Chat"
+        fallback_title = (
+            " ".join(source_text.split())[:60] if source_text else "New Chat"
+        )
         if not source_text:
             return fallback_title
 

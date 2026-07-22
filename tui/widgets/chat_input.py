@@ -563,7 +563,11 @@ class MessageTextArea(TextArea):
     def render_line(self, y: int):
         if y == 0 and not self.text:
             width = max(1, self.size.width)
-            hint = "" if self._suppress_placeholder else self._owner.input_placeholder(self)
+            hint = (
+                ""
+                if self._suppress_placeholder
+                else self._owner.input_placeholder(self)
+            )
             placeholder_style = Style(
                 color=TEXT_MUTED,
                 bgcolor=self._placeholder_background,
@@ -1333,7 +1337,9 @@ class ChatInput(Widget):
             self._select_prompt_option(event.index)
         event.stop()
 
-    def on_pending_message_row_selected(self, event: PendingMessageRow.Selected) -> None:
+    def on_pending_message_row_selected(
+        self, event: PendingMessageRow.Selected
+    ) -> None:
         self._start_pending_edit(event.message_id)
         event.stop()
 
@@ -1875,9 +1881,7 @@ class ChatInput(Widget):
                     )
                 )
 
-    def _find_pending_editor(
-        self, message_id: int
-    ) -> MessageTextArea | None:
+    def _find_pending_editor(self, message_id: int) -> MessageTextArea | None:
         for editor in self.query("#pending-list MessageTextArea"):
             if getattr(editor, "pending_message_id", None) == message_id:
                 return editor

@@ -1503,6 +1503,14 @@ class AgentTUIApp(App):
     def _append_question_entry(self, question: str, answer: str) -> None:
         self.query_one("#messages-view", ChatView).add_question_entry(question, answer)
 
+    def add_todo_entry(self, items: list[dict], summary: dict | None = None) -> None:
+        self._call_ui(self._append_todo_entry, items, summary)
+
+    def _append_todo_entry(
+        self, items: list[dict], summary: dict | None = None
+    ) -> None:
+        self.query_one("#messages-view", ChatView).add_todo_entry(items, summary)
+
     def add_web_fetch_entry(self, url: str) -> None:
         self._call_ui(self._append_web_fetch_entry, url)
 
@@ -1518,9 +1526,7 @@ class AgentTUIApp(App):
     def add_subagent_entry(self, agent_type: str, transcript: list[dict]) -> None:
         self._call_ui(self._append_subagent_entry, agent_type, transcript)
 
-    def _append_subagent_entry(
-        self, agent_type: str, transcript: list[dict]
-    ) -> None:
+    def _append_subagent_entry(self, agent_type: str, transcript: list[dict]) -> None:
         self.query_one("#messages-view", ChatView).add_subagent_entry(
             agent_type, transcript
         )
@@ -4396,9 +4402,9 @@ class AgentTUIApp(App):
 
     def _replay_tool_result_message(self, view: ChatView, message: dict) -> None:
         name = str(message.get("tool_name") or message.get("name") or "")
-        if name == "update_todo":
-            return
         if self._replay_tool_result_display(view, message.get("display")):
+            return
+        if name == "update_todo":
             return
         content = clean_display_text_preserve_newlines(message.get("content", ""))
         label = f"Tool result: {name}".strip()
@@ -4410,9 +4416,9 @@ class AgentTUIApp(App):
         if not isinstance(block, dict):
             return
         name = str(block.get("tool_name") or "")
-        if name == "update_todo":
-            return
         if self._replay_tool_result_display(view, block.get("display")):
+            return
+        if name == "update_todo":
             return
         content = clean_display_text_preserve_newlines(block.get("content", ""))
         tool_use_id = str(block.get("tool_use_id") or "")
@@ -4453,6 +4459,15 @@ class AgentTUIApp(App):
             answer = clean_display_text_preserve_newlines(display.get("answer", ""))
             if question or answer:
                 view.add_question_entry(question, answer)
+                return True
+            return False
+        if kind == "todo":
+            items = display.get("items")
+            summary = display.get("summary")
+            if isinstance(items, list):
+                view.add_todo_entry(
+                    items, summary if isinstance(summary, dict) else None
+                )
                 return True
             return False
         if kind == "web_fetch":

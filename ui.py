@@ -201,6 +201,12 @@ def add_question_entry(question, answer):
         bridge.add_question_entry(question, answer)
 
 
+def add_todo_entry(items, summary=None):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_todo_entry(items, summary)
+
+
 def add_web_fetch_entry(url):
     bridge = get_bridge()
     if bridge is not None:

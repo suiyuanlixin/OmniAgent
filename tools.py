@@ -20,6 +20,7 @@ from ui import (
     add_edit_entry,
     add_question_entry,
     add_shell_entry,
+    add_todo_entry,
     add_web_fetch_entry,
     add_web_search_entry,
     add_write_entry,
@@ -1574,9 +1575,66 @@ class AgentTools:
         self._display_payload = None
         return payload
 
+    def _todo_display_items(self):
+        items = []
+        for item in self.todo_store.items:
+            if getattr(item, "system", False):
+                continue
+            items.append({
+                "id": str(getattr(item, "id", "") or ""),
+                "content": str(getattr(item, "content", "") or ""),
+                "status": str(getattr(item, "status", "") or ""),
+                "priority": str(getattr(item, "priority", "") or ""),
+                "verified": bool(getattr(item, "verified", False)),
+                "reason": str(getattr(item, "reason", "") or ""),
+            })
+        return items
+
+    @staticmethod
+    def _todo_display_summary(items):
+        items = [item for item in list(items or []) if isinstance(item, dict)]
+        total = len(items)
+        completed = sum(
+            1 for item in items if str(item.get("status") or "") == "completed"
+        )
+        in_progress_content = next(
+            (
+                str(item.get("content") or "")
+                for item in items
+                if str(item.get("status") or "") == "in_progress"
+            ),
+            "",
+        )
+        return {
+            "total": total,
+            "completed": completed,
+            "in_progress_content": in_progress_content,
+            "has_blocked": any(
+                str(item.get("status") or "") == "blocked" for item in items
+            ),
+            "has_failed": any(
+                str(item.get("status") or "") == "failed" for item in items
+            ),
+        }
+
+    def _todo_display_payload(self):
+        items = self._todo_display_items()
+        return {
+            "kind": "todo",
+            "summary": self._todo_display_summary(items),
+            "items": items,
+        }
+
     def _update_todo(self, tool_input):
         items = tool_input.get("items")
         self.todo_store.update(items)
+        self._display_payload = self._todo_display_payload()
+        self._before_visible_output()
+        if not self.suppress_visible_output:
+            add_todo_entry(
+                self._display_payload.get("items", []),
+                self._display_payload.get("summary"),
+            )
         return self.todo_store.tool_result(
             max_tool_calls=self.max_tool_calls,
             used_tool_calls=self.used_tool_calls,
