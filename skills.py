@@ -111,6 +111,20 @@ class SkillRegistry:
         )
         return "\n".join(lines)
 
+    def workspace_usage_prompt(self):
+        if not self.enabled or not self.workspace_enabled or self.workspace_dir is None:
+            return ""
+        return (
+            "\nWorkspace skills are enabled. At the start of every non-trivial task, "
+            "call list_skills before using task-specific tools, even when no skill is "
+            "immediately obvious from the request. Inspect names, descriptions, and triggers; "
+            "if any skill could materially help, call read_skill before proceeding and follow "
+            "its workflow. Prefer using a plausible skill over recreating its process manually. "
+            "Skip discovery only for simple direct answers or when the relevant skill has "
+            "already been loaded for the current task. Do not load unrelated skills merely to "
+            "increase tool usage."
+        )
+
     def list_for_tool(self):
         if not self.enabled:
             return "Skills are disabled."

@@ -627,6 +627,12 @@ class ChatInput(Widget):
     ChatInput.prompt-mode #message-input {
         padding: 0;
     }
+    ChatInput.prompt-separated-options #prompt-options {
+        margin-top: 1;
+    }
+    ChatInput.prompt-separated-options #prompt-question {
+        min-height: 1;
+    }
 
     ChatInput > #input-area {
         width: 100%;
@@ -695,11 +701,18 @@ class ChatInput(Widget):
         color: $SURFACE_BACKGROUND;
         background: $PAGE_BACKGROUND;
     }
+    ChatInput.todo-visible #pending-top-gap {
+        color: $INFO_BAR_BACKGROUND;
+    }
     #pending-top-gap.visible {
         display: block;
     }
     #pending-shell.visible {
         display: block;
+    }
+    ChatInput.prompt-mode #pending-top-gap,
+    ChatInput.prompt-mode #pending-shell {
+        display: none;
     }
     #pending-list {
         width: 100%;
@@ -958,6 +971,7 @@ class ChatInput(Widget):
         min-width: 0;
         margin: 0;
     }
+    #plan-drop.hidden,
     #approval-drop.hidden {
         display: none;
     }
@@ -1091,6 +1105,7 @@ class ChatInput(Widget):
 
     plan_mode = reactive(True)
     chat_active = reactive(False)
+    project_selected = reactive(False)
     allow_model_change = reactive(True)
     controls_locked = reactive(False)
     prompt_active = reactive(False)
@@ -1494,8 +1509,17 @@ class ChatInput(Widget):
 
     def _update_plan_build(self) -> None:
         try:
+            plan_drop = self.query_one("#plan-drop", Container)
             trigger = self.query_one("#plan-trigger", Button)
             approval = self.query_one("#approval-drop", Container)
+            if self.project_selected:
+                plan_drop.remove_class("hidden")
+            else:
+                plan_drop.add_class("hidden")
+                approval.add_class("hidden")
+                self._close_all_dropdowns()
+                self._fit_trigger_to_label("plan")
+                return
             if self.plan_mode:
                 trigger.label = "Plan"
                 trigger.remove_class("mode-build")
@@ -1562,6 +1586,11 @@ class ChatInput(Widget):
                 "approval", APPROVAL_LEVELS, self.selected_approval_value
             )
             self._set_approval_level(self.selected_approval_value)
+
+    def set_project_selected(self, selected: bool) -> None:
+        self.project_selected = bool(selected)
+        if self.is_mounted:
+            self._update_plan_build()
 
     def set_model_change_allowed(self, allowed):
         self.allow_model_change = bool(allowed)
@@ -1766,7 +1795,10 @@ class ChatInput(Widget):
         if not self.is_mounted:
             return
         text_area = self._message_input()
-        width = max(1, text_area.content_region.width)
+        horizontal_padding = int(text_area.styles.padding.left or 0) + int(
+            text_area.styles.padding.right or 0
+        )
+        width = max(1, text_area.content_region.width - horizontal_padding)
         lines = str(text_area.text or "").split("\n") or [""]
         height = 0
         for line in lines:
@@ -1903,7 +1935,7 @@ class ChatInput(Widget):
             return
         top_gap = self.query_one("#pending-top-gap", BottomHalfRowSpacer)
         shell = self.query_one("#pending-shell", Horizontal)
-        show_shell = bool(self._pending_messages)
+        show_shell = bool(self._pending_messages) and not self.prompt_active
         if show_shell:
             top_gap.add_class("visible")
             shell.add_class("visible")
@@ -1913,6 +1945,10 @@ class ChatInput(Widget):
             self._editing_pending_message_id = None
         self._rebuild_pending_list()
         self._update_direct_send_button_state()
+
+    def set_todo_visible(self, visible: bool) -> None:
+        self.set_class(bool(visible), "todo-visible")
+        self._update_pending_shell()
 
     def _update_direct_send_button_state(self) -> None:
         return
@@ -2241,6 +2277,7 @@ class ChatInput(Widget):
         question: str = "",
         options: list[tuple[str, str, bool]] | None = None,
         allow_custom: bool = False,
+        separate_options: bool = False,
         selected_option_index: int | None = None,
         custom_selected: bool = False,
         custom_value: str = "",
@@ -2253,6 +2290,7 @@ class ChatInput(Widget):
         if not active:
             self.prompt_active = False
             self.remove_class("prompt-mode")
+            self.remove_class("prompt-separated-options")
             self.remove_class("prompt-no-input")
             self._prompt_question = ""
             self._prompt_options = []
@@ -2265,11 +2303,13 @@ class ChatInput(Widget):
             self.query_one("#prompt-progress", Static).update("")
             self.query_one("#prompt-question", Static).update("")
             self.query_one("#prompt-options", Vertical).remove_children()
+            self._update_pending_shell()
             self.call_after_refresh(self._update_input_height)
             return
 
         self.prompt_active = True
         self.add_class("prompt-mode")
+        self.set_class(bool(separate_options), "prompt-separated-options")
         self._close_all_dropdowns()
         self._hide_command_menu()
         self._prompt_current_index = max(1, int(current_index or 1))
@@ -2324,6 +2364,7 @@ class ChatInput(Widget):
             self.remove_class("prompt-no-input")
         else:
             self.add_class("prompt-no-input")
+        self._update_pending_shell()
         self.call_after_refresh(self._update_input_height)
         self.post_message(self.PromptStateChanged(self.prompt_can_submit()))
 

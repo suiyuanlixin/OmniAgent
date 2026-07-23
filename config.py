@@ -59,7 +59,6 @@ DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
 AUTO_MODEL_SELECTION = "auto"
 DEFAULT_COMPACTION_COMPACT_MODEL = AUTO_MODEL_SELECTION
 DEFAULT_MEMORY_MODEL = AUTO_MODEL_SELECTION
-DEFAULT_DEBUG = False
 DEFAULT_RENDER_MARKDOWN = True
 AGENT_APPROVAL_MODES = {
     AGENT_APPROVAL_CONFIRM,
@@ -112,7 +111,6 @@ GLOBAL_FIELD_KEYS = {
     "compaction_compact_model",
     "memory_model",
     "render_markdown",
-    "debug",
     "web_search_enable",
     "web_search_provider",
     "web_search_api_key",
@@ -172,7 +170,6 @@ class AppConfig:
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
     memory_model: str = DEFAULT_MEMORY_MODEL
     render_markdown: bool = DEFAULT_RENDER_MARKDOWN
-    debug: bool = DEFAULT_DEBUG
     web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
     web_search_provider: str = DEFAULT_WEB_SEARCH_PROVIDER
     web_search_api_key: str = ""
@@ -281,7 +278,6 @@ class AppConfig:
                 "search_depth": self.web_search_depth,
                 "topic": self.web_search_topic,
             },
-            **({"debug": True} if self.debug else {}),
         }
 
     def to_flat_dict(self):
@@ -303,7 +299,6 @@ class AppConfig:
             "compaction_compact_model": self.compaction_compact_model,
             "memory_model": self.memory_model,
             "render_markdown": self.render_markdown,
-            "debug": self.debug,
             "web_search_enable": self.web_search_enable,
             "web_search_provider": self.web_search_provider,
             "web_search_api_key": self.web_search_api_key,
@@ -765,7 +760,6 @@ def _sanitize_config(data):
         render_markdown=_parse_bool(
             general_config.get("render_markdown"), DEFAULT_RENDER_MARKDOWN
         ),
-        debug=_parse_bool(data.get("debug"), DEFAULT_DEBUG),
         web_search_enable=_parse_bool(
             web_search.get("enable"), DEFAULT_WEB_SEARCH_ENABLE
         ),
@@ -981,8 +975,6 @@ def save_config_fields(fields):
             config.memory_model = normalize_optional_model_selection(value)
         elif key == "render_markdown":
             config.render_markdown = _parse_bool(value, config.render_markdown)
-        elif key == "debug":
-            config.debug = _parse_bool(value, DEFAULT_DEBUG)
         elif key == "web_search_enable":
             config.web_search_enable = _parse_bool(value, config.web_search_enable)
         elif key == "web_search_provider":

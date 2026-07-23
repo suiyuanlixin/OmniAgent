@@ -1,38 +1,38 @@
 # OmniAgent
 
-OmniAgent 是一个基于 Python 和 Rich 的终端 AI Agent 工作台。它面向本地多步骤任务，支持 GLM / ZhipuAI、Anthropic Messages API、OpenAI Chat Completions API、Gemini API 以及 Ollama 本地 / 云端模型，可在限定工作目录内读文件、搜索代码、编辑文件和执行命令，同时保留普通交互、会话保存、流式输出、推理内容展示和持久记忆能力。
+OmniAgent 是一个基于 Python、Textual 和 Rich 的本地 AI Agent 工作台。它同时覆盖普通聊天、带工具的本地 Agent、多模型切换、长期记忆、会话持久化、网络搜索、Skills、子智能体和 Team 协作，适合在终端里完成代码阅读、实现、调试、文档整理等多步骤任务。
 
 ## 功能亮点
 
-- 支持五类 API：`glm` 使用 ZAI SDK，`anthropic` 使用 Anthropic SDK，`openai` 使用 OpenAI SDK，`gemini` 使用 Gemini OpenAI 兼容端点，`ollama` 使用 Ollama Python SDK。
-- 支持自定义 `base_url`，可接入 Anthropic Messages API、OpenAI Chat Completions 兼容端点、Gemini OpenAI 兼容端点或 Ollama 服务端。
-- 支持普通输出与流式输出，流式模式会实时打印模型返回内容。
-- 支持展示模型返回的推理 / 思考内容，例如 GLM `reasoning_content`、Anthropic thinking block、Gemini thought summary 或 MiniMax OpenAI 兼容接口的 `reasoning_details`。
-- 使用 Rich 渲染终端界面，包含启动 dashboard、渐变文本和最近历史记录预览。
-- 支持会话保存与加载，记录以 JSON 文件保存到 `record/`。
-- 支持运行时调整 `max_tokens`、`temperature`、输出模式和思考模式。
-- 支持会话上下文自动压缩和 `/comp` 手动压缩，使用分层摘要 + 最近消息窗口延续长任务和长对话。
-- 支持 Tavily 网络搜索，普通交互可按需自动检索，Agent 模式会注入 `web_search` 工具。
-- 支持持久记忆、偏好记忆、情景记忆和热历史，记忆更新可使用独立模型。
-- 支持本地文件 agent 模式，可让模型在限定工作目录内读文件、搜索代码、编辑文件和执行命令。
-- 支持 Agent todo 审批、状态恢复和最终校验，适合多步骤本地任务。
-- 支持 agent skills，可从程序目录、工作目录、ClawHub 或 SkillHub 加载本机专用工作流指令。
-- 对写文件、编辑文件和高风险命令执行用户确认，避免模型无提示修改本地文件。
+- Textual TUI 界面，包含侧边栏、会话流、设置页、Todo 面板、项目选择器和引用标签。
+- 支持多模型档案 `model_list`，可在 GLM、Anthropic、OpenAI 兼容端点、Gemini 和 Ollama 之间切换。
+- 支持普通输出、流式输出以及模型 reasoning / thinking 展示。
+- 支持 `[@file:路径]` 与 `[@folder:路径]` 引用；文本文件可直接注入上下文，文件夹以只读方式延迟访问。
+- 支持图片、音频、视频附件；仅在当前模型档案声明 `extra_modalities` 时直接作为多模态输入发送。
+- 支持 Agent Plan mode / Build mode 分工，使用 todo 跟踪执行进度与最终校验。
+- 支持子智能体 `reader`、`researcher`、`auditor`、`builder`。
+- 支持 Team 模式，可启用内置 teammate：`architect`、`reviewer`、`devops`、`debugger`。
+- 支持持久记忆、偏好记忆、情景记忆、自动上下文压缩与手动 `/comp` 压缩。
+- 支持 Tavily 网络搜索、程序级 / 工作区级 Skills，以及 ClawHub / SkillHub 安装流程。
+- 对写文件、补丁、命令执行等高风险操作提供审批保护。
 
 ## 环境要求
 
 - Python 3.10+
 - 可访问目标模型服务的 API Key
+- 如需网络搜索，准备 Tavily API Key
+- 如需本地模型，已安装并启动 Ollama
 
-核心依赖：
+核心依赖位于 `requirements.txt`，其中包括：
 
+- `textual`
 - `rich`
+- `prompt_toolkit`
 - `zai-sdk`
 - `anthropic`
 - `openai`
 - `ollama`
 - `httpx`
-- `prompt_toolkit`
 
 ## 安装
 
@@ -52,33 +52,56 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 中包含运行所需的完整 Python 依赖；如果只想手动安装核心包，可安装 `rich prompt_toolkit zai-sdk anthropic openai ollama httpx`。
+## 快速开始
+
+启动程序：
+
+```bash
+python main.py
+```
+
+说明：
+
+- 启动后通过界面里的项目选择器选择工作区。
+- 未选择项目时，可以正常聊天、搜索、使用记忆与程序文档，但不能启用工作区写操作 Agent。
+- 选择项目后，Agent 才能读取、搜索、编辑并执行工作区内命令。
+- 首次启动会在本地生成 `config.json` 和 `prompt.md`。
 
 ## 配置
 
-首次运行时，如果 `config.json` 不存在或 `api_key` 为空，程序会在终端中引导你输入配置。
+当前配置文件为仓库根目录下的 `config.json`。程序实际使用的是“全局设置 + 多模型档案”结构，而不是旧版单模型平铺格式。
 
-也可以手动创建或编辑 `config.json`：
+示例：
 
 ```json
 {
-  "api_type": "glm",
-  "base_url": "",
-  "model": "glm-4.7",
-  "api_key": "YOUR_API_KEY",
-  "max_tokens": 4096,
-  "temperature": 0.7,
-  "stream_mode": false,
-  "thinking_mode": false,
-  "reasoning_effort": "",
-  "context_window_tokens": 128000,
-  "debug": false,
+  "general": {
+    "render_markdown": true
+  },
+  "model_list": {
+    "DeepSeek-V4-Pro": {
+      "api_type": "openai",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-v4-pro",
+      "api_key": "sk-xxxxxxxx",
+      "max_tokens": 32000,
+      "temperature": 1,
+      "stream_mode": true,
+      "thinking_mode": true,
+      "reasoning_effort": "max",
+      "extra_modalities": [],
+      "context_window_tokens": 1000000
+    }
+  },
+  "current_model": "DeepSeek-V4-Pro",
   "agent_mode": {
-    "enable": false,
-    "max_rounds": 12,
-    "max_tool_calls": 40,
-    "approve": "confirm",
-    "plan_mode": true
+    "max_rounds": 150,
+    "max_tool_calls": 500,
+    "approve": "approve",
+    "plan_mode": false,
+    "agent_team": {
+      "enable": true
+    }
   },
   "skills": {
     "enable": true,
@@ -87,214 +110,175 @@ pip install -r requirements.txt
       "workspace": false
     },
     "auto_catalog": true,
-    "max_skill_chars": 12000
+    "max_skill_chars": 32000
   },
   "auto_compact": {
     "enable": true,
     "trigger_ratio": 0.75,
-    "keep_recent_messages": 12,
-    "compact_model": ""
+    "keep_recent_messages": 10,
+    "compact_model": "auto"
   },
   "memory_system": {
-    "memory_model": ""
+    "memory_model": "auto"
   },
   "web_search": {
     "enable": true,
     "provider": "tavily",
-    "api_key": "YOUR_TAVILY_KEY",
-    "max_results": 5,
+    "api_key": "tvly-xxxxxxxx",
+    "max_results": 10,
     "search_depth": "basic",
     "topic": "general"
   }
 }
 ```
 
-其他接口只需要替换对应的连接字段：
+关键字段：
 
-```json
-{
-  "api_type": "openai",
-  "base_url": "https://api.minimaxi.com/v1",
-  "model": "MiniMax-M3",
-  "api_key": "YOUR_MINIMAX_KEY",
-  "extra_modalities": ["image", "video"]
-}
-```
+- `general.render_markdown`：是否将回答按 Markdown 渲染到聊天区。
+- `model_list`：模型档案集合，可配置多个 profile。
+- `current_model`：当前启用的模型档案名。
+- `api_type`：支持 `glm`、`anthropic`、`openai`、`gemini`、`ollama`。
+- `base_url`：兼容端点地址。`gemini` 留空时自动使用官方 OpenAI 兼容地址；`ollama` 留空时走本地默认服务。
+- `thinking_mode` 与 `reasoning_effort`：控制推理内容显示与强度。
+- `extra_modalities`：声明当前模型允许直接发送的附件模态，支持 `audio`、`image`、`video`。
+- `agent_mode.approve`：审批模式，支持 `confirm`、`approve`、`full`。
+- `agent_mode.plan_mode`：是否启用只读的 Plan mode。
+- `agent_mode.agent_team.enable`：是否启用 Team 模式。
+- `skills.sources.app`：是否加载程序目录 `skills/`。
+- `skills.sources.workspace`：是否加载工作区 `.omniagent/skills/`。
+- `auto_compact.compact_model`：上下文压缩模型，`auto` 表示跟随当前模型。
+- `memory_system.memory_model`：记忆写入模型，`auto` 表示跟随当前模型。
+- `web_search.provider`：当前仅支持 `tavily`。
 
-MiniMax-M3 推荐使用 OpenAI 兼容配置。程序会在调用 MiniMax OpenAI 兼容接口时自动传递 `reasoning_split=true`，并在多轮 Function Call 中把完整 assistant 消息写回历史，包括 `reasoning_details`、`tool_calls` 和必要的原始 `<think>...</think>` 内容。也可以使用 Anthropic 兼容端点 `https://api.minimaxi.com/anthropic`；该路径会按官方要求完整回传 `thinking/text/tool_use` 内容块。MiniMax API Key 只从 `config.json` 的 `api_key` 字段读取。
+`reasoning_effort` 的有效值按提供商不同：
 
-```json
-{
-  "api_type": "gemini",
-  "base_url": "",
-  "model": "gemini-3.5-flash",
-  "api_key": "YOUR_GEMINI_API_KEY"
-}
-```
+- `glm` / `anthropic` / `openai`：`low`、`medium`、`high`、`xhigh`、`max`
+- `gemini`：`minimal`、`low`、`medium`、`high`
+- `ollama`：`low`、`medium`、`high`
+
+推荐配置示例：
+
+本地 Ollama：
 
 ```json
 {
   "api_type": "ollama",
   "base_url": "",
-  "model": "qwen3",
+  "model": "deepseek-r1:671b",
   "api_key": ""
 }
 ```
+
+Ollama 云端：
 
 ```json
 {
   "api_type": "ollama",
   "base_url": "https://ollama.com",
-  "model": "gpt-oss:120b",
-  "api_key": "YOUR_OLLAMA_API_KEY"
+  "model": "deepseek-v4-pro:cloud",
+  "api_key": "xxxxxxxx"
 }
 ```
 
-如果希望通过本地 Ollama 调用云端模型，先在命令行执行 `ollama signin`，再 `ollama pull gpt-oss:120b-cloud`。项目配置保持 `"api_type": "ollama"`、`"base_url": ""`、`"api_key": ""`，把 `"model"` 改成 `gpt-oss:120b-cloud` 即可。
+`config.json` 已被 `.gitignore` 忽略，适合保存本地密钥和个人设置。
 
-配置字段说明：
+## 界面与命令
 
-| 字段 | 说明 |
+主要界面：
+
+- 左侧 Sidebar：项目与会话管理、固定项目/会话、归档浏览。
+- 中央 ChatView：消息流、Thinking 块、工具结果块、Todo 块、Markdown 渲染。
+- 底部 ChatInput：输入、引用、附件、Plan / Build 切换、发送队列。
+- Settings：模型、Agent、Skills、Web Search、Team 等设置。
+- TodosPanel：展示当前 Agent 执行中的 todo 快照。
+
+内置命令：
+
+| 命令 | 说明 |
 | --- | --- |
-| `api_type` | API 类型，只支持 `glm`、`anthropic`、`openai`、`gemini` 或 `ollama`。 |
-| `base_url` | 自定义 API 地址。`glm` 类型会自动忽略该字段；`anthropic` 和 `openai` 类型可留空使用 SDK 默认地址，也可填写兼容端点。`gemini` 留空时自动使用 `https://generativelanguage.googleapis.com/v1beta/openai/`。MiniMax OpenAI 兼容接口填写 `https://api.minimaxi.com/v1`。`ollama` 留空时使用本地默认服务，通常是 `http://localhost:11434`；直连 Ollama 云端时填写 `https://ollama.com`。 |
-| `model` | 模型名称，按服务商要求填写。 |
-| `api_key` | API Key，只从 `config.json` 读取。Gemini 使用 Google AI Studio 创建的 Gemini API Key。Ollama 本地模型和通过本地 Ollama 代理调用云端模型可留空。请只保存在本地，不要提交到仓库。 |
-| `max_tokens` | 单次回复的最大 token 数。 |
-| `temperature` | 采样温度，范围为 `0` 到 `1`。 |
-| `stream_mode` | 是否默认启用流式输出。 |
-| `thinking_mode` | 是否默认展示模型返回的推理 / 思考内容。 |
-| `reasoning_effort` | 推理 / 思考强度。关闭 `thinking_mode` 时等同于 `none`。开启后按接口支持范围填写：`openai` / `anthropic` / `glm` 支持 `low`、`medium`、`high`、`xhigh`、`max`；`gemini` 支持 `minimal`、`low`、`medium`、`high`；`ollama` 支持 `low`、`medium`、`high`、`max`。留空时使用服务商默认值；旧配置里的不兼容值会在加载时自动归一化。 |
-| `extra_modalities` | 模型除文本外额外支持的模态列表，可填写 `audio`、`image`、`video`。程序只会把这里声明过的附件直接作为多模态内容发送给模型；未声明时仍保留附件清单文本。 |
-| `context_window_tokens` | 当前模型的上下文窗口 token 数，用于按比例计算自动压缩阈值。不同模型请按服务商文档填写。 |
-| `debug` | 全局调试开关，默认 `false`。开启后会写入 `memory/memory_update_diagnostics.jsonl` 等诊断信息。 |
-| `agent_mode.enable` | 是否默认启用 agent 模式。没有启动工作目录时会自动关闭。 |
-| `agent_mode.max_rounds` | 每次用户请求中，agent 最多执行多少轮工具循环。 |
-| `agent_mode.max_tool_calls` | 每次用户请求中，agent 最多调用多少次工具。 |
-| `agent_mode.approve` | Agent 写操作审批模式，只支持 `confirm` 或 `auto`。 |
-| `agent_mode.plan_mode` | 是否启用 Plan mode。默认 `true`；开启后可在“先想清楚再动手”的只读规划/澄清工作流中使用 `ask_user`，关闭后不启用这套 Plan mode 协作流程。 |
-| `skills.enable` | Agent skills 总开关。关闭后不会注入 `list_skills` 和 `read_skill`。 |
-| `skills.sources.app` | 是否加载程序目录 `skills/`，适合放所有项目通用的本机 skills。 |
-| `skills.sources.workspace` | 是否加载工作目录 `.omniagent/skills/`，默认关闭；开启后如果目录不存在会自动创建。 |
-| `skills.auto_catalog` | 是否把已加载 skills 的名称、描述和触发词自动加入 agent system prompt。 |
-| `skills.max_skill_chars` | 单次 `read_skill` 读取 `SKILL.md` 和附加文件的最大字符数，超出会截断。 |
-| `auto_compact.enable` | 是否启用自动上下文压缩。开启后普通交互和 Agent 模式都会在上下文超过阈值时自动压缩。 |
-| `auto_compact.trigger_ratio` | 自动压缩触发比例，默认 `0.75` 表示上一轮请求的输入 token 达到 `context_window_tokens * 0.75` 时压缩。 |
-| `auto_compact.keep_recent_messages` | 压缩时保留最近多少条原始消息，其余更早消息会折叠进压缩摘要。 |
-| `auto_compact.compact_model` | 执行压缩摘要的模型。留空时使用当前模型；填写模型名时统一使用该模型做自动和手动压缩。 |
-| `memory_system.memory_model` | 执行持久记忆和情景记忆更新的模型。留空时使用当前模型。 |
-| `web_search.enable` | 是否开启网络搜索功能。开启且配置 Tavily key 后，普通交互和 Agent 都可以使用搜索。 |
-| `web_search.provider` | 网络搜索提供商，目前支持 `tavily`。 |
-| `web_search.api_key` | Tavily API Key，只从 `config.json` 的 `web_search.api_key` 读取，也可以通过 `/search key <tavily-api-key>` 写入。 |
-| `web_search.max_results` | 每次搜索最多返回多少条结果，范围 `1` 到 `20`。 |
-| `web_search.search_depth` | Tavily 搜索深度，支持 `basic`、`fast`、`ultra-fast`、`advanced`。 |
-| `web_search.topic` | Tavily 搜索主题，支持 `general`、`news`、`finance`。 |
+| `/help` | 打开命令帮助页面。 |
+| `/quit` | 退出程序。 |
+| `/clear` | 清空当前会话上下文。 |
+| `/comp` | 立即按当前压缩策略压缩上下文。 |
+| `/memory` | 打开记忆页面。 |
+| `/search` | 打开 Web Search 设置页面。 |
+| `/skills` | 打开 Skills 设置页面。 |
+| `/agent` | 打开 Agent 设置页面。 |
+| `/team` | 打开 Team 页面。 |
 
-`config.json` 已被 `.gitignore` 忽略，适合存放本地密钥和个人配置。
+## 文件引用与多模态
 
-## 运行
+支持两种引用语法：
 
-普通交互：
+- `[@file:path/to/file]`
+- `[@folder:path/to/folder]`
 
-```bash
-python main.py
-```
-
-指定工作目录后运行：
-
-```bash
-python main.py <workspace>
-```
-
-启动后会显示 dashboard，包含当前模型、工作目录和最近历史记录。未指定工作目录时，dashboard 会显示 `No workspace directory`。
-
-## 外部文件引用
-
-文件引用只支持 `[@file:绝对路径]` 和 `[@file:相对路径]`。相对路径仅在选择项目后可用，并以当前项目目录为基准；没有选择项目时只能使用绝对路径。
-
-文件夹引用只支持 `[@folder:绝对路径]` 和 `[@folder:相对路径]`，相对路径同样要求当前已选择项目。文件夹内容不会立即加入上下文，模型会在本次请求中按需使用只读文件工具访问，且不能写入引用文件夹。
+示例：
 
 ```text
-请总结 [@file:D:\Notes\report.md]
-检查 [@folder:documents]
+请总结 [@file:path/to/file]
+检查 [@folder:path/to/folder]
 ```
 
-输入完整格式后，如果目标实际存在，输入框会立即将其显示为带白色背景的加粗标签。文件显示文件名，文件夹显示目录名并以 `/` 结尾；发生重名时会逐级补充上级目录。Backspace、Delete 及其他删除操作会整体删除标签。无效格式或不存在的目标保持普通文本。
+规则：
 
-文本文件内容会作为只读上下文附加到本次消息中，不会放开 Agent 工具对其他路径的读写限制。单个文本引用文件最多附加 `60000` 个字符，超出部分会被截断。
+- 相对路径只有在已选择工作区后可用。
+- 路径会做真实存在校验；不存在的目标不会转换成引用标签。
+- 文本文件内容会以只读上下文附加到本次请求，单文件最多附加 `60000` 个字符。
+- 文件夹不会直接展开进上下文，而是作为本次请求的只读目录权限来源。
+- 图片、音频、视频会按文件头和后缀识别类型。
+- 只有当前模型档案的 `extra_modalities` 声明了对应模态，媒体才会直接随请求发送。
 
-引用音频、图片或视频时，程序会自动检测文件类型，并按当前模型配置里的 `extra_modalities` 决定是否直接作为多模态内容发送。OpenAI 兼容接口会发送 `input_audio`、`image_url`、`video_url` 内容块，Anthropic 兼容接口会发送 `audio`、`image`、`video` 内容块；未声明对应模态时仍会保留附件清单文本，但不会直接发送媒体内容。支持的图片类型包括 JPEG、PNG、GIF、WEBP，支持的音频类型包括 MP3、WAV、FLAC、OGG、WEBM、M4A、AAC，支持的视频类型包括 MP4、AVI、MOV、MKV。本地图片最大 `10 MB`，本地音频和视频最大 `50 MB`，媒体请求体总量限制为 `64 MB`。
+媒体限制：
 
-## 自定义提示词
-
-首次运行时会自动创建 `prompt.md`，可以在其中写入自定义提示词、人格、回复风格和个人偏好。程序会在每次模型请求前读取 `prompt.md`，普通交互和 Agent 模式都会生效。
-
-`prompt.md` 已被 `.gitignore` 忽略，适合存放只在本机使用的个人提示词。默认生成的说明内容在 Markdown 注释中，不会发送给模型；把真实提示词写在注释外即可。上下文压缩和 Agent thinking 概括仍使用项目内置提示词，不会附加该文件内容。
-
-## 网络搜索
-
-网络搜索使用 Tavily。开启并配置 key 后，普通交互会在需要近期、外部或容易变化的信息时让模型调用搜索；Agent 模式也会获得 `web_search` 工具。搜索结果会包含来源 URL，回答需要引用搜索结果中的链接。
-
-常用命令：
-
-```text
-/search
-/search on
-/search key tvly-your-api-key
-/search provider tavily
-/search max 5
-/search depth basic
-/search topic general
-```
-
-当前 provider 只支持 `tavily`。`search_depth` 支持 `basic`、`fast`、`ultra-fast`、`advanced`，`topic` 支持 `general`、`news`、`finance`。如果未配置 `web_search.api_key`，`/search` 会显示 `missing key`，普通交互和 Agent 都不会真正执行网络搜索。
-
-普通交互默认会给模型注入 `read_program_docs` 和 `web_fetch` 只读工具。`read_program_docs` 只能读取程序内置 `README.md`，用于回答“这个程序怎么用”、命令说明、配置说明、Agent 模式和 skills 等学习类问题；`web_fetch` 可读取用户给出的公开 HTTP/HTTPS 网页链接。它们不会授予普通聊天读取工作目录任意文件的权限。
+- 图片最大 `10 MB`
+- 音频最大 `50 MB`
+- 视频最大 `50 MB`
+- 单次多模态请求体总量最大 `64 MB`
 
 ## Agent 模式
 
-Agent 模式类似 Claude Code 的本地工具调用流程：模型可以请求工具，客户端执行工具并把结果返回给模型，直到模型输出最终回复。
+Agent 模式用于多步骤本地任务。模型可以请求工具，客户端执行后再把结果反馈给模型，直到给出最终答复。
 
-当前支持的工具：
+核心特性：
 
-| 工具 | 功能 |
-| --- | --- |
-| `update_todo` | 维护当前 Agent 执行 todo，支持优先级、依赖、完成标准、blocked/failed 原因和校验状态。 |
-| `ask_user` | 仅在 Plan mode 可用。向用户提出一个单选问题，用户可用方向键、数字键和 Enter 选择；当关键决策会影响目标、范围、权衡或验收标准时，应使用该工具补齐信息，而不是在正文里等待用户回复。 |
-| `list_dir` | 列出工作目录内文件和目录，支持递归深度限制。 |
-| `read_file` | 读取工作目录内的 UTF-8 文本文件，支持按行号范围读取。 |
-| `read_program_docs` | 读取程序内置 `README.md`，帮助用户学习命令、配置和使用方式；普通交互也默认可用。 |
-| `web_fetch` | 读取指定公开 HTTP/HTTPS 网页链接，支持正文提取或原始 HTML/text。 |
-| `write_file` | 创建或覆盖工作目录内文件，并按审批模式确认或自动批准。 |
-| `edit_file` | 基于精确字符串替换编辑文件，并按审批模式确认或自动批准。 |
-| `apply_patch` | 按 1-based 行号范围替换文件内容，并展示 unified diff 预览。 |
-| `apply_unified_patch` | 对单个文件应用 unified diff，并在写入前校验上下文。 |
-| `bash` | 在工作目录内执行 shell 命令。明显会修改或删除文件的命令需要用户确认。 |
-| `local_http_check` | 临时启动 Python 静态服务，检查一个或多个本地路径的 HTTP 状态，然后自动关闭服务。 |
-| `git_status` | 查看工作目录的 `git status --short`，只读且不需要确认。 |
-| `git_diff` | 查看完整 diff、diff stat 或 `git diff --check`，只读且不需要确认。 |
-| `grep` | 使用正则搜索工作目录内文件内容。 |
-| `glob` | 使用 glob 模式匹配工作目录内文件名。 |
-| `web_search` | 使用 Tavily 搜索公开网页。仅在网络搜索开启且配置 key 后注入。 |
-| `list_skills` | 列出已启用来源中的 agent skills。 |
-| `read_skill` | 读取匹配 skill 的 `SKILL.md` 和可选附加文件。 |
-| `dispatch_subagent` | 派发独立 history 的子智能体处理阅读、研究、审计或小范围实现任务；结果只以摘要回填主上下文。 |
+- Plan mode：只读规划模式，适合先澄清需求、拆任务、看设计、提问题。
+- Build mode：实际执行模式，允许在工作区内读写文件和运行命令。
+- Todo 跟踪：使用 `update_todo` 维护当前执行计划，并同步显示到对话流与 Todo 面板。
+- 审批保护：写文件、补丁、命令执行会根据审批模式要求确认。
+- 最终校验：任务结束前保留验证步骤，降低漏改和回归风险。
 
-Agent 模式会根据当前是否选中项目自动决定是否可用；相关开关与参数统一在设置页面中调整：
+典型工具类别：
 
-```text
-/agent
-```
+- 文件与目录：`list_dir`、`read_file`、`write_file`、`edit_file`
+- 搜索与差异：`grep`、`glob`、`git_status`、`git_diff`
+- 修改：`apply_patch`、`apply_unified_patch`
+- 执行：`bash`
+- 文档与网页：`read_program_docs`、`web_fetch`
+- 协作：`update_todo`、`ask_user`
+- 外部能力：`web_search`、`list_skills`、`read_skill`
 
-Plan mode 是“先想清楚再动手”的协作状态：适合需求还不够明确、改动风险较大、需要先看设计/路线图/任务清单，或需要向用户提出 1-3 个短问题补齐关键决策的场景。Plan mode 保持只读，最终输出不一定是 todo list，也可以是清晰的方案、结论、实施步骤和待确认点。
+安全限制：
 
-进入 Build mode 后，Agent 才会执行改动，并用 `update_todo` 维护执行中的 todo。todo 快照和事件日志保存在 `<workspace>/.omniagent/todos/`。整个 `.omniagent/` 已被 `.gitignore` 忽略。
+- 必须带工作区启动后才能启用本地 Agent。
+- 所有工作区工具只允许访问工作区及其子目录。
+- 普通聊天不会获得工作区任意文件读写权限。
+- 高风险命令仍需要审批。
 
-子智能体在 Agent 模式中默认可用，无需额外配置。主 Agent 可通过 `dispatch_subagent` 派发 `reader`、`researcher`、`auditor` 或 `builder`，也支持别名 `general -> builder`、`investigator -> researcher`。每个子智能体都有独立上下文和工具白名单，不能再派发子智能体，也不能调用 `update_todo` 或 `ask_user`；主 Agent 仍负责维护 todo、最终校验和面向用户的结论。`builder` 的写文件和命令能力沿用当前 `agent_mode.approve` 审批策略。
+## 子智能体与 Team
 
-终端 v1 会按模型同一轮返回的 tool call 顺序执行多个子智能体派发，不做并发执行；这样可以复用现有终端确认界面和文件变更记录，避免多个子任务同时争用审批状态。
+### 子智能体
 
-可以在工作目录中创建子智能体 prompt 模板，覆盖内置 system prompt：
+Agent 默认支持以下子智能体：
+
+- `reader`：快速阅读和总结代码
+- `researcher`：资料搜索与方案调研
+- `auditor`：审计与风险检查
+- `builder`：小范围实现任务
+
+主 Agent 可以派发子任务，但子智能体不能继续派发子智能体，也不能直接维护 todo 或向用户提问。
+
+工作区中可通过模板覆盖内置 prompt：
 
 ```text
 <workspace>/.omniagent/subagents/
@@ -304,226 +288,199 @@ Plan mode 是“先想清楚再动手”的协作状态：适合需求还不够�
 └── builder.md
 ```
 
-模板文件只控制对应子智能体的身份、职责和输出风格；工具白名单、最大轮次、`dispatch_subagent` / `update_todo` / `ask_user` 禁用规则仍由代码固定，不会被模板放开。整个 `.omniagent/` 已被 `.gitignore` 忽略，适合存放本机偏好。
+### Team 模式
 
-Agent skills 只在 agent 模式中可用，支持两个来源：程序目录 `skills/` 和工作目录 `.omniagent/skills/`。工作目录来源默认关闭，开启后如果目录不存在会自动创建。相关开关和已安装技能浏览器统一在 `Settings -> Skills` 中配置。每个 skill 使用一个目录，目录名只能包含小写字母、数字、`-` 和 `_`：
+Team 模式支持多 teammate 协作，内置成员包括：
+
+- `architect`
+- `reviewer`
+- `devops`
+- `debugger`
+
+团队配置和线程数据位于：
 
 ```text
-skills/
-  git-commit/
-    SKILL.md
-    references/
-
-<workspace>/.omniagent/skills/
-  project-review/
-    SKILL.md
+<workspace>/.omniagent/team/
+├── config.json
+├── inbox/
+└── threads/
 ```
 
-`SKILL.md` 可以包含 frontmatter：
+## Skills
 
-```md
----
-description: Git commit message workflow.
-triggers:
-  - git commit
-enabled: true
----
+Skills 是给 Agent 使用的可复用工作流说明，不直接执行脚本，也不能绕过安全限制。
 
-# Instructions
-...
-```
+支持两个来源：
 
-Skills 只提供工作流指导，不会执行 skill 里的脚本，也不能覆盖 agent 安全规则、工作目录限制、审批设置或工具限制。程序目录 `skills/` 已被 `.gitignore` 忽略，适合放本机专用指令。
+- 程序目录：`skills/`
+- 工作区目录：`<workspace>/.omniagent/skills/`
 
-安装 skills：
+安装来源支持 `ClawHub` 和 `SkillHub`。
 
-- 在 `Settings -> Skills -> Installed skills -> Install skill` 中安装。
-- Provider 目前支持 `ClawHub` 和 `SkillHub`。
-- 默认优先安装到工作目录 `.omniagent/skills/`；没有选中项目时可安装到程序目录 `skills/`。
-- 可选填写 `version`、自定义 `registry`，并可开启 `force` 覆盖已有 skill。
-- 安装来源和 lock 文件分别写入 `.clawhub/` 或 `.skillhub/`，这些目录已被 `.gitignore` 忽略。
+## 网络搜索
 
-安全限制：
+网络搜索使用 Tavily。开启并配置 key 后：
 
-- 必须通过启动参数传入工作目录后才能开启 agent 模式。
-- 所有工具只能访问工作目录及其子目录。
-- 普通交互默认可用的 `read_program_docs` 只读取程序内置 `README.md`，`web_fetch` 只读取公开 HTTP/HTTPS 网页；二者不开放工作目录文件读取权限。
-- `web_fetch` 会阻止 localhost、内网、回环、link-local、保留地址等非公开地址。
-- 路径中不允许使用父级目录引用。
-- 写入类工具会展示 unified diff。`agent_mode.approve=auto` 时会自动批准工作目录内的文件编辑和低风险命令。
-- `bash` 在工作目录内执行，并拦截明显越界路径。
-- 删除、包安装、变更 git 历史等高风险命令仍会要求用户确认。
+- 普通聊天可按需调用搜索
+- Agent 模式会获得 `web_search` 工具
+- 结果会附带来源链接，适合处理外部、实时、易变信息
 
-## 命令
+当前配置方式：
 
-| 命令 | 说明 |
-| --- | --- |
-| `/help` | 打开命令帮助页面，左侧显示命令，右侧显示简要介绍。 |
-| `/quit` | 退出程序。 |
-| `/clear` | 清空当前会话上下文。 |
-| `/comp` | 立即按当前 auto_compact 配置压缩会话上下文；消息数不超过 `keep_recent_messages` 时会取消压缩。 |
-| `/memory` | 打开独立记忆页面，左侧切换核心记忆、偏好记忆、情景记忆，右侧查看内容。 |
-| `/search` | 打开 Web Search 设置页面。 |
-| `/skills` | 打开 Skills 设置页面。 |
-| `/agent` | 打开 Skills 设置页面。 |
-| `/team` | 打开 Team 页面，查看开关、可用 teammate 和当前活跃 teammate。 |
-| `Ctrl+C` | 中断并退出程序。 |
+- 输入 `/search` 打开 Web Search 设置页面
+- 在设置页中开启/关闭搜索
+- 在设置页中填写 Tavily API Key
+- 在设置页中调整 `provider`、`max_results`、`depth`、`topic`
 
-## 输出模式
+当前仅支持 `tavily`，搜索深度支持 `basic`、`fast`、`ultra-fast`、`advanced`，主题支持 `general`、`news`、`finance`。
 
-普通模式会等待模型完整返回后再显示结果。如果服务商返回推理内容，程序会先显示 Thinking，再显示最终回答。
+## 记忆、会话与本地数据
 
-流式模式会实时显示模型返回的 thinking delta 和 text delta。实际是否能看到推理内容取决于模型和服务商是否返回对应字段。`reasoning_effort` 可用于调节支持该能力的模型思考强度；Gemini 在 `thinking_mode=true` 时会请求 thought summary；Ollama thinking 模型会读取 `message.thinking` 字段；`gpt-oss` 系列开启 thinking 且未配置 `reasoning_effort` 时默认使用 `medium` 级别。
+### 持久记忆
 
-Anthropic Agent 模式使用 streaming API 读取工具调用事件和 thinking delta，避免长请求触发 SDK 的非流式限制。GLM / OpenAI / Gemini Agent 模式使用 Chat Completions 工具循环，Ollama Agent 模式使用 `/api/chat` 工具调用循环，并会在每轮响应返回后立即显示可用的 thinking。
-
-Agent 运行时会隐藏 round 编号、工具调用编号、工具结果摘要和 final check 摘要等中间噪音，只保留必要的确认、警告、错误和最终回复。Thinking、确认框和最终回复之间会自动保持一行间距。
-
-Agent 模式会显示完整的 thinking/reasoning 过程，并在开启流式模式时把最终回复继续按流式方式显示。
-
-## 上下文压缩
-
-上下文压缩使用“压缩摘要 + 最近消息窗口”的策略。自动压缩开启后，普通交互和 Agent 模式都会根据上一轮模型调用返回的输入 token 判断是否超过 `context_window_tokens * auto_compact.trigger_ratio`，并用当前历史的本地 token 粗估补上本轮新增消息。超过阈值时，将较早消息和已有压缩摘要交给 `auto_compact.compact_model` 生成新的连续性摘要，并保留最近 `auto_compact.keep_recent_messages` 条原始消息。如果服务端没有返回 usage，客户端会临时使用本地 token 粗估作为兜底。
-
-`auto_compact.compact_model` 留空时使用当前模型；填写模型名时，自动压缩和 `/comp` 手动压缩都会统一使用该模型。手动执行 `/comp` 时，如果当前消息数不超过 `keep_recent_messages`，会提示取消压缩。
-
-持久记忆和情景记忆更新使用 `memory_system.memory_model`。该字段留空时使用当前模型；填写后只影响记忆写入，不影响压缩摘要模型。
-
-## 持久记忆
-
-程序会在 `memory/` 下维护本机持久记忆：
+程序会在 `memory/` 下维护长期记忆：
 
 ```text
 memory/
-  core.md
-  preferences.md
-  episodes/
-    YYYY-MM-DD.md
+├── core.md
+├── preferences.md
+└── episodes/
+    └── YYYY-MM-DD.md
 ```
 
-`core.md` 保存长期事实、目标和约束，`preferences.md` 保存偏好，`episodes/YYYY-MM-DD.md` 保存按日期归档的情景记忆。`/memory` 会打开独立记忆页面，左侧切换三类记忆，右侧查看内容；情景记忆按从新到旧显示。会话级原始历史会保存在各自 session 旁边的 `.history.jsonl` 文件中。
+- `core.md`：长期事实、目标、约束
+- `preferences.md`：用户偏好
+- `episodes/`：按日期归档的情景记忆
 
-全局 `debug` 默认为 `false`。只有开启后，记忆更新才会额外写入 `memory/memory_update_diagnostics.jsonl`，用于排查模型返回的记忆 JSON、解析结果和写入状态。`memory/` 已被 `.gitignore` 忽略，默认不会提交到仓库。
+### 会话存储
 
-## 会话记录
+会话和项目索引保存在 `sessions/`：
 
-会话会自动持久化到 session 目录，对应的快照文件结构如下：
-
-```json
-{
-  "version": "3.0.0",
-  "model": "model-name",
-  "created_at": "2026-04-25T22:33:00",
-  "conversation": [
-    {
-      "role": "user",
-      "content": "Hello"
-    },
-    {
-      "role": "assistant",
-      "content": "Hi!"
-    }
-  ]
-}
+```text
+sessions/
+├── projects.json
+├── pinned.json
+├── pinned_projects.json
+├── projects/
+└── orphan/
 ```
 
-Agent 模式会话可能包含 Anthropic `tool_use` / `tool_result` content block 或 GLM tool 消息。保存和加载时会尽量按可读文本展示。
+每个会话会保存 JSON 快照，并在旁边保留 `.history.jsonl` 历史。
 
-Agent 运行结束后，中间工具消息会折叠成摘要写入会话历史，避免后续对话继承大量内部 tool 结果。
+### 工作区状态
 
-`record/` 已被 `.gitignore` 忽略，默认不会提交到仓库。
+工作区相关运行数据保存在 `<workspace>/.omniagent/`，例如：
+
+- `todos/`
+- `skills/`
+- `subagents/`
+- `team/`
+
+以下路径默认已被 `.gitignore` 忽略：
+
+- `config.json`
+- `prompt.md`
+- `memory/`
+- `sessions/`
+- `skills/`
+- `.clawhub/`
+- `.skillhub/`
+- `.omniagent/`
+
+## 自定义提示词
+
+首次运行会生成 `prompt.md`。你可以把个人提示词、回复风格、角色设定写在其中。该文件会在每次模型请求前读取，并同时影响普通聊天与 Agent 模式。
+
+`prompt.md` 已被 `.gitignore` 忽略，适合保存只在本机使用的长期提示词。
 
 ## 项目结构
 
 ```text
 OmniAgent/
-├── record/                  # 会话记录目录
-├── chat.py                  # OmniAgent 客户端、API 调用、流式处理和 agent loop
-├── commands.py              # 命令解析、分发与 handler
-├── config.py                # 配置读取、校验、交互式更新和持久化
-├── installer.py             # ClawHub / SkillHub skills 搜索、检查和安装
-├── main.py                  # 程序入口、启动参数、事件循环和 UI 组装
-├── memory.py                # 持久记忆、偏好记忆、情景记忆和热历史
-├── todo.py                  # Agent todo、审批状态、事件日志和质量检查
-├── search.py                # Tavily 网络搜索封装和结果格式化
-├── session.py               # 会话保存与加载
-├── skills.py                # Agent skills 加载、索引和读取
-├── subagents.py             # 子智能体角色、工具白名单和独立 runner
-├── tools.py                 # Agent 工具 schema、本地执行器和安全限制
-└── ui.py                    # Rich 终端 UI、dashboard、流式输出和确认界面
+├── README.md
+├── requirements.txt
+├── main.py                  # 程序入口与外部引用处理
+├── chat.py                  # 对话引擎、模型调用、Agent 主循环
+├── config.py                # 配置模型、全局设置与持久化
+├── commands.py              # 斜杠命令定义
+├── tools.py                 # Agent 工具定义与执行器
+├── search.py                # Tavily 搜索封装
+├── memory.py                # 持久记忆与历史
+├── session.py               # 会话与项目索引存储
+├── todo.py                  # Todo 状态与快照
+├── references.py            # 文件 / 文件夹引用解析
+├── skills.py                # Skills 加载与读取
+├── installer.py             # Skills 安装器
+├── subagents.py             # 子智能体注册与限制
+├── team.py                  # Team 模式与 teammate 管理
+├── ui.py                    # 控制台展示辅助
+└── tui/
+    ├── __main__.py          # `python -m tui` 入口
+    ├── app.py               # Textual 主应用
+    ├── theme.py             # 主题与 CSS 生成
+    ├── runtime.py           # TUI / console bridge
+    └── widgets/             # 输入框、聊天区、侧边栏、设置页、Todo 面板等组件
 ```
+
+## 开发说明
+
+当前仓库以 `requirements.txt` + 手动运行为主，未提供：
+
+- `pyproject.toml`
+- 自动化测试目录
+- 仓库级 `pytest` / `ruff` / `black` / `mypy` 配置
+
+推荐开发流程：
+
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+修改后重点手动验证：
+
+- TUI 布局与交互
+- 模型切换与配置保存
+- Agent 工具审批流程
+- Todo、记忆、会话持久化
+- 引用与附件发送逻辑
 
 ## 常见问题
 
-**提示 `No module named 'zai'`**
+### 无法开启 Agent 模式
 
-安装 ZAI SDK：
+请确认已经在界面中选择了项目工作区：
 
-```bash
-pip install zai-sdk
-```
+- 底部信息栏可打开项目选择器
+- 只有选中项目后，Agent 才能使用工作区内的读写和命令能力
 
-**提示 `No module named 'anthropic'`**
+### 网络搜索显示 `missing key`
 
-安装 Anthropic SDK：
+请打开 Web Search 设置页面并完成以下配置：
 
-```bash
-pip install anthropic
-```
+- 输入 `/search`
+- 开启 Web Search
+- 填写 Tavily API Key
 
-**提示 `No module named 'openai'`**
+### Ollama 本地模型无法连接
 
-安装 OpenAI SDK：
-
-```bash
-pip install openai
-```
-
-**提示 `No module named 'ollama'`**
-
-安装 Ollama Python SDK：
+确认 Ollama 已安装、服务已启动，并已拉取模型：
 
 ```bash
-pip install ollama
+ollama pull deepseek-r1:671b
+ollama run deepseek-r1:671b
 ```
 
-**Ollama 本地模型无法连接**
+### 请求失败或无响应
 
-确认本机 Ollama 已安装并运行，且已经拉取模型：
+检查：
 
-```bash
-ollama pull qwen3
-ollama run qwen3
-```
+- `api_key` 是否正确
+- `base_url` 是否匹配目标服务
+- `model` 是否存在
+- 当前网络是否可访问相应 API
 
-配置中 `api_type` 使用 `ollama`，`base_url` 留空即可走本地默认服务。如果 Ollama 服务运行在其他机器或端口，填写对应地址，例如 `http://192.168.1.10:11434`。
-
-**无法开启 agent 模式**
-
-请确认启动时传入了工作目录：
-
-```bash
-python main.py D:\Code
-```
-
-未传入工作目录时，Agent 相关能力不会激活。
-
-**网络搜索显示 `missing key`**
-
-先写入 Tavily API Key：
-
-```text
-/search key tvly-your-api-key
-/search on
-```
-
-当前网络搜索只支持 Tavily。配置成功后，`/search` 会显示 `available`。
-
-**请求失败或无响应**
-
-检查 `api_key`、`base_url`、`model` 是否与服务商要求一致，并确认当前网络可以访问对应 API。
-
-**终端显示异常**
+### 终端显示异常
 
 建议使用支持 UTF-8 和 ANSI 颜色的现代终端，例如 Windows Terminal、PowerShell 7、iTerm2 或 GNOME Terminal。
 

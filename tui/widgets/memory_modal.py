@@ -8,6 +8,7 @@ from textual.widgets import Static
 
 from tui.theme import render_css
 from tui.widgets.chat_input import HalfRowSpacer
+from tui.widgets.chat_view import MarkdownMessageStatic
 
 
 class _MemoryNavItem(Static):
@@ -103,6 +104,7 @@ class MemoryModal(ModalScreen[None]):
     #memory-panel {
         width: 100%;
         height: auto;
+        min-width: 0;
     }
 
     #memory-sidebar {
@@ -119,6 +121,7 @@ class MemoryModal(ModalScreen[None]):
     #memory-nav-scroll,
     #memory-detail-scroll {
         width: 100%;
+        min-width: 0;
         height: auto;
         min-height: 0;
         overflow-y: auto;
@@ -127,12 +130,14 @@ class MemoryModal(ModalScreen[None]):
 
     #memory-detail-wrap {
         width: 1fr;
+        min-width: 0;
         height: auto;
         padding: 0;
     }
 
     #memory-detail-content {
         width: 100%;
+        min-width: 0;
         height: auto;
         color: $TEXT_PRIMARY;
         padding: 0 0 0 1;
@@ -207,8 +212,8 @@ class MemoryModal(ModalScreen[None]):
                                         yield Vertical(id="memory-nav")
                                 with Vertical(id="memory-detail-wrap"):
                                     with Vertical(id="memory-detail-scroll"):
-                                        yield Static(
-                                            "", id="memory-detail-content", markup=False
+                                        yield MarkdownMessageStatic(
+                                            "", id="memory-detail-content"
                                         )
                     yield HalfRowSpacer(id="memory-bottom-edge")
                 yield Static("", classes="memory-outer-gap")
@@ -280,7 +285,7 @@ class MemoryModal(ModalScreen[None]):
                 item.remove_class("selected")
 
     def _update_detail(self) -> None:
-        content_widget = self.query_one("#memory-detail-content", Static)
+        content_widget = self.query_one("#memory-detail-content", MarkdownMessageStatic)
         selected = next(
             (
                 section
@@ -300,24 +305,9 @@ class MemoryModal(ModalScreen[None]):
         except Exception:
             return
         available_width = max(1, self.size.width - 8)
-        memory_stack.styles.width = min(96, max(44, available_width))
+        memory_stack.styles.width = available_width
         available_height = max(3, self.size.height - 6)
-        nav_needed = max(1, len(self.sections))
-        selected = next(
-            (
-                section
-                for section in self.sections
-                if str(section.get("id") or "") == self._selected_section_id
-            ),
-            self.sections[0] if self.sections else {"content": ""},
-        )
-        detail_text = str(selected.get("content") or "").strip()
-        detail_needed = max(1, len(detail_text.splitlines()) if detail_text else 1)
-        nav_height = min(nav_needed, available_height)
-        detail_height = min(detail_needed, available_height)
-        nav_scroll.styles.height = nav_height
         nav_scroll.styles.max_height = available_height
-        detail_scroll.styles.height = detail_height
         detail_scroll.styles.max_height = available_height
 
     def action_quit_app(self) -> None:

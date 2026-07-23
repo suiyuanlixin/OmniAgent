@@ -24,6 +24,7 @@ from ui import (
     add_web_fetch_entry,
     add_web_search_entry,
     add_write_entry,
+    append_chat_status,
     get_agent_confirmation,
     get_agent_choice,
     get_agent_choices,
@@ -72,11 +73,28 @@ WEB_FETCH_DEFAULT_MAX_CHARS = 8000
 WEB_FETCH_MAX_CHARS = 60000
 WEB_FETCH_MAX_RESPONSE_BYTES = 1000000
 WEB_FETCH_MAX_REDIRECTS = 5
-NO_WORKSPACE_TOOLS = {"read_program_docs", "web_fetch", "web_search"}
+NO_WORKSPACE_TOOLS = {
+    "read_program_docs",
+    "web_fetch",
+    "web_search",
+    "update_todo",
+    "ask_user",
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+}
+REFERENCE_ONLY_TOOLS = frozenset({
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+})
 
 PLAN_MODE_ALLOWED_TOOLS = frozenset({
     "update_todo",
     "ask_user",
+    "dispatch_subagent",
     "read_file",
     "read_program_docs",
     "list_dir",
@@ -154,7 +172,7 @@ ASK_USER_TOOL_DEFINITION = {
     "description": (
         "Ask the user one important multiple-choice question, or a short batch of related questions, "
         "and return the selected option or typed answer for each. "
-        "This tool is available only in Plan mode. Use it instead of asking the user to "
+        "This tool is available in normal mode and in Agent Build/Plan mode. Use it instead of asking the user to "
         "choose from options in normal assistant text. "
         "Use only for uncertainty that materially affects goal, scope, tradeoffs, or acceptance "
         "criteria and cannot be resolved from local files, tools, or web facts."
@@ -781,8 +799,6 @@ def tool_definitions(
         for tool in TOOL_DEFINITIONS
         if include_plan or tool["name"] != "update_todo"
     ]
-    if not plan_mode:
-        definitions = [tool for tool in definitions if tool["name"] != "ask_user"]
     if include_skills:
         definitions.extend(SKILL_TOOL_DEFINITIONS)
     if include_web_search:
@@ -951,6 +967,7 @@ class AgentTools:
         self._display_payload = None
         self.suppress_visible_output = False
         self._session_original_contents = {}
+        self.reference_files = {}
         self.reference_folders = {}
         self.begin_agent_session(clear_todos=False)
 
@@ -1028,6 +1045,9 @@ class AgentTools:
     def skills_catalog_prompt(self):
         return self.skill_registry.catalog_prompt()
 
+    def workspace_skills_usage_prompt(self):
+        return self.skill_registry.workspace_usage_prompt()
+
     def set_subagent_executor(self, executor):
         self.subagent_executor = executor
 
@@ -1073,7 +1093,9 @@ class AgentTools:
                 "tool whitelist. The subagent returns one concise summary, which is the "
                 "only content added back to the main context. Use this for independent "
                 "research, code reading, audit, or scoped implementation tasks that would "
-                "otherwise add bulky tool output to the main conversation.\n\n"
+                "otherwise add bulky tool output to the main conversation. For non-trivial "
+                "tasks, actively look for a bounded part that can be delegated early instead "
+                "of doing all exploration in the main context.\n\n"
                 "Available agent_type values:\n"
                 f"{self.subagent_registry.describe()}"
             ),
@@ -1127,7 +1149,8 @@ class AgentTools:
                 "Spawn a persistent teammate into the agent team and optionally assign an "
                 "immediate task. Teammates have independent contexts and tool whitelists. "
                 "The teammate runs immediately and returns a result. Use this to parallelize "
-                "work across different roles.\n\n"
+                "work across different roles. For non-trivial Build tasks, prefer assigning "
+                "a fitting specialist early rather than keeping all work in the lead agent.\n\n"
                 "Available teammate types:\n"
                 f"{store.describe() if store else ''}"
             ),
@@ -1341,6 +1364,18 @@ class AgentTools:
             for name, path in dict(folders or {}).items()
         }
 
+    def set_reference_files(self, files=None):
+        self.reference_files = {
+            str(name): Path(path).resolve(strict=True)
+            for name, path in dict(files or {}).items()
+        }
+
+    def has_reference_access(self):
+        return bool(self.reference_files or self.reference_folders)
+
+    def clear_reference_files(self):
+        self.reference_files = {}
+
     def clear_reference_folders(self):
         self.reference_folders = {}
 
@@ -1517,6 +1552,14 @@ class AgentTools:
     def execute(self, name, tool_input):
         if not self.enabled and name not in NO_WORKSPACE_TOOLS:
             return _error_result("No workspace directory")
+        if (
+            not self.enabled
+            and name in REFERENCE_ONLY_TOOLS
+            and not self.has_reference_access()
+        ):
+            return _error_result(
+                "Tool is unavailable unless the user explicitly referenced a file or folder in this request."
+            )
 
         try:
             self._display_payload = None
@@ -1529,9 +1572,6 @@ class AgentTools:
                     f"Tool '{name}' is not available in Plan mode (read-only). "
                     "Switch to Build mode to use modification tools."
                 )
-            if not self.plan_mode and name == "ask_user":
-                return _error_result("Tool 'ask_user' is available only in Plan mode.")
-
             handlers = {
                 "update_todo": self._update_todo,
                 "ask_user": self._ask_user,
@@ -1650,6 +1690,10 @@ class AgentTools:
                 item["options"],
                 default_index=item["default_index"],
             )
+            if selected_index <= 0:
+                self._display_payload = None
+                self._display_user_rejection("Rejected by user: question.")
+                return "User cancelled question."
             add_question_entry(item["question"], selected_text)
             self._display_payload = {
                 "kind": "ask_user",
@@ -1665,6 +1709,7 @@ class AgentTools:
         answers = get_agent_choices(questions)
         if not answers:
             self._display_payload = None
+            self._display_user_rejection("Rejected by user: question batch.")
             return "User cancelled question batch."
         entries = []
         response_lines = []
@@ -1857,6 +1902,24 @@ class AgentTools:
             diff or f"(no content changes, {len(content)} characters)",
             "file_edit",
         ):
+            additions, deletions = _diff_stats(diff)
+            self._display_payload = {
+                "kind": "file_write",
+                "file_path": self._display_path(file_path),
+                "additions": additions,
+                "deletions": deletions,
+                "diff": diff,
+                "status": "rejected",
+            }
+            self._before_visible_output()
+            if not self.suppress_visible_output:
+                add_write_entry(
+                    self._display_path(file_path),
+                    additions,
+                    deletions,
+                    diff,
+                    status="rejected",
+                )
             return _error_result("User rejected write_file.")
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1905,6 +1968,24 @@ class AgentTools:
             diff,
             "file_edit",
         ):
+            additions, deletions = _diff_stats(diff)
+            self._display_payload = {
+                "kind": "file_edit",
+                "file_path": self._display_path(file_path),
+                "additions": additions,
+                "deletions": deletions,
+                "diff": diff,
+                "status": "rejected",
+            }
+            self._before_visible_output()
+            if not self.suppress_visible_output:
+                add_edit_entry(
+                    self._display_path(file_path),
+                    additions,
+                    deletions,
+                    diff,
+                    status="rejected",
+                )
             return _error_result("User rejected edit_file.")
 
         file_path.write_text(updated, encoding="utf-8")
@@ -1967,6 +2048,24 @@ class AgentTools:
             diff or f"Old lines:\n{old_display}\n\nNew lines:\n{new_display}",
             "file_edit",
         ):
+            additions, deletions = _diff_stats(diff)
+            self._display_payload = {
+                "kind": "file_edit",
+                "file_path": self._display_path(file_path),
+                "additions": additions,
+                "deletions": deletions,
+                "diff": diff,
+                "status": "rejected",
+            }
+            self._before_visible_output()
+            if not self.suppress_visible_output:
+                add_edit_entry(
+                    self._display_path(file_path),
+                    additions,
+                    deletions,
+                    diff,
+                    status="rejected",
+                )
             return _error_result("User rejected apply_patch.")
 
         file_path.write_text(updated, encoding="utf-8")
@@ -2005,6 +2104,24 @@ class AgentTools:
             diff or patch,
             "file_edit",
         ):
+            additions, deletions = _diff_stats(diff)
+            self._display_payload = {
+                "kind": "file_edit",
+                "file_path": self._display_path(file_path),
+                "additions": additions,
+                "deletions": deletions,
+                "diff": diff,
+                "status": "rejected",
+            }
+            self._before_visible_output()
+            if not self.suppress_visible_output:
+                add_edit_entry(
+                    self._display_path(file_path),
+                    additions,
+                    deletions,
+                    diff,
+                    status="rejected",
+                )
             return _error_result("User rejected apply_unified_patch.")
 
         file_path.write_text(updated, encoding="utf-8")
@@ -2041,6 +2158,15 @@ class AgentTools:
             f"{risk_reason}\n{command}",
             risk_reason,
         ):
+            result = _error_result("User rejected bash command.")
+            self._display_payload = {
+                "kind": "shell",
+                "command": command,
+                "output": "Rejected by user.",
+            }
+            self._before_visible_output()
+            if not self.suppress_visible_output:
+                add_shell_entry(command, "Rejected by user.")
             return _error_result("User rejected bash command.")
 
         try:
@@ -2497,6 +2623,9 @@ class AgentTools:
         reference = str(reference or "").strip()
         if not reference:
             return self._resolve_path(path_value)
+        reference_file = self._reference_file(reference)
+        if reference_file is not None:
+            return self._resolve_reference_file_path(path_value, reference_file)
         path_text = str(path_value or "").strip()
         if not path_text:
             raise AgentToolError("Path cannot be empty.")
@@ -2508,6 +2637,24 @@ class AgentTools:
         resolved = (root / path_text).resolve(strict=False)
         self._ensure_inside_root(resolved, root)
         return resolved
+
+    def _resolve_reference_file_path(self, path_value, file_path):
+        path_text = str(path_value or "").strip()
+        if path_text in {"", "."}:
+            return file_path
+        if _has_parent_reference(path_text) or _looks_absolute(path_text):
+            raise AgentToolError(
+                "Referenced-file paths must target the referenced file itself."
+            )
+        if path_text not in {file_path.name, file_path.as_posix()}:
+            raise AgentToolError(
+                "Referenced-file access is limited to the explicitly referenced file."
+            )
+        return file_path
+
+    def _reference_file(self, reference):
+        files = getattr(self, "reference_files", {})
+        return files.get(str(reference))
 
     def _reference_root(self, reference):
         folders = getattr(self, "reference_folders", {})
@@ -2537,9 +2684,11 @@ class AgentTools:
             raise AgentToolError("Path is outside the workspace.")
 
     def _display_path(self, path):
+        if self.workspace_dir is None:
+            return str(path)
         try:
             return str(path.relative_to(self.workspace_dir))
-        except ValueError:
+        except (TypeError, ValueError):
             return str(path)
 
     def _record_changed_file(self, file_path, original_content=None):
@@ -2621,6 +2770,11 @@ class AgentTools:
             return True
         self._before_visible_output()
         return get_agent_confirmation(title, detail)
+
+    def _display_user_rejection(self, message):
+        self._before_visible_output()
+        if not self.suppress_visible_output:
+            append_chat_status(message)
 
     def _todo_action_gate(self, name, tool_input):
         if self.plan_mode:

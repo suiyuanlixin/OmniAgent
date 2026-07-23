@@ -10,7 +10,6 @@ PREFERENCE_MEMORY_FILE = "preferences.md"
 EPISODIC_DIR_NAME = "episodes"
 LEGACY_EPISODIC_FILE = "episodic.md"
 LEGACY_EPISODIC_MIGRATED_FILE = "episodic.migrated.md"
-MEMORY_UPDATE_DIAGNOSTICS_FILE = "memory_update_diagnostics.jsonl"
 CORE_MEMORY_MAX_CHARS = 3000
 PREFERENCE_MEMORY_MAX_CHARS = 3000
 SYSTEM_MEMORY_MAX_CHARS = 7000
@@ -23,9 +22,8 @@ PREFERENCE_MEMORY_TEMPLATE = "# Critical\n\n# High\n\n# Medium\n\n# Low\n"
 
 
 class MemoryStore:
-    def __init__(self, memory_dir=None, debug=False, history_path=None):
+    def __init__(self, memory_dir=None, history_path=None):
         self.memory_dir = Path(memory_dir) if memory_dir is not None else MEMORY_DIR
-        self.debug = bool(debug)
         self.core_path = self.memory_dir / CORE_MEMORY_FILE
         self.preference_path = self.memory_dir / PREFERENCE_MEMORY_FILE
         self.episodic_dir = self.memory_dir / EPISODIC_DIR_NAME
@@ -34,11 +32,7 @@ class MemoryStore:
             self.memory_dir / LEGACY_EPISODIC_MIGRATED_FILE
         )
         self.history_path = Path(history_path) if history_path else None
-        self.update_diagnostics_path = self.memory_dir / MEMORY_UPDATE_DIAGNOSTICS_FILE
         self.ensure_files()
-
-    def set_debug(self, enabled):
-        self.debug = bool(enabled)
 
     def ensure_files(self):
         self.memory_dir.mkdir(parents=True, exist_ok=True)
@@ -710,32 +704,6 @@ class MemoryStore:
         if len(content) < CORE_MEMORY_MAX_CHARS:
             return
         self.write_core_body(self.read_core_body())
-
-    def record_update_diagnostic(
-        self,
-        source,
-        raw_response,
-        error,
-        repair_response=None,
-        now=None,
-    ):
-        if not self.debug:
-            return False
-        now = now or datetime.now()
-        payload = {
-            "ts": now.isoformat(timespec="seconds"),
-            "source": str(source or ""),
-            "error": str(error or ""),
-            "raw_response": _truncate(str(raw_response or ""), 4000),
-        }
-        if repair_response is not None:
-            payload["repair_response"] = _truncate(str(repair_response or ""), 4000)
-        try:
-            with self.update_diagnostics_path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            return True
-        except OSError:
-            return False
 
 
 def parse_memory_update_response(text):

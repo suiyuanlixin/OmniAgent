@@ -171,16 +171,16 @@ def add_explored_entry(tool_name, description):
         bridge.add_explored_entry(tool_name, description)
 
 
-def add_edit_entry(file_path, additions, deletions, diff):
+def add_edit_entry(file_path, additions, deletions, diff, status=""):
     bridge = get_bridge()
     if bridge is not None:
-        bridge.add_edit_entry(file_path, additions, deletions, diff)
+        bridge.add_edit_entry(file_path, additions, deletions, diff, status)
 
 
-def add_write_entry(file_path, additions, deletions, diff):
+def add_write_entry(file_path, additions, deletions, diff, status=""):
     bridge = get_bridge()
     if bridge is not None:
-        bridge.add_write_entry(file_path, additions, deletions, diff)
+        bridge.add_write_entry(file_path, additions, deletions, diff, status)
 
 
 def add_shell_entry(command, output):
@@ -235,6 +235,18 @@ def append_subagent_event(entry_id, event):
     bridge = get_bridge()
     if bridge is not None:
         bridge.append_subagent_event(entry_id, event)
+
+
+def start_compaction_entry(entry_id, status, mode="auto"):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.start_compaction_entry(entry_id, status, mode)
+
+
+def finish_compaction_entry(entry_id, status, mode="auto", details=""):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.finish_compaction_entry(entry_id, status, mode, details)
 
 
 def print_stream_response_start(model_name):

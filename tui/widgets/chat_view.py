@@ -78,7 +78,13 @@ def _patch_rich_markdown_tables() -> None:
     rich_markdown.TableElement._omniagent_fold_patch = True
 
 
+def _patch_rich_markdown_headings() -> None:
+    # Keep h1 aligned with the rest of the Markdown content.
+    rich_markdown.Heading.LEVEL_ALIGN["h1"] = "left"
+
+
 _patch_rich_markdown_tables()
+_patch_rich_markdown_headings()
 
 
 class ChatView(Widget):
@@ -249,6 +255,37 @@ class ChatView(Widget):
         margin: 1 0 0 0;
         padding: 0;
         background: transparent;
+    }
+
+    CompactionBlock {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    CompactionBlock > .compaction-line {
+        width: 100%;
+        height: 1;
+        color: $TEXT_MUTED;
+        background: transparent;
+        content-align: center middle;
+        text-align: center;
+    }
+
+    CompactionBlock > .compaction-details {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        padding: 0;
+        color: $TEXT_MUTED;
+        background: transparent;
+        content-align: center middle;
+        text-align: center;
+    }
+    CompactionBlock > .compaction-details.hidden {
+        display: none;
     }
 
     QuestionsBlock > .questions-toggle {
@@ -717,6 +754,8 @@ class ChatView(Widget):
         self._write_block: WrittenBlock | None = None
         self._shell_block: ShellBlock | None = None
         self._questions_block: QuestionsBlock | None = None
+        self._compaction_blocks: dict[str, CompactionBlock] = {}
+        self._compaction_transcript_indices: dict[str, int] = {}
         self._subagent_blocks: dict[str, SubagentBlock] = {}
         self._subagent_transcript_indices: dict[str, int] = {}
 
@@ -847,6 +886,8 @@ class ChatView(Widget):
         self._write_block = None
         self._shell_block = None
         self._questions_block = None
+        self._compaction_blocks.clear()
+        self._compaction_transcript_indices.clear()
         self._subagent_blocks.clear()
         self._subagent_transcript_indices.clear()
 
@@ -967,7 +1008,12 @@ class ChatView(Widget):
         self._explored_block = None
 
     def add_edit_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
         self._activate_aux_output("edit")
         if self._edited_block is None:
@@ -975,18 +1021,26 @@ class ChatView(Widget):
             self.query_one("#chat-log", VerticalScroll).mount(block)
             self.call_after_refresh(self._scroll_end)
             self._edited_block = block
-        self._edited_block.add_entry(file_path, additions, deletions, diff)
+        self._edited_block.add_entry(
+            file_path, additions, deletions, diff, status=status
+        )
         self._append_transcript_entry({
             "kind": "edit",
             "file_path": str(file_path or ""),
             "additions": int(additions or 0),
             "deletions": int(deletions or 0),
             "diff": str(diff or ""),
+            "status": str(status or ""),
         })
         self.call_after_refresh(self._scroll_end)
 
     def add_write_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
         self._activate_aux_output("write")
         if self._write_block is None:
@@ -994,13 +1048,16 @@ class ChatView(Widget):
             self.query_one("#chat-log", VerticalScroll).mount(block)
             self.call_after_refresh(self._scroll_end)
             self._write_block = block
-        self._write_block.add_entry(file_path, additions, deletions, diff)
+        self._write_block.add_entry(
+            file_path, additions, deletions, diff, status=status
+        )
         self._append_transcript_entry({
             "kind": "write",
             "file_path": str(file_path or ""),
             "additions": int(additions or 0),
             "deletions": int(deletions or 0),
             "diff": str(diff or ""),
+            "status": str(status or ""),
         })
         self.call_after_refresh(self._scroll_end)
 
@@ -1103,6 +1160,86 @@ class ChatView(Widget):
             )
         self.call_after_refresh(self._scroll_end)
 
+    def start_compaction_entry(
+        self,
+        entry_id: str,
+        status: str,
+        mode: str = "auto",
+        details: str = "",
+    ) -> None:
+        self._activate_aux_output("compaction")
+        entry_id = str(entry_id or "")
+        details = self._normalize_compaction_details(details)
+        block = CompactionBlock(status=status, mode=mode, details=details)
+        self._compaction_blocks[entry_id] = block
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "compaction",
+            "status": str(status or ""),
+            "mode": str(mode or "auto"),
+            "details": str(details or ""),
+        })
+        self._compaction_transcript_indices[entry_id] = len(self._transcript) - 1
+        self.call_after_refresh(self._scroll_end)
+
+    def finish_compaction_entry(
+        self,
+        entry_id: str,
+        status: str,
+        mode: str = "auto",
+        details: str = "",
+    ) -> None:
+        entry_id = str(entry_id or "")
+        details = self._normalize_compaction_details(details)
+        block = self._compaction_blocks.get(entry_id)
+        if block is None:
+            self.start_compaction_entry(entry_id, status, mode=mode, details=details)
+            return
+        block.set_state(status=status, mode=mode, details=details)
+        transcript_index = self._compaction_transcript_indices.get(entry_id)
+        if transcript_index is not None:
+            self._update_transcript_entry(
+                transcript_index,
+                status=str(status or ""),
+                mode=str(mode or "auto"),
+                details=str(details or ""),
+            )
+        self.call_after_refresh(self._scroll_end)
+
+    @staticmethod
+    def _normalize_compaction_details(details: str) -> str:
+        text = str(details or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", " ", text)
+        message_match = re.search(
+            r"\bmessages?\s*:\s*([0-9]+)\s*->\s*([0-9]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        char_match = re.search(
+            r"\bchars?\s*:\s*([0-9]+)\s*->\s*([0-9]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        model_match = re.search(
+            r"\bcompact model\s*:\s*(.+?)(?=\s+Memory updated:|\s+Memory update failed:|\s+Memory update:\s*scheduled|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        parts: list[str] = []
+        if message_match:
+            parts.append(
+                f"Message: {message_match.group(1)} -> {message_match.group(2)}"
+            )
+        if char_match:
+            parts.append(f"Chars: {char_match.group(1)} -> {char_match.group(2)}")
+        if model_match:
+            model = str(model_match.group(1) or "").strip()
+            if model:
+                parts.append(f"Compact model: {model}")
+        return "\n".join(parts) if parts else ""
+
     def _reset_message_stream(self) -> None:
         self._stream_target = None
         self._stream_role = None
@@ -1187,6 +1324,7 @@ class ChatView(Widget):
                 int(entry.get("additions", 0) or 0),
                 int(entry.get("deletions", 0) or 0),
                 str(entry.get("diff") or ""),
+                str(entry.get("status") or ""),
             )
             return
         if kind == "write":
@@ -1195,6 +1333,7 @@ class ChatView(Widget):
                 int(entry.get("additions", 0) or 0),
                 int(entry.get("deletions", 0) or 0),
                 str(entry.get("diff") or ""),
+                str(entry.get("status") or ""),
             )
             return
         if kind == "shell":
@@ -1213,6 +1352,15 @@ class ChatView(Widget):
                 str(entry.get("agent_type") or ""),
                 list(entry.get("transcript") or []),
             )
+            return
+        if kind == "compaction":
+            self.start_compaction_entry(
+                f"replay-{len(self._transcript)}",
+                str(entry.get("status") or "running"),
+                str(entry.get("mode") or "auto"),
+                str(entry.get("details") or ""),
+            )
+            return
 
     def add_web_fetch_entry(self, url: str) -> None:
         self._activate_aux_output("web_fetch")
@@ -1273,6 +1421,88 @@ class ChatView(Widget):
             self._shell_block = None
         if except_kind != "questions":
             self._questions_block = None
+
+
+class CompactionBlock(Vertical):
+    LABELS = {
+        ("auto", "running"): "Auto context compaction",
+        ("auto", "done"): "Context compact complete",
+        ("manual", "running"): "Manual context compaction",
+        ("manual", "done"): "Context compact complete",
+    }
+
+    def __init__(self, status: str = "running", mode: str = "auto", details: str = ""):
+        super().__init__()
+        self.status = str(status or "running")
+        self.mode = str(mode or "auto")
+        self.details = str(details or "")
+        self.expanded = False
+        self._line_widget: Static | None = None
+        self._details_widget: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        self._line_widget = Static("", classes="compaction-line", markup=True)
+        yield self._line_widget
+        self._details_widget = Static(
+            "", classes="compaction-details hidden", markup=False
+        )
+        yield self._details_widget
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def on_click(self, event: events.Click) -> None:
+        if self.status != "done" or not self.details:
+            return
+        self.expanded = not self.expanded
+        self._refresh()
+        if self.expanded:
+            self.call_after_refresh(
+                self.scroll_visible,
+                animate=False,
+                force=True,
+                immediate=True,
+            )
+        event.stop()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._refresh()
+
+    def set_state(self, status: str, mode: str = "auto", details: str = "") -> None:
+        self.status = str(status or "running")
+        self.mode = str(mode or "auto")
+        self.details = str(details or "")
+        if self.status != "done" or not self.details:
+            self.expanded = False
+        self._refresh()
+
+    def _label(self) -> str:
+        return self.LABELS.get(
+            (self.mode, self.status),
+            self.LABELS[("auto", "running")],
+        )
+
+    def _refresh(self) -> None:
+        if self._line_widget is None or self._details_widget is None:
+            return
+        self._line_widget.update(self._line_markup())
+        self._details_widget.update(self.details)
+        if self.expanded and self.status == "done" and self.details:
+            self._details_widget.remove_class("hidden")
+        else:
+            self._details_widget.add_class("hidden")
+
+    def _line_markup(self) -> str:
+        label = self._label()
+        width = max(1, self.size.width or self.content_region.width or 1)
+        inner_width = max(0, width - 2)
+        label_width = cell_len(label)
+        side_total = max(0, inner_width - label_width)
+        left_width = side_total // 2
+        right_width = side_total - left_width
+        left = "─" * left_width
+        right = "─" * right_width
+        return f"[gray]{left} {_escape_markup(label)} {right}[/gray]"
 
 
 def _build_message_widgets(
@@ -1412,6 +1642,7 @@ class SelectableMessageStatic(Static, can_focus=True):
         self._render_cache_source = ""
         self._render_cache_text = ""
         self._render_cache_styled: Text | None = None
+        self._render_cache_index_map: tuple[int | None, ...] = ()
 
     def render(self):
         if self._selection_anchor == self._selection_focus:
@@ -1427,6 +1658,7 @@ class SelectableMessageStatic(Static, can_focus=True):
         self._render_cache_source = ""
         self._render_cache_text = ""
         self._render_cache_styled = None
+        self._render_cache_index_map = ()
         self.clear_selection(refresh=False)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
@@ -1470,7 +1702,7 @@ class SelectableMessageStatic(Static, can_focus=True):
         if self._selection_anchor == self._selection_focus:
             selected = self._copy_content or self._raw_content()
         else:
-            selected = self.selected_text
+            selected = self._selected_copy_text()
             for display, syntax in self._copy_references:
                 selected = selected.replace(display, syntax)
         if not selected:
@@ -1487,6 +1719,19 @@ class SelectableMessageStatic(Static, can_focus=True):
     def selected_text(self) -> str:
         start, end = self._selection_range()
         return self._plain_content()[start:end]
+
+    def _selected_copy_text(self) -> str:
+        start, end = self._selection_range()
+        if start >= end:
+            return ""
+        self._rendered_plain_text()
+        source = self._raw_content()
+        copied: list[str] = []
+        for source_index in self._render_cache_index_map[start:end]:
+            if source_index is None or source_index < 0 or source_index >= len(source):
+                continue
+            copied.append(source[source_index])
+        return "".join(copied)
 
     def clear_selection(self, refresh: bool = True) -> None:
         self._selection_anchor = 0
@@ -1517,11 +1762,21 @@ class SelectableMessageStatic(Static, can_focus=True):
             return self._render_cache_styled
         base_text = self._styled_content()
         raw_lines = base_text.split("\n", include_separator=False)
+        source_lines = source.split("\n")
         if not raw_lines:
             raw_lines = [Text("")]
+        if not source_lines:
+            source_lines = [""]
         rendered = Text()
         plain_lines: list[str] = []
+        index_map: list[int | None] = []
+        source_offset = 0
         for line_index, raw_line in enumerate(raw_lines):
+            source_line = (
+                source_lines[line_index] if line_index < len(source_lines) else ""
+            )
+            source_line_offset = source_offset
+            source_line_cursor = 0
             wrapped = raw_line.wrap(
                 self.app.console,
                 width,
@@ -1533,12 +1788,29 @@ class SelectableMessageStatic(Static, can_focus=True):
             for wrapped_index, visual_line in enumerate(wrapped):
                 if rendered:
                     rendered.append("\n")
+                    if wrapped_index == 0 and line_index > 0:
+                        index_map.append(source_line_offset - 1)
+                    else:
+                        index_map.append(None)
                 rendered.append_text(visual_line)
                 plain_lines.append(visual_line.plain)
+                visual_text = visual_line.plain
+                visual_length = len(visual_text)
+                for char_index in range(visual_length):
+                    source_index = source_line_offset + source_line_cursor + char_index
+                    if source_index < source_line_offset + len(source_line):
+                        index_map.append(source_index)
+                    else:
+                        index_map.append(None)
+                source_line_cursor += visual_length
+            source_offset = source_line_offset + len(source_line)
+            if line_index != len(source_lines) - 1:
+                source_offset += 1
         self._render_cache_width = width
         self._render_cache_source = source
         self._render_cache_text = "\n".join(plain_lines)
         self._render_cache_styled = rendered
+        self._render_cache_index_map = tuple(index_map)
         return rendered
 
     def _selection_range(self) -> tuple[int, int]:
@@ -1731,17 +2003,22 @@ class MarkdownMessageStatic(Static, can_focus=True):
         plain_lines: list[str] = []
         for line_index, segments in enumerate(lines):
             line_text = Text()
+            preserve_trailing_whitespace = False
             for segment in segments:
                 if not segment.text:
                     continue
+                if self._segment_has_background(segment.style):
+                    preserve_trailing_whitespace = True
                 line_text.append(segment.text, segment.style)
-            trim_length = len(line_text.plain.rstrip())
-            if trim_length <= 0:
-                line_text = Text("")
-                plain_lines.append("")
-            else:
-                line_text = line_text[:trim_length]
+            if preserve_trailing_whitespace:
                 plain_lines.append(line_text.plain)
+            else:
+                trim_length = len(line_text.plain.rstrip())
+                if trim_length > 0:
+                    line_text = line_text[:trim_length]
+                plain_lines.append(line_text.plain)
+            if not line_text.plain and not preserve_trailing_whitespace:
+                line_text = Text("")
             if line_index:
                 rendered.append("\n")
             rendered.append_text(line_text)
@@ -1750,6 +2027,20 @@ class MarkdownMessageStatic(Static, can_focus=True):
         self._render_cache_text = "\n".join(plain_lines)
         self._render_cache_styled = rendered
         return rendered
+
+    @staticmethod
+    def _segment_has_background(style) -> bool:
+        if style is None:
+            return False
+        bgcolor = getattr(style, "bgcolor", None)
+        if bgcolor is not None:
+            return True
+        link_style = getattr(style, "_link_style", None)
+        if link_style is not None:
+            linked_bg = getattr(link_style, "bgcolor", None)
+            if linked_bg is not None:
+                return True
+        return False
 
     def _selection_range(self) -> tuple[int, int]:
         start = max(0, min(self._selection_anchor, self._selection_focus))
@@ -2300,10 +2591,21 @@ class EditedBlock(Vertical):
         super().__init__()
 
     def add_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
         row = DiffFileRow(
-            "[gray]#[/] Edit", file_path, additions, deletions, diff, show_stats=True
+            "[gray]#[/] Edit",
+            file_path,
+            additions,
+            deletions,
+            diff,
+            show_stats=True,
+            status=status,
         )
         self.mount(row)
 
@@ -2313,10 +2615,21 @@ class WrittenBlock(Vertical):
         super().__init__()
 
     def add_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
         row = DiffFileRow(
-            "[gray]#[/] Write", file_path, additions, deletions, diff, show_stats=False
+            "[gray]#[/] Write",
+            file_path,
+            additions,
+            deletions,
+            diff,
+            show_stats=False,
+            status=status,
         )
         self.mount(row)
 
@@ -2449,6 +2762,7 @@ class DiffFileRow(Vertical):
         deletions: int,
         diff: str,
         show_stats: bool = True,
+        status: str = "",
     ):
         super().__init__()
         self.label = str(label or "")
@@ -2457,6 +2771,7 @@ class DiffFileRow(Vertical):
         self.deletions = int(deletions or 0)
         self.diff = str(diff or "")
         self.show_stats = bool(show_stats)
+        self.status = str(status or "").strip().lower()
         self._row_expanded = False
         self._row_container: Vertical | None = None
         self._file_row: ChangedFileRow | None = None
@@ -2464,7 +2779,10 @@ class DiffFileRow(Vertical):
     def compose(self) -> ComposeResult:
         with Horizontal(classes="diff-row-header"):
             yield Static(
-                self.label, classes="diff-row-label", markup=True, expand=False
+                self._label_markup(),
+                classes="diff-row-label",
+                markup=True,
+                expand=False,
             )
             yield Static(
                 _escape_markup(self.file_path),
@@ -2512,12 +2830,19 @@ class DiffFileRow(Vertical):
         event.stop()
 
     def _stats_text(self) -> str:
+        if self.status == "rejected":
+            return ""
         parts = []
         if self.additions:
             parts.append(f"[#7fd97f]+{self.additions}[/]")
         if self.deletions:
             parts.append(f"[#d97f7f]-{self.deletions}[/]")
         return " ".join(parts)
+
+    def _label_markup(self) -> str:
+        if self.status == "rejected":
+            return f"{self.label} [gray](rejected)[/]"
+        return self.label
 
 
 class ChangedFilesBlock(Vertical):

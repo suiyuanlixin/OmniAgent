@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,7 @@ from ui import (
     append_subagent_event,
     clean_and_print_stream_response,
     clean_display_text,
+    finish_compaction_entry,
     finish_thinking_round,
     print_error,
     print_info,
@@ -21,6 +23,7 @@ from ui import (
     print_warn,
     set_todo_panel,
     set_context_usage,
+    start_compaction_entry,
     start_subagent_entry,
 )
 from config import (
@@ -43,8 +46,11 @@ from config import (
 )
 from memory import MemoryStore, parse_memory_update_response
 from tools import (
+    ASK_USER_TOOL_DEFINITION,
     AgentTools,
     PROGRAM_DOCS_TOOL_DEFINITION,
+    PLAN_MODE_ALLOWED_TOOLS,
+    TOOL_DEFINITIONS,
     WEB_FETCH_TOOL_DEFINITION,
     WEB_SEARCH_TOOL_DEFINITION,
     anthropic_tool_schemas,
@@ -54,6 +60,7 @@ from tools import (
 )
 from subagents import (
     FORBIDDEN_SUBAGENT_TOOL_NAMES,
+    SubagentSpec,
     SubagentRunner,
     compose_subagent_task,
 )
@@ -250,7 +257,6 @@ class OmniAgent:
         compaction_keep_recent_messages=12,
         compaction_compact_model=AUTO_MODEL_SELECTION,
         memory_model=AUTO_MODEL_SELECTION,
-        debug=False,
         web_search_enabled=True,
         web_search_provider="tavily",
         web_search_api_key="",
@@ -259,11 +265,11 @@ class OmniAgent:
         web_search_topic="general",
         agent_plan_enabled=True,
         agent_team_enable=False,
+        current_model_name="",
         history_path=None,
     ):
         _ensure_user_prompt_file()
-        self.debug = bool(debug)
-        self.memory_store = MemoryStore(debug=self.debug, history_path=history_path)
+        self.memory_store = MemoryStore(history_path=history_path)
         self.memory_lock = threading.Lock()
         self.session_memory_lock = threading.Lock()
         self.session_episodic_heading = ""
@@ -277,6 +283,7 @@ class OmniAgent:
         self.extra_modalities = normalize_extra_modalities(extra_modalities)
         self.last_context_input_tokens = 0
         self.last_context_usage_source = ""
+        self.current_model_name = str(current_model_name or "").strip()
         self.set_context_window_tokens(context_window_tokens)
         self.set_compaction_config(
             compaction_enable,
@@ -557,10 +564,6 @@ class OmniAgent:
     def set_memory_model(self, model):
         self.memory_model = normalize_optional_model_selection(model)
 
-    def set_debug(self, enabled):
-        self.debug = bool(enabled)
-        self.memory_store.set_debug(self.debug)
-
     def _memory_model_name(self):
         if self.memory_model == AUTO_MODEL_SELECTION:
             return self.model
@@ -570,7 +573,6 @@ class OmniAgent:
         return {
             "configured_model": self.memory_model,
             "effective_model": self._memory_model_name(),
-            "debug": self.debug,
         }
 
     def set_workspace_dir(self, workspace_dir):
@@ -671,8 +673,10 @@ class OmniAgent:
         stream_callback_thinking=None,
         stream_callback_response=None,
         media_references=None,
+        reference_files=None,
         reference_folders=None,
     ):
+        self.agent_tools.set_reference_files(reference_files)
         self.agent_tools.set_reference_folders(reference_folders)
         user_content = self._user_message_content(user_message, media_references)
         self.conversation_history.append({"role": "user", "content": user_content})
@@ -751,6 +755,7 @@ class OmniAgent:
             print_error(f"Request error: {error}")
             return None
         finally:
+            self.agent_tools.clear_reference_files()
             self.agent_tools.clear_reference_folders()
 
     def _agent_response(self):
@@ -1058,6 +1063,7 @@ class OmniAgent:
                         tool_call["id"],
                         tool_call["name"],
                         tool_result,
+                        display=self._consume_last_tool_display(),
                     )
                 )
             finish_thinking_round()
@@ -1274,9 +1280,18 @@ class OmniAgent:
 
     def _execute_normal_web_search_tool(self, name, arguments):
         arguments = arguments if isinstance(arguments, dict) else {}
-        if name == "read_program_docs":
+        if name in {"read_file", "list_dir", "grep", "glob"}:
+            if not str(arguments.get("reference") or "").strip():
+                return _error_text(
+                    "In normal mode, local file tools require an explicit referenced file or folder label."
+                )
             return self.agent_tools.execute(name, arguments)
-        if name == "web_fetch":
+        if name in {
+            "update_todo",
+            "ask_user",
+            "read_program_docs",
+            "web_fetch",
+        }:
             return self.agent_tools.execute(name, arguments)
         if name != "web_search":
             return _error_text(f"Tool is not available in normal mode: {name}")
@@ -2346,7 +2361,11 @@ class OmniAgent:
                     tool_call["name"], tool_call["arguments"]
                 )
                 self.conversation_history.append(
-                    self._ollama_tool_result_message(tool_call["name"], tool_result)
+                    self._ollama_tool_result_message(
+                        tool_call["name"],
+                        tool_result,
+                        display=self._consume_last_tool_display(),
+                    )
                 )
             finish_thinking_round()
 
@@ -2578,15 +2597,7 @@ class OmniAgent:
             }
 
         result = self.compact_context(manual=False)
-        if result.get("compacted"):
-            print_info(
-                "Context compacted automatically: "
-                f"{result.get('before_messages')} -> {result.get('after_messages')} messages, "
-                f"{result.get('before_input_tokens')} input tokens "
-                f"(threshold {result.get('token_threshold')})."
-            )
-            self._print_memory_update_result(result.get("memory_update"))
-        elif result.get("error"):
+        if result.get("error"):
             print_warn(result.get("reason", "Automatic context compaction failed."))
         return result
 
@@ -2636,7 +2647,7 @@ class OmniAgent:
             messages = [{"role": "system", "content": self._agent_system_prompt()}]
         else:
             messages = [{"role": "system", "content": self._normal_system_prompt()}]
-        messages += self.conversation_history
+        messages += self._normalized_history_messages(self.conversation_history)
         return _estimate_history_tokens(messages)
 
     def compact_context(self, manual=False):
@@ -2649,6 +2660,11 @@ class OmniAgent:
             self.model
             if self.compaction_compact_model == AUTO_MODEL_SELECTION
             else self.compaction_compact_model
+        )
+        compact_model_label = (
+            self.current_model_name
+            if self.compaction_compact_model == AUTO_MODEL_SELECTION
+            else str(compact_model or "").strip()
         )
 
         if before_messages <= keep_recent:
@@ -2664,7 +2680,7 @@ class OmniAgent:
                 "usage_source": usage_source,
                 "token_threshold": token_threshold,
                 "context_window_tokens": self.context_window_tokens,
-                "model": compact_model,
+                "model": compact_model_label,
             }
 
         recent_messages = self.conversation_history[-keep_recent:]
@@ -2686,8 +2702,28 @@ class OmniAgent:
                 "usage_source": usage_source,
                 "token_threshold": token_threshold,
                 "context_window_tokens": self.context_window_tokens,
-                "model": compact_model,
+                "model": compact_model_label,
             }
+
+        if not source_messages and existing_summary:
+            return {
+                "compacted": False,
+                "reason": (
+                    "Context compaction cancelled: just compacted recently. "
+                    "Wait until more messages move beyond the recent window."
+                ),
+                "before_messages": before_messages,
+                "before_chars": before_chars,
+                "before_input_tokens": before_input_tokens,
+                "usage_source": usage_source,
+                "token_threshold": token_threshold,
+                "context_window_tokens": self.context_window_tokens,
+                "model": compact_model_label,
+            }
+
+        compaction_entry_id = f"compaction-{uuid.uuid4().hex}"
+        compaction_mode = "manual" if manual else "auto"
+        start_compaction_entry(compaction_entry_id, "running", compaction_mode)
 
         try:
             summary = self._create_compaction_summary(
@@ -2706,7 +2742,7 @@ class OmniAgent:
                 "usage_source": usage_source,
                 "token_threshold": token_threshold,
                 "context_window_tokens": self.context_window_tokens,
-                "model": compact_model,
+                "model": compact_model_label,
             }
 
         summary = summary.strip()
@@ -2721,7 +2757,7 @@ class OmniAgent:
                 "usage_source": usage_source,
                 "token_threshold": token_threshold,
                 "context_window_tokens": self.context_window_tokens,
-                "model": compact_model,
+                "model": compact_model_label,
             }
 
         memory_update = self._schedule_memory_update_from_compaction(
@@ -2737,6 +2773,24 @@ class OmniAgent:
         after_chars = _estimate_history_chars(self.conversation_history)
         after_input_tokens = self._estimate_current_context_tokens()
         self._set_context_input_tokens(after_input_tokens, "estimated_after_compaction")
+        finish_compaction_entry(
+            compaction_entry_id,
+            "done",
+            compaction_mode,
+            self._compaction_details_text(
+                before_messages=before_messages,
+                after_messages=len(self.conversation_history),
+                before_chars=before_chars,
+                after_chars=after_chars,
+                before_input_tokens=before_input_tokens,
+                after_input_tokens=after_input_tokens,
+                token_threshold=token_threshold,
+                usage_source=usage_source,
+                compact_model=compact_model_label,
+                removed_tool_results=removed_tool_results,
+                memory_update=memory_update,
+            ),
+        )
         return {
             "compacted": True,
             "manual": manual,
@@ -2749,10 +2803,34 @@ class OmniAgent:
             "usage_source": usage_source,
             "token_threshold": token_threshold,
             "context_window_tokens": self.context_window_tokens,
-            "model": compact_model,
+            "model": compact_model_label,
             "removed_orphan_tool_results": removed_tool_results,
             "memory_update": memory_update,
         }
+
+    @staticmethod
+    def _compaction_details_text(
+        *,
+        before_messages,
+        after_messages,
+        before_chars,
+        after_chars,
+        before_input_tokens,
+        after_input_tokens,
+        token_threshold,
+        usage_source,
+        compact_model,
+        removed_tool_results,
+        memory_update,
+    ):
+        lines = [
+            f"Message: {before_messages} -> {after_messages}",
+            f"Chars: {before_chars} -> {after_chars}",
+        ]
+        compact_model = str(compact_model or "").strip()
+        if compact_model:
+            lines.append(f"Compact model: {compact_model}")
+        return "\n".join(lines)
 
     def _create_compaction_summary(
         self, existing_summary, source_messages, compact_model
@@ -2961,28 +3039,10 @@ class OmniAgent:
             repair_response = self._create_memory_update(repair_prompt, memory_model)
             repaired = parse_memory_update_response(repair_response)
             if repaired:
-                self.memory_store.record_update_diagnostic(
-                    source,
-                    raw_update,
-                    "repaired invalid JSON response",
-                    repair_response=repair_response,
-                )
                 return repaired
-        except Exception as error:
-            self.memory_store.record_update_diagnostic(
-                source,
-                raw_update,
-                f"repair failed: {error}",
-                repair_response=repair_response,
-            )
+        except Exception:
             return {}
 
-        self.memory_store.record_update_diagnostic(
-            source,
-            raw_update,
-            "memory update model returned no parseable JSON",
-            repair_response=repair_response,
-        )
         return {}
 
     def _create_memory_update(self, prompt, memory_model):
@@ -3165,12 +3225,16 @@ class OmniAgent:
     def _format_messages_for_compaction(self, messages):
         formatted = []
         for index, message in enumerate(messages, start=1):
+            if not isinstance(message, dict):
+                continue
             role = message.get("role", "unknown")
             content = self._message_content_for_compaction(message)
             formatted.append(f"[{index}] {role}:\n{content}")
         return "\n\n".join(formatted)
 
     def _message_content_for_compaction(self, message):
+        if not isinstance(message, dict):
+            return "(empty)"
         parts = []
         content = message.get("content", "")
         if content:
@@ -3200,13 +3264,17 @@ class OmniAgent:
         if not messages:
             return "", []
         first_message = messages[0]
+        if not isinstance(first_message, dict):
+            return "", [message for message in messages if isinstance(message, dict)]
         content = str(first_message.get("content", "") or "")
         if first_message.get("role") == "user" and content.startswith(
             COMPACTION_SUMMARY_PREFIX
         ):
             summary = content[len(COMPACTION_SUMMARY_PREFIX) :].strip()
-            return summary, messages[1:]
-        return "", messages
+            return summary, [
+                message for message in messages[1:] if isinstance(message, dict)
+            ]
+        return "", [message for message in messages if isinstance(message, dict)]
 
     def _fold_leading_tool_results_into_source(self, source_messages, recent_messages):
         source_messages = list(source_messages)
@@ -3216,6 +3284,8 @@ class OmniAgent:
         return source_messages, recent_messages
 
     def _message_has_tool_result(self, message):
+        if not isinstance(message, dict):
+            return False
         if message.get("role") == "tool":
             return True
         content = message.get("content")
@@ -3504,13 +3574,14 @@ class OmniAgent:
             evidence_required=evidence_required,
             scope_limit=scope_limit,
         )
+        effective_spec = self._effective_subagent_spec(spec)
         label = _single_line(purpose or task, 120)
         self._before_agent_visible_output()
         entry_id = uuid.uuid4().hex
         start_subagent_entry(entry_id, spec.name)
         runner = SubagentRunner(
             parent_agent=self,
-            spec=spec,
+            spec=effective_spec,
             tool_schemas=self._subagent_tool_schemas(spec),
             execute_tool=self._execute_subagent_tool,
             compact_tool_result=_compact_tool_result_for_context,
@@ -4355,6 +4426,7 @@ class OmniAgent:
         source_messages = (
             messages if messages is not None else self.conversation_history
         )
+        source_messages = self._normalized_history_messages(source_messages)
         if source_messages and source_messages[0].get("role") == "system":
             return source_messages
         return [
@@ -4371,6 +4443,7 @@ class OmniAgent:
         source_messages = (
             messages if messages is not None else self.conversation_history
         )
+        source_messages = self._normalized_history_messages(source_messages)
         if source_messages and source_messages[0].get("role") == "system":
             return self._ollama_messages(source_messages)
         return self._ollama_messages(
@@ -4396,6 +4469,29 @@ class OmniAgent:
             "\nUse web_fetch when the user provides a specific public webpage URL "
             "and asks you to read or summarize that page."
         )
+        reference_files = getattr(self.agent_tools, "reference_files", {})
+        reference_folders = getattr(self.agent_tools, "reference_folders", {})
+        if reference_files or reference_folders:
+            prompt += (
+                "\n- For this request, local read-only access is available only through "
+                "explicit user references. Always pass the exact reference label in the "
+                "`reference` parameter; never try to read other local paths."
+            )
+        if reference_files:
+            labels = ", ".join(reference_files)
+            prompt += (
+                "\n- The user referenced these files for this request: "
+                f"{labels}. Use read_file with the exact `reference` label. Access is "
+                "limited to that one file only."
+            )
+        if reference_folders:
+            labels = ", ".join(reference_folders)
+            prompt += (
+                "\n- The user referenced these folders for this request: "
+                f"{labels}. Access is read-only and lazy. Use list_dir or glob first, then "
+                "read_file or grep with the exact `reference` label and a path relative to "
+                "that folder. Do not use any local file tool without a `reference`."
+            )
         return _with_user_custom_prompt(
             _with_persistent_memory(prompt, self.memory_store)
         )
@@ -4408,11 +4504,11 @@ class OmniAgent:
                 "\n\nYou are in Plan mode. This is a planning and clarification workflow "
                 "for 'think it through before touching code'. Stay read-only: you may "
                 "inspect the workspace and use only read/search tools plus ask_user and "
-                "update_todo. Do NOT modify files or run commands."
+                "update_todo, and you may delegate read-only subagents. Do NOT modify files or run commands."
                 "\n- Use Plan mode when the request is still ambiguous, the change is risky, "
                 "the user wants design/options/roadmap first, or key decisions still need "
                 "confirmation."
-                "\n- ask_user is available only in Plan mode. Use it for short, "
+                "\n- ask_user is available in Build and Plan mode. In Plan mode, use it for short, "
                 "high-impact clarification questions; you may batch a few related questions in one call."
                 "\n- Your final output in Plan mode does not need a rigid format, but it "
                 "should usually make clear: the recommendation or conclusion, why it is "
@@ -4428,16 +4524,50 @@ class OmniAgent:
         )
         if self.agent_tools.subagents_available:
             prompt += (
-                "\n- Use dispatch_subagent for independent research, code reading, audit, "
-                "or scoped implementation subtasks that would otherwise add bulky tool "
-                "output to the main context. The subagent has its own history and a "
-                "restricted tool whitelist; only its final summary returns to you."
-                "\n- Keep ownership of the main plan, user-facing decisions, final "
-                "verification, and final answer. Do not dispatch a subagent for tasks "
-                "that need immediate user clarification."
-                "\n- If several delegated tasks are independent, you may request multiple "
-                "dispatch_subagent calls in the same assistant tool-use turn; OmniAgent "
-                "will execute them safely in order for terminal v1."
+                "\n- Before substantial direct work on a non-trivial request, identify at "
+                "least one bounded part suitable for dispatch_subagent, such as repository "
+                "exploration, external research, auditing, verification, or a scoped "
+                "implementation. Dispatch it early so its detailed tool output stays out of "
+                "the main context."
+                "\n- If two or more parts are independent, issue multiple dispatch_subagent "
+                "calls in the same assistant tool-use turn. Choose the narrowest matching role "
+                "and provide a concrete task, expected output, evidence requirement, and scope."
+                "\n- Handle work directly only when it is a simple one-step task, tightly "
+                "coupled to the main reasoning, requires immediate user clarification, or no "
+                "available subagent has a useful tool set. Do not delegate merely to repeat "
+                "work already completed in the main context."
+                "\n- The subagent has its own history and restricted tools; only its final "
+                "summary returns. Keep ownership of user-facing decisions, integration, final "
+                "verification, and the final answer."
+            )
+        if self.agent_tools.team_available and not self.agent_tools.plan_mode:
+            prompt += (
+                "\n- Agent Team is enabled. For every non-trivial Build task, inspect the "
+                "available teammate roles before substantial direct work and assign a fitting "
+                "specialist early with spawn_teammate. Use teammates for role-specific work "
+                "that benefits from an independent context, especially architecture review, "
+                "code review, debugging, infrastructure, implementation, or independent "
+                "verification."
+                "\n- Split independent responsibilities across multiple fitting teammates "
+                "rather than asking one teammate to cover unrelated concerns. Give each task "
+                "a narrow scope, expected output, and required evidence. Reuse active teammates "
+                "through team messaging when follow-up belongs to the same role."
+                "\n- Skip team delegation only for simple one-step work, tightly coupled edits "
+                "where delegation would duplicate the lead agent's context, or when no teammate "
+                "role fits. The lead agent remains responsible for integrating results, resolving "
+                "conflicts, verifying the final state, and answering the user."
+            )
+        if (
+            self.agent_tools.subagents_available
+            and self.agent_tools.team_available
+            and not self.agent_tools.plan_mode
+        ):
+            prompt += (
+                "\n- When both subagents and Agent Team are available, use them for distinct "
+                "scopes: prefer subagents for short, bounded investigation or verification "
+                "whose final summary is sufficient; prefer teammates for specialist ownership "
+                "that may need implementation or follow-up communication. A substantial task "
+                "may use both, but never assign the same scope to both or repeat completed work."
             )
         if self.agent_tools.plan_mode:
             prompt += (
@@ -4463,6 +4593,7 @@ class OmniAgent:
                 "relative to that folder. Do not use write, patch, shell, or git tools on "
                 "referenced folders. This access expires after the request."
             )
+        prompt += self.agent_tools.workspace_skills_usage_prompt()
         skills_prompt = self.agent_tools.skills_catalog_prompt()
         if skills_prompt:
             prompt += skills_prompt
@@ -4667,18 +4798,20 @@ class OmniAgent:
         )
 
     def _subagent_tool_schemas(self, spec):
+        effective_spec = self._effective_subagent_spec(spec)
         include_web_search = (
-            self.agent_tools.web_search_available and "web_search" in spec.tool_names
+            self.agent_tools.web_search_available
+            and "web_search" in effective_spec.tool_names
         )
         include_skills = self.agent_tools.skills_available and bool(
-            {"list_skills", "read_skill"} & set(spec.tool_names)
+            {"list_skills", "read_skill"} & set(effective_spec.tool_names)
         )
         if self.api_type == API_TYPE_ANTHROPIC:
             return anthropic_tool_schemas(
                 include_web_search,
                 include_skills,
                 False,
-                only_tools=spec.tool_names,
+                only_tools=effective_spec.tool_names,
                 exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
             )
         if self.api_type == API_TYPE_OLLAMA:
@@ -4686,7 +4819,7 @@ class OmniAgent:
                 include_web_search,
                 include_skills,
                 False,
-                only_tools=spec.tool_names,
+                only_tools=effective_spec.tool_names,
                 exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
             )
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
@@ -4694,16 +4827,24 @@ class OmniAgent:
                 include_web_search,
                 include_skills,
                 False,
-                only_tools=spec.tool_names,
+                only_tools=effective_spec.tool_names,
                 exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
             )
         return glm_tool_schemas(
             include_web_search,
             include_skills,
             False,
-            only_tools=spec.tool_names,
+            only_tools=effective_spec.tool_names,
             exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
         )
+
+    def _effective_subagent_spec(self, spec: SubagentSpec) -> SubagentSpec:
+        if not self.agent_tools.plan_mode:
+            return spec
+        allowed_names = tuple(
+            name for name in spec.tool_names if name in PLAN_MODE_ALLOWED_TOOLS
+        )
+        return replace(spec, tool_names=allowed_names)
 
     def _teammate_tool_schemas(self, spec):
         include_web_search = (
@@ -4754,6 +4895,18 @@ class OmniAgent:
 
     def _normal_web_search_tool_schemas(self):
         definitions = []
+        tool_definition_by_name = {
+            definition["name"]: definition for definition in TOOL_DEFINITIONS
+        }
+        if self.agent_tools.has_reference_access():
+            for name in ("read_file", "list_dir", "grep", "glob"):
+                definition = tool_definition_by_name.get(name)
+                if definition is not None:
+                    definitions.append(definition)
+        update_todo_definition = tool_definition_by_name.get("update_todo")
+        if update_todo_definition is not None:
+            definitions.append(update_todo_definition)
+        definitions.append(ASK_USER_TOOL_DEFINITION)
         if self.agent_tools.program_docs_available:
             definitions.append(PROGRAM_DOCS_TOOL_DEFINITION)
         definitions.append(WEB_FETCH_TOOL_DEFINITION)
@@ -5130,8 +5283,16 @@ class OmniAgent:
         self.clear_todos()
         self._clear_context_usage()
 
+    @staticmethod
+    def _normalized_history_messages(history):
+        return [
+            dict(message)
+            for message in list(history or [])
+            if isinstance(message, dict)
+        ]
+
     def set_history(self, history):
-        self.conversation_history = list(history or [])
+        self.conversation_history = self._normalized_history_messages(history)
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
         self.clear_todos()

@@ -55,21 +55,6 @@ def handle_comp(chat, args):
 
     result = chat.compact_context(manual=True)
     if result.get("compacted"):
-        memory_update = result.get("memory_update") or {}
-        memory_changed = memory_update.get("changed") or []
-        memory_suffix = ""
-        if memory_changed:
-            memory_suffix = f" Memory updated: {', '.join(memory_changed)}."
-        elif memory_update.get("error"):
-            memory_suffix = f" Memory update failed: {memory_update.get('error')}."
-        print_success(
-            "Context compacted: "
-            f"{result.get('before_messages')} -> {result.get('after_messages')} messages, "
-            f"{result.get('before_chars')} -> {result.get('after_chars')} chars, "
-            f"{result.get('before_input_tokens')} -> {result.get('after_input_tokens')} input tokens "
-            f"(threshold {result.get('token_threshold')})."
-            f"{memory_suffix}"
-        )
         return True
 
     reason = result.get("reason") or "Context compaction was cancelled."

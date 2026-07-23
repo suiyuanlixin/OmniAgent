@@ -170,6 +170,7 @@ def _read_external_media_reference(path_text, encoded_bytes_before=0, base_dir=N
 def attach_external_file_references_with_media(user_input, base_dir=None):
     parsed = resolve_references(user_input, base_dir)
     references = []
+    files = {}
     folders = {}
     seen = set()
     for reference in parsed:
@@ -183,12 +184,13 @@ def attach_external_file_references_with_media(user_input, base_dir=None):
             references.append(reference)
     if not references:
         if not folders:
-            return user_input, [], {}
+            return user_input, [], {}, {}
         folder_lines = "\n".join(f"- {name}" for name in folders)
         return (
             f"{user_input}\n\n[Referenced folders]\n{folder_lines}\n"
             "These folders are available lazily through read-only file tools for this request.",
             [],
+            files,
             folders,
         )
 
@@ -224,6 +226,7 @@ def attach_external_file_references_with_media(user_input, base_dir=None):
             continue
 
         path, content = _read_external_file_reference(path_text, base_dir)
+        files[reference.display] = path
         blocks.append(f"--- File: {path} ---\n{content}\n--- End file: {path} ---")
 
     if folders:
@@ -233,7 +236,7 @@ def attach_external_file_references_with_media(user_input, base_dir=None):
             f"{folder_lines}\n"
             "These folders are available lazily through read-only file tools for this request."
         )
-    return f"{user_input}\n\n" + "\n\n".join(blocks), media_references, folders
+    return f"{user_input}\n\n" + "\n\n".join(blocks), media_references, files, folders
 
 
 def main():

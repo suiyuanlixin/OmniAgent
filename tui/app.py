@@ -163,6 +163,7 @@ class _InlinePromptQuestion:
     question: str
     options: list[_InlinePromptOption]
     allow_custom: bool = False
+    separate_options: bool = False
     custom_label: str = "Type your own answer"
     custom_placeholder: str = "Type your own answer..."
     default_option_index: int | None = None
@@ -620,7 +621,12 @@ class AgentTUIApp(App):
         self._advance_inline_prompt()
 
     def on_chat_input_send(self, event: ChatInput.Send) -> None:
+        is_command = str(event.content or "").startswith("/")
         if self.chat_busy:
+            if is_command and self.chat is not None:
+                self._interrupt_send_payload = (event.content, event.display_content)
+                self._interrupt_active_response()
+                return
             self.query_one("#chat-input", ChatInput).enqueue_pending_message(
                 event.content,
                 event.display_content,
@@ -1050,6 +1056,7 @@ class AgentTUIApp(App):
     def _set_todo_panel_items(self, items) -> None:
         has_items = bool(items)
         self.query_one("#todos-panel-wrap", TodosPanel).set_items(items)
+        self.query_one("#chat-input", ChatInput).set_todo_visible(has_items)
         self.query_one("#chat-input-wrap", Container).set_class(
             has_items,
             "with-todos",
@@ -1074,6 +1081,7 @@ class AgentTUIApp(App):
                     _InlinePromptOption("Approve", value="Approve"),
                     _InlinePromptOption("Cancel", value="Cancel"),
                 ],
+                separate_options=True,
             )
         ])
         self._call_ui(self._open_inline_prompt, request)
@@ -1271,6 +1279,7 @@ class AgentTUIApp(App):
                 question.allow_custom and answer.selected_option_index is None
             ),
             custom_value=answer.custom_text,
+            separate_options=question.separate_options,
             custom_label=question.custom_label,
             custom_placeholder=question.custom_placeholder,
         )
@@ -1462,27 +1471,51 @@ class AgentTUIApp(App):
         )
 
     def add_edit_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
-        self._call_ui(self._append_edit_entry, file_path, additions, deletions, diff)
+        self._call_ui(
+            self._append_edit_entry, file_path, additions, deletions, diff, status
+        )
 
     def _append_edit_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
         self.query_one("#messages-view", ChatView).add_edit_entry(
-            file_path, additions, deletions, diff
+            file_path, additions, deletions, diff, status
         )
 
     def add_write_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
-        self._call_ui(self._append_write_entry, file_path, additions, deletions, diff)
+        self._call_ui(
+            self._append_write_entry, file_path, additions, deletions, diff, status
+        )
 
     def _append_write_entry(
-        self, file_path: str, additions: int, deletions: int, diff: str
+        self,
+        file_path: str,
+        additions: int,
+        deletions: int,
+        diff: str,
+        status: str = "",
     ) -> None:
         self.query_one("#messages-view", ChatView).add_write_entry(
-            file_path, additions, deletions, diff
+            file_path, additions, deletions, diff, status
         )
 
     def add_shell_entry(self, command: str, output: str) -> None:
@@ -1547,6 +1580,30 @@ class AgentTUIApp(App):
             entry_id, event
         )
 
+    def start_compaction_entry(
+        self, entry_id: str, status: str, mode: str = "auto"
+    ) -> None:
+        self._call_ui(self._start_compaction_entry, entry_id, status, mode)
+
+    def _start_compaction_entry(
+        self, entry_id: str, status: str, mode: str = "auto"
+    ) -> None:
+        self.query_one("#messages-view", ChatView).start_compaction_entry(
+            entry_id, status, mode
+        )
+
+    def finish_compaction_entry(
+        self, entry_id: str, status: str, mode: str = "auto", details: str = ""
+    ) -> None:
+        self._call_ui(self._finish_compaction_entry, entry_id, status, mode, details)
+
+    def _finish_compaction_entry(
+        self, entry_id: str, status: str, mode: str = "auto", details: str = ""
+    ) -> None:
+        self.query_one("#messages-view", ChatView).finish_compaction_entry(
+            entry_id, status, mode, details
+        )
+
     def _start_stream_widget(self, role: str, prefix: str) -> None:
         self.query_one("#messages-view", ChatView).start_stream(
             role=role, prefix=prefix
@@ -1605,6 +1662,7 @@ class AgentTUIApp(App):
                 title_case=True,
             )
         )
+        chat_input.set_project_selected(bool(self.current_project_name))
         chat_input.plan_mode = bool(self.config.agent_plan_enable)
         chat_input.set_selected_approval(self.config.agent_approval_mode)
         chat_input.set_selected_thinking(self._thinking_value_from_config())
@@ -1706,6 +1764,9 @@ class AgentTUIApp(App):
         self.current_project_name = str(project_name or "").strip()
         self.query_one("#project-picker", ProjectPicker).set_current_project(
             self.current_project_name
+        )
+        self.query_one("#chat-input", ChatInput).set_project_selected(
+            bool(self.current_project_name)
         )
 
     def _selected_project(self) -> ProjectRecord | None:
@@ -3421,7 +3482,7 @@ class AgentTUIApp(App):
             history_path = str(
                 self.current_session_record.get("history_path") or ""
             ).strip()
-        return MemoryStore(debug=self.config.debug, history_path=history_path or None)
+        return MemoryStore(history_path=history_path or None)
 
     def _memory_sections(self) -> list[dict]:
         store = self._memory_store_for_page()
@@ -3732,12 +3793,6 @@ class AgentTUIApp(App):
             self.chat.set_web_search_config(topic=value)
         self._apply_config_to_controls()
 
-    def _on_setting_debug_changed(self, value: str) -> None:
-        enabled = value.lower() in ("on", "true", "yes")
-        save_config_field("debug", enabled)
-        self._reload_config()
-        self._apply_config_to_controls()
-
     def _on_setting_compact_changed(self, value: str) -> None:
         enabled = value.lower() in ("on", "true", "yes")
         save_config_field("compaction_enable", enabled)
@@ -3895,7 +3950,6 @@ class AgentTUIApp(App):
             compaction_keep_recent_messages=self.config.compaction_keep_recent_messages,
             compaction_compact_model=self.config.compaction_compact_model,
             memory_model=self.config.memory_model,
-            debug=self.config.debug,
             web_search_enabled=self.config.web_search_enable,
             web_search_provider=self.config.web_search_provider,
             web_search_api_key=self.config.web_search_api_key,
@@ -3904,6 +3958,7 @@ class AgentTUIApp(App):
             web_search_topic=self.config.web_search_topic,
             agent_plan_enabled=self.config.agent_plan_enable,
             agent_team_enable=self.config.agent_team_enable,
+            current_model_name=self.config.active_model_name,
             history_path=session_record.get("history_path"),
         )
         return chat
@@ -3916,7 +3971,7 @@ class AgentTUIApp(App):
 
             project = self._selected_project()
             base_dir = project.path if project is not None else None
-            enriched_text, media_references, reference_folders = (
+            enriched_text, media_references, reference_files, reference_folders = (
                 attach_external_file_references_with_media(user_text, base_dir)
             )
             response = self.chat.send_message(
@@ -3924,6 +3979,7 @@ class AgentTUIApp(App):
                 stream_callback_thinking=self.append_stream_thinking,
                 stream_callback_response=self.append_stream_response,
                 media_references=media_references,
+                reference_files=reference_files,
                 reference_folders=reference_folders,
             )
             if response and not response.get("agent_stopped"):
@@ -4273,8 +4329,51 @@ class AgentTUIApp(App):
                     if resolve_references(source, base_dir):
                         item["content"] = source
                 user_index += 1
+            elif isinstance(item, dict) and item.get("kind") == "compaction":
+                item["details"] = self._normalize_compaction_transcript_details(
+                    item.get("details", "")
+                )
             restored.append(item)
         return restored
+
+    def _normalize_compaction_transcript_details(self, details: str) -> str:
+        text = str(details or "").strip()
+        if not text:
+            return ""
+        model_name_by_id = {
+            str(getattr(profile, "model", "") or "").strip(): str(name or "").strip()
+            for name, profile in self.config.model_list.items()
+            if str(getattr(profile, "model", "") or "").strip()
+        }
+        lines: list[str] = []
+        message_match = re.search(
+            r"\bmessages?\s*:\s*([0-9]+)\s*->\s*([0-9]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if message_match:
+            lines.append(
+                f"Message: {message_match.group(1)} -> {message_match.group(2)}"
+            )
+        char_match = re.search(
+            r"\bchars?\s*:\s*([0-9]+)\s*->\s*([0-9]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if char_match:
+            lines.append(f"Chars: {char_match.group(1)} -> {char_match.group(2)}")
+        model_match = re.search(
+            r"\bcompact model\s*:\s*(.+?)(?=\s+Memory updated:|\s+Memory update failed:|\s+Memory update:\s*scheduled|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if model_match:
+            raw_model = str(model_match.group(1) or "").strip()
+            if raw_model:
+                lines.append(
+                    f"Compact model: {model_name_by_id.get(raw_model, raw_model)}"
+                )
+        return "\n".join(lines) if lines else text
 
     @staticmethod
     def _reference_display_source(content: str) -> str:
@@ -4487,8 +4586,9 @@ class AgentTUIApp(App):
             additions = int(display.get("additions", 0) or 0)
             deletions = int(display.get("deletions", 0) or 0)
             diff = display.get("diff", "")
+            status = clean_display_text_preserve_newlines(display.get("status", ""))
             if file_path:
-                view.add_edit_entry(file_path, additions, deletions, diff)
+                view.add_edit_entry(file_path, additions, deletions, diff, status)
                 return True
         if kind == "file_write":
             file_path = clean_display_text_preserve_newlines(
@@ -4497,8 +4597,9 @@ class AgentTUIApp(App):
             additions = int(display.get("additions", 0) or 0)
             deletions = int(display.get("deletions", 0) or 0)
             diff = display.get("diff", "")
+            status = clean_display_text_preserve_newlines(display.get("status", ""))
             if file_path:
-                view.add_write_entry(file_path, additions, deletions, diff)
+                view.add_write_entry(file_path, additions, deletions, diff, status)
                 return True
         if kind == "shell":
             command = clean_display_text_preserve_newlines(display.get("command", ""))
