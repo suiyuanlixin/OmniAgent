@@ -1580,6 +1580,80 @@ class AgentTUIApp(App):
             entry_id, event
         )
 
+    def start_team_entry(
+        self,
+        entry_id: str,
+        teammate_name: str,
+        role: str = "",
+        purpose: str = "",
+        task_id: str = "",
+    ) -> None:
+        self._call_ui(
+            self._start_team_entry,
+            entry_id,
+            teammate_name,
+            role,
+            purpose,
+            task_id,
+        )
+
+    def _start_team_entry(
+        self,
+        entry_id: str,
+        teammate_name: str,
+        role: str = "",
+        purpose: str = "",
+        task_id: str = "",
+    ) -> None:
+        self.query_one("#messages-view", ChatView).start_team_entry(
+            entry_id, teammate_name, role, purpose, task_id
+        )
+
+    def append_team_event(self, entry_id: str, event: dict) -> None:
+        self._call_ui(self._append_team_event, entry_id, event)
+
+    def _append_team_event(self, entry_id: str, event: dict) -> None:
+        self.query_one("#messages-view", ChatView).append_team_event(entry_id, event)
+
+    def finish_team_entry(self, entry_id: str, status: str, result: str = "") -> None:
+        self._call_ui(self._finish_team_entry, entry_id, status, result)
+
+    def _finish_team_entry(self, entry_id: str, status: str, result: str = "") -> None:
+        updated = self.query_one("#messages-view", ChatView).finish_team_entry(
+            entry_id, status, result
+        )
+        if updated:
+            self._persist_current_session(refresh_sidebar=False)
+
+    def add_team_action_entry(
+        self,
+        action: str,
+        summary: str,
+        details: str = "",
+        status: str = "success",
+        metadata: dict | None = None,
+    ) -> None:
+        self._call_ui(
+            self._append_team_action_entry,
+            action,
+            summary,
+            details,
+            status,
+            metadata or {},
+        )
+
+    def _append_team_action_entry(
+        self,
+        action: str,
+        summary: str,
+        details: str = "",
+        status: str = "success",
+        metadata: dict | None = None,
+    ) -> None:
+        self.query_one("#messages-view", ChatView).add_team_action_entry(
+            action, summary, details, status, metadata or {}
+        )
+
     def start_compaction_entry(
         self, entry_id: str, status: str, mode: str = "auto"
     ) -> None:
@@ -3457,6 +3531,7 @@ class AgentTUIApp(App):
         removed = False
         if self.chat is not None and getattr(self.chat, "team_store", None) is not None:
             try:
+                self.chat._shutdown_teammate_task(name)
                 removed = bool(self.chat.team_store.remove_teammate(name))
             except Exception:
                 removed = False
@@ -4615,6 +4690,28 @@ class AgentTUIApp(App):
             if agent_type and isinstance(transcript, list):
                 view.add_subagent_entry(agent_type, transcript)
                 return True
+        if kind == "team_run":
+            transcript = display.get("transcript")
+            if isinstance(transcript, list):
+                view.add_team_entry(
+                    str(display.get("teammate_name") or "teammate"),
+                    str(display.get("role") or ""),
+                    str(display.get("purpose") or ""),
+                    str(display.get("task_id") or ""),
+                    str(display.get("status") or "completed"),
+                    transcript,
+                    str(display.get("result") or ""),
+                )
+                return True
+        if kind == "team_action":
+            view.add_team_action_entry(
+                str(display.get("action") or "team"),
+                str(display.get("summary") or ""),
+                str(display.get("details") or ""),
+                str(display.get("status") or "success"),
+                dict(display.get("metadata") or {}),
+            )
+            return True
         return False
 
     @staticmethod

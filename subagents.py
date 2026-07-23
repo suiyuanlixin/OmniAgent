@@ -19,6 +19,62 @@ DEFAULT_SUBAGENT_TOOL_CALL_FACTOR = 4
 WORKSPACE_SUBAGENTS_RELATIVE_DIR = Path(".omniagent") / "subagents"
 
 
+def format_worker_request_error(worker_label: str, error: Exception | str) -> str:
+    """Turn noisy provider/network exceptions into a short actionable message."""
+    raw = str(error or "").strip()
+    lowered = raw.lower()
+    is_524 = (
+        "error code: 524" in lowered
+        or "status': 524" in lowered
+        or 'status": 524' in lowered
+        or ("524" in lowered and "cloudflare" in lowered)
+    )
+    is_timeout = any(
+        marker in lowered
+        for marker in (
+            "timed out",
+            "timeout",
+            "read operation timed",
+            "readtimeout",
+        )
+    )
+    is_reset = any(
+        marker in lowered
+        for marker in (
+            "winerror 10054",
+            "connection reset",
+            "forcibly closed",
+            "????????",
+        )
+    )
+    stream_failed = "stream request failed" in lowered
+    fallback_failed = "fallback request failed" in lowered
+
+    lines = [f"{str(worker_label or 'Worker')} request failed.", ""]
+    if is_524:
+        lines.append("The model service timed out (HTTP 524).")
+    elif is_timeout:
+        lines.append("The model request timed out before a response completed.")
+    elif is_reset:
+        lines.append("The model connection was closed unexpectedly.")
+    else:
+        detail = " ".join(raw.split())
+        if len(detail) > 240:
+            detail = detail[:239].rstrip() + "?"
+        lines.append(detail or "The model request did not complete.")
+
+    if is_reset and is_524:
+        lines.append("The streaming connection was also closed unexpectedly.")
+    elif stream_failed and fallback_failed:
+        lines.append("Both the streaming request and its fallback failed.")
+    elif stream_failed and is_timeout and not is_524:
+        lines.append("The streaming request did not complete.")
+
+    if is_524 or is_timeout or is_reset:
+        lines.append("Try again later or use a faster, more stable model endpoint.")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class SubagentSpec:
     name: str
@@ -309,6 +365,10 @@ class SubagentRunner:
         compact_tool_result: Callable[[str], str] | None = None,
         max_tool_calls: int | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
+        worker_label: str = "Subagent",
+        before_turn_callback: Callable[[], list[str | dict[str, Any]]] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+        forbidden_tool_names: set[str] | None = None,
     ):
         self.parent = parent_agent
         self.spec = spec
@@ -323,6 +383,14 @@ class SubagentRunner:
         self.allowed_tool_names = set(spec.tool_names)
         self.transcript: list[dict[str, Any]] = []
         self.event_callback = event_callback
+        self.worker_label = str(worker_label or "Subagent")
+        self.before_turn_callback = before_turn_callback
+        self.stop_requested = stop_requested
+        self.forbidden_tool_names = set(
+            FORBIDDEN_SUBAGENT_TOOL_NAMES
+            if forbidden_tool_names is None
+            else forbidden_tool_names
+        )
         self._streamed_thinking = False
         self._streamed_text = False
         self._stream_thinking_content = ""
@@ -345,6 +413,15 @@ class SubagentRunner:
         self._record_event({"kind": "message", "role": "user", "content": task})
 
         for _round_index in range(1, self.spec.max_turns + 1):
+            if self._should_stop():
+                message = f"ERROR: {self.worker_label} cancelled."
+                self._record_event({
+                    "kind": "message",
+                    "role": "status",
+                    "content": message,
+                })
+                return message
+            self._append_incoming_messages(history)
             self._streamed_thinking = False
             self._streamed_text = False
             self._stream_thinking_content = ""
@@ -371,7 +448,7 @@ class SubagentRunner:
                 self._record_event({
                     "kind": "message",
                     "role": "status",
-                    "content": f"Subagent error: {error}",
+                    "content": format_worker_request_error(self.worker_label, error),
                 })
                 raise
             turn_elapsed_seconds = time.monotonic() - turn_started_at
@@ -412,11 +489,13 @@ class SubagentRunner:
             final_response += text
 
             if not tool_calls:
+                if self._append_incoming_messages(history):
+                    continue
                 summary = final_response.strip()
                 if summary:
                     return summary
                 message = (
-                    f"ERROR: Subagent '{self.spec.name}' returned an empty response "
+                    f"ERROR: {self.worker_label} returned an empty response "
                     "without text or tool calls."
                 )
                 self._record_event({
@@ -428,16 +507,57 @@ class SubagentRunner:
 
             if self.tool_calls_used + len(tool_calls) > self.max_tool_calls:
                 return (
-                    f"ERROR: Subagent '{self.spec.name}' stopped after "
+                    f"ERROR: {self.worker_label} stopped after "
                     f"{self.max_tool_calls} tool calls."
                 )
 
             self._append_tool_results(history, tool_calls)
 
         return (
-            f"ERROR: Subagent '{self.spec.name}' stopped after "
+            f"ERROR: {self.worker_label} stopped after "
             f"{self.spec.max_turns} tool rounds."
         )
+
+    def _should_stop(self) -> bool:
+        return bool(self.stop_requested and self.stop_requested())
+
+    def _append_incoming_messages(self, history: list[dict[str, Any]]) -> bool:
+        if self.before_turn_callback is None:
+            return False
+        try:
+            incoming = self.before_turn_callback() or []
+        except Exception as error:
+            self._record_event({
+                "kind": "message",
+                "role": "status",
+                "content": f"{self.worker_label} inbox error: {error}",
+            })
+            return False
+        appended = False
+        for incoming_message in incoming:
+            if isinstance(incoming_message, dict):
+                text = str(incoming_message.get("content") or "").strip()
+                source = str(incoming_message.get("source") or "").strip()
+                team_message = bool(incoming_message.get("team_message"))
+            else:
+                text = str(incoming_message or "").strip()
+                source = ""
+                team_message = False
+            if not text:
+                continue
+            history.append({"role": "user", "content": text})
+            event = {
+                "kind": "message",
+                "role": "user",
+                "content": text,
+            }
+            if source:
+                event["source"] = source
+            if team_message:
+                event["team_message"] = True
+            self._record_event(event)
+            appended = True
+        return appended
 
     def _chat_turn(self, history: list[dict[str, Any]]):
         stream_error = None
@@ -719,9 +839,9 @@ class SubagentRunner:
 
     def _run_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
         self.tool_calls_used += 1
-        if name in FORBIDDEN_SUBAGENT_TOOL_NAMES or name not in self.allowed_tool_names:
+        if name in self.forbidden_tool_names or name not in self.allowed_tool_names:
             result = (
-                f"ERROR: Tool '{name}' is not available to subagent '{self.spec.name}'."
+                f"ERROR: Tool '{name}' is not available to {self.worker_label}."
             )
             self._record_event({
                 "kind": "tool_result",
@@ -738,12 +858,16 @@ class SubagentRunner:
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}
-        result = self.execute_tool(name, arguments)
+        execution = self.execute_tool(name, arguments)
         display = None
-        agent_tools = getattr(self.parent, "agent_tools", None)
-        consume_display = getattr(agent_tools, "consume_display_payload", None)
-        if callable(consume_display):
-            display = consume_display()
+        if isinstance(execution, tuple) and len(execution) == 2:
+            result, display = execution
+        else:
+            result = execution
+            agent_tools = getattr(self.parent, "agent_tools", None)
+            consume_display = getattr(agent_tools, "consume_display_payload", None)
+            if callable(consume_display):
+                display = consume_display()
         full_result = str(result or "")
         compact_result = self.compact_tool_result(full_result)
         self._record_event({

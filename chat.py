@@ -10,9 +10,11 @@ from typing import Any, Dict, List, Optional
 from ui import (
     add_explored_entry,
     append_subagent_event,
+    append_team_event,
     clean_and_print_stream_response,
     clean_display_text,
     finish_compaction_entry,
+    finish_team_entry,
     finish_thinking_round,
     print_error,
     print_info,
@@ -25,6 +27,7 @@ from ui import (
     set_context_usage,
     start_compaction_entry,
     start_subagent_entry,
+    start_team_entry,
 )
 from config import (
     API_TYPE_ANTHROPIC,
@@ -50,6 +53,7 @@ from tools import (
     AgentTools,
     PROGRAM_DOCS_TOOL_DEFINITION,
     PLAN_MODE_ALLOWED_TOOLS,
+    PLAN_SUBAGENT_TYPES,
     TOOL_DEFINITIONS,
     WEB_FETCH_TOOL_DEFINITION,
     WEB_SEARCH_TOOL_DEFINITION,
@@ -63,11 +67,19 @@ from subagents import (
     SubagentSpec,
     SubagentRunner,
     compose_subagent_task,
+    format_worker_request_error,
 )
 from team import (
+    MAX_TEAMMATE_REPORTS_PER_TASK,
+    TEAMMATE_REPORT_KINDS,
+    TEAMMATE_REPORT_TOOL_NAME,
+    WRITE_TOOL_NAMES,
     TeamStore,
     TeamRunner,
     compose_teammate_task,
+    path_matches_write_scope,
+    teammate_has_write_tools,
+    teammate_report_tool_definition,
 )
 
 
@@ -272,6 +284,9 @@ class OmniAgent:
         self.memory_store = MemoryStore(history_path=history_path)
         self.memory_lock = threading.Lock()
         self.session_memory_lock = threading.Lock()
+        self._agent_tools_execution_lock = threading.RLock()
+        self._team_tasks_lock = threading.RLock()
+        self._team_tasks = {}
         self.session_episodic_heading = ""
         self.session_memory_generation = 0
         self.conversation_history = []
@@ -346,11 +361,13 @@ class OmniAgent:
         )
         if self.agent_team_enabled:
             self.team_store = TeamStore(workspace_dir=workspace_dir)
+            self.team_store.reconcile_stale_tasks()
             self.agent_tools.set_team_config(
                 team_store=self.team_store,
                 team_enabled=True,
             )
             self.agent_tools.set_team_executor(self._execute_teammate)
+            self.agent_tools.set_team_shutdown_executor(self._shutdown_teammate_task)
         else:
             self.team_store = None
             self.agent_tools.set_team_config(team_enabled=False)
@@ -609,10 +626,22 @@ class OmniAgent:
         }
 
     def set_team_mode(self, enabled):
-        self.agent_team_enabled = bool(enabled and self.agent_tools.enabled)
+        next_enabled = bool(enabled and self.agent_tools.enabled)
+        if self.agent_team_enabled and not next_enabled and self.team_store is not None:
+            active_names = {
+                str(record.get("display_name") or record.get("teammate_name") or "")
+                for record in self._team_tasks.values()
+                if record.get("status") in {"starting", "running", "cancelling"}
+            }
+            for name in active_names:
+                if name:
+                    self._shutdown_teammate_task(name)
+        self.agent_team_enabled = next_enabled
         if self.team_store is None and self.agent_tools.workspace_dir is not None:
             self.team_store = TeamStore(workspace_dir=self.agent_tools.workspace_dir)
+            self.team_store.reconcile_stale_tasks()
             self.agent_tools.set_team_executor(self._execute_teammate)
+            self.agent_tools.set_team_shutdown_executor(self._shutdown_teammate_task)
         if self.team_store is not None:
             self.team_store.reload_specs()
             self.agent_tools.set_team_config(
@@ -3495,22 +3524,31 @@ class OmniAgent:
 
     def _execute_agent_tool(self, name, tool_input):
         self.agent_tool_calls += 1
-        self.agent_tools.set_budget_context(
-            self.max_agent_tool_calls,
-            self.agent_tool_calls,
-        )
-        change_count_before = self.agent_tools.session_change_count()
-        todo_revision_before = self.agent_tools.todo_revision()
-        tool_result = self.agent_tools.execute(name, tool_input)
-        if self.agent_tools.consume_output_separator():
-            self.agent_output_needs_separator = True
-        if (
-            self.agent_tools.session_change_count() > change_count_before
-            or self.agent_tools.todo_revision() != todo_revision_before
-        ):
-            self.agent_final_check_done = False
+        with self._agent_tools_execution_lock:
+            self.agent_tools.set_budget_context(
+                self.max_agent_tool_calls,
+                self.agent_tool_calls,
+            )
+            change_count_before = self.agent_tools.session_change_count()
+            todo_revision_before = self.agent_tools.todo_revision()
+            self.agent_tools.consume_display_payload()
+            scope_error = self._write_scope_violation(
+                name, tool_input, {"kind": "lead", "name": "Lead"}
+            )
+            if scope_error:
+                tool_result = _error_text(scope_error)
+                self._last_tool_display = None
+            else:
+                tool_result = self.agent_tools.execute(name, tool_input)
+            if self.agent_tools.consume_output_separator():
+                self.agent_output_needs_separator = True
+            if (
+                self.agent_tools.session_change_count() > change_count_before
+                or self.agent_tools.todo_revision() != todo_revision_before
+            ):
+                self.agent_final_check_done = False
+            self._last_tool_display = self.agent_tools.consume_display_payload()
         self._track_explored_tool(name, tool_input)
-        self._last_tool_display = self.agent_tools.consume_display_payload()
         context_result = _compact_tool_result_for_context(tool_result)
         return context_result
 
@@ -3559,6 +3597,15 @@ class OmniAgent:
         scope_limit="",
     ):
         spec = self.agent_tools.subagent_registry.get(agent_type)
+        if (
+            self.agent_tools.plan_mode
+            and self.agent_tools.subagent_registry.resolve_name(agent_type)
+            not in PLAN_SUBAGENT_TYPES
+        ):
+            return _error_text(
+                "Plan mode only allows reader and researcher subagents. "
+                f"Requested: {agent_type!r}."
+            )
         if spec is None:
             return _error_text(
                 "Unknown subagent "
@@ -3583,7 +3630,9 @@ class OmniAgent:
             parent_agent=self,
             spec=effective_spec,
             tool_schemas=self._subagent_tool_schemas(spec),
-            execute_tool=self._execute_subagent_tool,
+            execute_tool=lambda name, args: self._execute_subagent_tool(
+                spec, name, args
+            ),
             compact_tool_result=_compact_tool_result_for_context,
             event_callback=lambda event: append_subagent_event(entry_id, event),
         )
@@ -3600,13 +3649,33 @@ class OmniAgent:
         }
         return result
 
-    def _execute_subagent_tool(self, name, tool_input):
-        previous = self.agent_tools.suppress_visible_output
-        self.agent_tools.suppress_visible_output = True
-        try:
-            return self.agent_tools.execute(name, tool_input)
-        finally:
-            self.agent_tools.suppress_visible_output = previous
+    def _execute_subagent_tool(self, spec, name, tool_input):
+        return self._execute_delegated_tool(
+            name,
+            tool_input,
+            actor={"kind": "subagent", "name": spec.name},
+        )
+
+    def _execute_delegated_tool(self, name, tool_input, actor=None):
+        with self._agent_tools_execution_lock:
+            previous = self.agent_tools.suppress_visible_output
+            previous_todos_enabled = self.agent_tools.todos_enabled
+            self.agent_tools.suppress_visible_output = True
+            self.agent_tools.todos_enabled = False
+            try:
+                self.agent_tools.consume_display_payload()
+                scope_error = self._write_scope_violation(
+                    name, tool_input, actor or {"kind": "delegated", "name": "Worker"}
+                )
+                if scope_error:
+                    return _error_text(scope_error), None
+                result = self.agent_tools.execute(name, tool_input)
+                display = self.agent_tools.consume_display_payload()
+                self.agent_tools.consume_output_separator()
+                return result, display
+            finally:
+                self.agent_tools.todos_enabled = previous_todos_enabled
+                self.agent_tools.suppress_visible_output = previous
 
     def _execute_teammate(
         self,
@@ -3617,37 +3686,355 @@ class OmniAgent:
         expected_output="",
         evidence_required="",
         scope_limit="",
+        write_scope=(),
     ):
+        if self.team_store is None:
+            return {"result": _error_text("Agent team is disabled."), "display": None}
+        resolved_name = self.team_store.resolve_name(spec.name)
+        try:
+            write_scope = self.team_store.normalize_write_scope(write_scope)
+        except ValueError as error:
+            return {"result": _error_text(str(error)), "display": None}
+        if teammate_has_write_tools(spec) and not write_scope:
+            return {
+                "result": _error_text(
+                    f"Teammate '{spec.name}' has file-writing tools and requires a non-empty write_scope."
+                ),
+                "display": None,
+            }
+        with self._team_tasks_lock:
+            existing = next(
+                (
+                    record
+                    for record in self._team_tasks.values()
+                    if record.get("teammate_name") == resolved_name
+                    and record.get("status") in {"starting", "running", "cancelling"}
+                ),
+                None,
+            )
+            if existing is not None:
+                return {
+                    "result": _error_text(
+                        f"Teammate '{spec.name}' already has a running task "
+                        f"({existing.get('task_id', '')})."
+                    ),
+                    "display": None,
+                }
+
         teammate_task = compose_teammate_task(
             task,
             expected_output=expected_output,
             evidence_required=evidence_required,
             scope_limit=scope_limit,
+            write_scope=write_scope,
         )
+        task_id = uuid.uuid4().hex
         label = _single_line(purpose or task, 120)
-        self._before_agent_visible_output()
-        print_info(f"Teammate {spec.name} ({spec.role}): {label}")
-
-        runner = TeamRunner(
-            parent_agent=self,
-            spec=spec,
-            tool_schemas=self._teammate_tool_schemas(spec),
-            execute_tool=self.agent_tools.execute,
-            compact_tool_result=_compact_tool_result_for_context,
-            team_store=self.team_store,
-            api_type=self.api_type,
-        )
+        stop_event = threading.Event()
+        display = {
+            "kind": "team_run",
+            "task_id": task_id,
+            "teammate_name": spec.name,
+            "role": spec.role,
+            "purpose": label,
+            "status": "running",
+            "result": "",
+            "transcript": [],
+            "write_scope": list(write_scope),
+        }
+        record = {
+            "task_id": task_id,
+            "teammate_name": resolved_name,
+            "display_name": spec.name,
+            "role": spec.role,
+            "purpose": label,
+            "status": "starting",
+            "write_scope": tuple(write_scope),
+            "report_count": 0,
+            "stop_event": stop_event,
+            "display": display,
+            "thread": None,
+        }
         try:
-            result = runner.run(teammate_task)
-        except Exception as error:
-            print_warn(f"Teammate {spec.name} failed: {error}")
-            return _error_text(f"Teammate '{spec.name}' failed: {error}")
-
-        self.team_store.update_status(spec.name, "active", task_count=1)
-        print_info(
-            f"Teammate {spec.name} completed; returning {len(result)} characters."
+            with self._team_tasks_lock:
+                self.team_store.start_task(
+                    spec.name,
+                    task_id=task_id,
+                    task=label,
+                    write_scope=write_scope,
+                )
+                self._team_tasks[task_id] = record
+        except ValueError as error:
+            return {"result": _error_text(str(error)), "display": None}
+        self._before_agent_visible_output()
+        start_team_entry(task_id, spec.name, spec.role, label, task_id)
+        worker = threading.Thread(
+            target=self._run_teammate_task,
+            args=(record, spec, teammate_task),
+            name=f"omniagent-team-{resolved_name}-{task_id[:8]}",
+            daemon=True,
         )
-        return result
+        record["thread"] = worker
+        record["status"] = "running"
+        try:
+            worker.start()
+        except Exception as error:
+            error_text = f"Unable to start teammate '{spec.name}': {error}"
+            record["status"] = "failed"
+            record["result"] = _error_text(error_text)
+            display["status"] = "failed"
+            display["result"] = record["result"]
+            try:
+                self.team_store.update_status(
+                    spec.name,
+                    "failed",
+                    task_id=task_id,
+                    error=error_text,
+                    write_scope=[],
+                )
+            except Exception:
+                pass
+            finish_team_entry(task_id, "failed", record["result"])
+            return {"result": record["result"], "display": display}
+        return {
+            "result": (
+                f"Teammate '{spec.name}' started background task {task_id}. "
+                "Use list_teammates to inspect status, send_message or broadcast to "
+                "provide follow-up guidance, and read_inbox with wait_seconds to collect results."
+            ),
+            "display": display,
+        }
+
+    def _run_teammate_task(self, record, spec, teammate_task):
+        task_id = str(record.get("task_id") or "")
+
+        def on_event(event):
+            if not isinstance(event, dict):
+                return
+            with self._team_tasks_lock:
+                display = record.get("display") or {}
+                display.setdefault("transcript", []).append(dict(event))
+            append_team_event(task_id, event)
+
+        runner = None
+        result = ""
+        status = "completed"
+        error_text = ""
+        transcript = []
+        try:
+            runtime_rules = [
+                "You are a teammate, not the Lead. Do not use Lead-only lifecycle tools.",
+                "Use report_to_lead only for important progress, blockers, findings, or questions.",
+            ]
+            write_scope = tuple(record.get("write_scope") or ())
+            if teammate_has_write_tools(spec):
+                runtime_rules.append(
+                    "Direct file writes and any mutations through bash must stay inside the assigned "
+                    f"write_scope: {', '.join(write_scope)}."
+                )
+            effective_spec = replace(
+                spec,
+                system_prompt=(
+                    f"{spec.system_prompt.rstrip()}\n\nRuntime team contract:\n- "
+                    + "\n- ".join(runtime_rules)
+                ),
+            )
+            runner = TeamRunner(
+                parent_agent=self,
+                spec=effective_spec,
+                tool_schemas=self._teammate_tool_schemas(spec),
+                execute_tool=lambda name, args: self._execute_teammate_tool(
+                    record, spec, name, args
+                ),
+                compact_tool_result=_compact_tool_result_for_context,
+                team_store=self.team_store,
+                api_type=self.api_type,
+                event_callback=on_event,
+                stop_event=record.get("stop_event"),
+            )
+            result = runner.run(teammate_task)
+            if record.get("stop_event").is_set():
+                status = "cancelled"
+            elif str(result or "").startswith("ERROR:"):
+                status = "failed"
+                error_text = str(result)
+        except Exception as error:
+            status = "failed"
+            error_text = format_worker_request_error(
+                f"Teammate '{spec.name}'", error
+            )
+            result = _error_text(error_text)
+        finally:
+            if runner is not None:
+                transcript = list(runner.transcript)
+
+        try:
+            self.team_store.save_thread(spec.name, transcript)
+        except Exception:
+            pass
+        try:
+            if self.team_store.is_active(spec.name):
+                self.team_store.update_status(
+                    spec.name,
+                    status,
+                    task_count=1,
+                    task_id=task_id,
+                    error=error_text if status in {"failed", "cancelled"} else None,
+                    write_scope=[],
+                )
+        except Exception:
+            pass
+        completion = str(result or "")
+        try:
+            self.team_store.send_message(
+                spec.name,
+                "lead",
+                completion,
+                kind="task_result",
+                task_id=task_id,
+                status=status,
+            )
+        except Exception:
+            pass
+        with self._team_tasks_lock:
+            record["status"] = status
+            record["result"] = str(result or "")
+            display = record.get("display") or {}
+            display["status"] = status
+            display["result"] = str(result or "")
+            display["transcript"] = transcript
+        finish_team_entry(task_id, status, str(result or ""))
+
+    def _execute_teammate_tool(self, record, spec, name, tool_input):
+        if name == TEAMMATE_REPORT_TOOL_NAME:
+            return self._report_teammate_to_lead(record, spec, tool_input)
+        return self._execute_delegated_tool(
+            name,
+            tool_input,
+            actor={
+                "kind": "teammate",
+                "name": spec.name,
+                "role": spec.role,
+                "task_id": str(record.get("task_id") or ""),
+                "write_scope": tuple(record.get("write_scope") or ()),
+            },
+        )
+
+    def _report_teammate_to_lead(self, record, spec, tool_input):
+        if not isinstance(tool_input, dict):
+            return _error_text("report_to_lead input must be an object."), None
+        report_kind = str(tool_input.get("kind") or "").strip().lower()
+        message = str(tool_input.get("message") or "").strip()
+        if report_kind not in TEAMMATE_REPORT_KINDS:
+            return (
+                _error_text(
+                    "report_to_lead kind must be one of: "
+                    + ", ".join(sorted(TEAMMATE_REPORT_KINDS))
+                ),
+                None,
+            )
+        if not message:
+            return _error_text("report_to_lead message cannot be empty."), None
+        with self._team_tasks_lock:
+            report_count = int(record.get("report_count") or 0)
+            if report_count >= MAX_TEAMMATE_REPORTS_PER_TASK:
+                return (
+                    _error_text(
+                        f"report_to_lead limit reached ({MAX_TEAMMATE_REPORTS_PER_TASK} per task)."
+                    ),
+                    None,
+                )
+            record["report_count"] = report_count + 1
+        task_id = str(record.get("task_id") or "")
+        status = str(record.get("status") or "running")
+        try:
+            self.team_store.send_message(
+                spec.name,
+                "lead",
+                message,
+                kind="team_report",
+                task_id=task_id,
+                status=status,
+                report_kind=report_kind,
+            )
+        except Exception as error:
+            with self._team_tasks_lock:
+                record["report_count"] = max(0, int(record.get("report_count") or 1) - 1)
+            return _error_text(f"Unable to report to Lead: {error}"), None
+        summary = f"Reported {report_kind} to Lead"
+        return (
+            summary + ".",
+            {
+                "kind": "team_report",
+                "report_kind": report_kind,
+                "summary": summary,
+                "message": message,
+            },
+        )
+
+    def _write_scope_violation(self, name, tool_input, actor):
+        if name not in WRITE_TOOL_NAMES or self.team_store is None:
+            return ""
+        if not isinstance(tool_input, dict):
+            return "Write tool input must be an object."
+        file_path = str(tool_input.get("file_path") or "").strip()
+        if not file_path:
+            return "Write tool requires file_path."
+        try:
+            relative_path = self.team_store.workspace_relative_path(file_path)
+        except ValueError as error:
+            return str(error)
+        actor = dict(actor or {})
+        task_id = str(actor.get("task_id") or "")
+        if actor.get("kind") == "teammate":
+            scopes = tuple(actor.get("write_scope") or ())
+            if not scopes or not any(
+                path_matches_write_scope(relative_path, scope) for scope in scopes
+            ):
+                scope_text = ", ".join(scopes) or "(none)"
+                return (
+                    f"{actor.get('name') or 'Teammate'} cannot modify {relative_path}; "
+                    f"assigned write_scope: {scope_text}."
+                )
+        owner = self.team_store.find_write_owner_for_path(
+            relative_path, exclude_task_id=task_id
+        )
+        if owner is None:
+            return ""
+        scope_text = ", ".join(owner.get("write_scope") or ())
+        return (
+            f"Cannot modify {relative_path}; active owner "
+            f"{owner.get('name') or 'Teammate'} ({owner.get('role') or 'writer'}) "
+            f"holds write_scope: {scope_text}."
+        )
+
+    def _shutdown_teammate_task(self, teammate_name):
+        if self.team_store is None:
+            return ""
+        resolved = self.team_store.resolve_name(teammate_name)
+        cancelled = []
+        with self._team_tasks_lock:
+            for task_id, record in self._team_tasks.items():
+                if (
+                    record.get("teammate_name") == resolved
+                    and record.get("status") in {"starting", "running", "cancelling"}
+                ):
+                    stop_event = record.get("stop_event")
+                    if stop_event is not None:
+                        stop_event.set()
+                    record["status"] = "cancelling"
+                    display = record.get("display") or {}
+                    display["status"] = "cancelling"
+                    cancelled.append(task_id)
+                    finish_team_entry(task_id, "cancelling", "")
+        if cancelled:
+            self.team_store.update_status(
+                teammate_name,
+                "cancelling",
+                task_id=cancelled[-1],
+            )
+            return "Cancellation requested for task(s): " + ", ".join(cancelled)
+        return ""
 
     def _history_snapshot(self):
         return [dict(message) for message in self.conversation_history]
@@ -4504,7 +4891,8 @@ class OmniAgent:
                 "\n\nYou are in Plan mode. This is a planning and clarification workflow "
                 "for 'think it through before touching code'. Stay read-only: you may "
                 "inspect the workspace and use only read/search tools plus ask_user and "
-                "update_todo, and you may delegate read-only subagents. Do NOT modify files or run commands."
+                "update_todo, and you may delegate only reader or researcher subagents. "
+                "Do NOT modify files, run commands, or use Agent Team."
                 "\n- Use Plan mode when the request is still ambiguous, the change is risky, "
                 "the user wants design/options/roadmap first, or key decisions still need "
                 "confirmation."
@@ -4523,35 +4911,55 @@ class OmniAgent:
             "and asks you to read or summarize that page."
         )
         if self.agent_tools.subagents_available:
-            prompt += (
-                "\n- Before substantial direct work on a non-trivial request, identify at "
-                "least one bounded part suitable for dispatch_subagent, such as repository "
-                "exploration, external research, auditing, verification, or a scoped "
-                "implementation. Dispatch it early so its detailed tool output stays out of "
-                "the main context."
-                "\n- If two or more parts are independent, issue multiple dispatch_subagent "
-                "calls in the same assistant tool-use turn. Choose the narrowest matching role "
-                "and provide a concrete task, expected output, evidence requirement, and scope."
-                "\n- Handle work directly only when it is a simple one-step task, tightly "
-                "coupled to the main reasoning, requires immediate user clarification, or no "
-                "available subagent has a useful tool set. Do not delegate merely to repeat "
-                "work already completed in the main context."
-                "\n- The subagent has its own history and restricted tools; only its final "
-                "summary returns. Keep ownership of user-facing decisions, integration, final "
-                "verification, and the final answer."
-            )
+            if self.agent_tools.plan_mode:
+                prompt += (
+                    "\n- In Plan mode, use dispatch_subagent only for bounded read-only repository "
+                    "inspection or external research. Choose reader or researcher (including "
+                    "their read-role aliases); do not delegate implementation or mutation."
+                    "\n- The subagent has its own history and restricted tools; only its final "
+                    "summary returns. Keep ownership of planning decisions and the final plan."
+                )
+            else:
+                prompt += (
+                    "\n- Use dispatch_subagent for short, synchronous, one-shot work such as "
+                    "repository exploration, external research, auditing, verification, or a "
+                    "scoped implementation whose final summary is sufficient. Dispatch it early "
+                    "when that shape fits so detailed tool output stays out of the main context."
+                    "\n- If two or more parts are independent, issue multiple dispatch_subagent "
+                    "calls in the same assistant tool-use turn. Choose the narrowest matching role "
+                    "and provide a concrete task, expected output, evidence requirement, and scope."
+                    "\n- Handle work directly only when it is a simple one-step task, tightly "
+                    "coupled to the main reasoning, requires immediate user clarification, or no "
+                    "available subagent has a useful tool set. Do not delegate merely to repeat "
+                    "work already completed in the main context."
+                    "\n- The subagent has its own history and restricted tools; only its final "
+                    "summary returns. Keep ownership of user-facing decisions, integration, final "
+                    "verification, and the final answer."
+                )
         if self.agent_tools.team_available and not self.agent_tools.plan_mode:
             prompt += (
-                "\n- Agent Team is enabled. For every non-trivial Build task, inspect the "
-                "available teammate roles before substantial direct work and assign a fitting "
-                "specialist early with spawn_teammate. Use teammates for role-specific work "
-                "that benefits from an independent context, especially architecture review, "
+                "\n- Agent Team is enabled. Use spawn_teammate for background or long-running "
+                "role-specific work that benefits from continuing ownership, status tracking, "
+                "or follow-up messages. Choose a fitting specialist for architecture review, "
                 "code review, debugging, infrastructure, implementation, or independent "
                 "verification."
                 "\n- Split independent responsibilities across multiple fitting teammates "
                 "rather than asking one teammate to cover unrelated concerns. Give each task "
                 "a narrow scope, expected output, and required evidence. Reuse active teammates "
                 "through team messaging when follow-up belongs to the same role."
+                "\n- spawn_teammate starts a background task and returns immediately. Use "
+                "send_message or broadcast for follow-up guidance while it is running, then "
+                "use read_inbox with wait_seconds to collect completion messages before relying "
+                "on delegated findings. Use list_teammates to inspect lifecycle state and do not "
+                "treat a started task as completed evidence."
+                "\n- Delegate application-code implementation to implementer. Delegate CI/CD, "
+                "Docker, deployment, build, environment, and infrastructure configuration to "
+                "devops. Every write-capable teammate must receive a narrow write_scope."
+                "\n- While a write-capable teammate is active, neither the Lead nor a Builder "
+                "Subagent may modify files inside that teammate's write_scope. Integrate only "
+                "after ownership is released."
+                "\n- Before the final answer, call read_inbox and collect every teammate result "
+                "that the answer depends on; a started or running teammate is not evidence."
                 "\n- Skip team delegation only for simple one-step work, tightly coupled edits "
                 "where delegation would duplicate the lead agent's context, or when no teammate "
                 "role fits. The lead agent remains responsible for integrating results, resolving "
@@ -4564,10 +4972,11 @@ class OmniAgent:
         ):
             prompt += (
                 "\n- When both subagents and Agent Team are available, use them for distinct "
-                "scopes: prefer subagents for short, bounded investigation or verification "
-                "whose final summary is sufficient; prefer teammates for specialist ownership "
-                "that may need implementation or follow-up communication. A substantial task "
-                "may use both, but never assign the same scope to both or repeat completed work."
+                "scopes. Use a Subagent for short, synchronous, one-shot investigation, "
+                "verification, or implementation whose final summary is sufficient. Use a "
+                "teammate for background or long-running work that needs status tracking, "
+                "follow-up messages, or continuing ownership. Never assign the same task scope "
+                "to both a Subagent and a teammate."
             )
         if self.agent_tools.plan_mode:
             prompt += (
@@ -4847,6 +5256,8 @@ class OmniAgent:
         return replace(spec, tool_names=allowed_names)
 
     def _teammate_tool_schemas(self, spec):
+        tool_names = tuple(spec.tool_names) + (TEAMMATE_REPORT_TOOL_NAME,)
+        report_definition = [teammate_report_tool_definition()]
         include_web_search = (
             self.agent_tools.web_search_available and "web_search" in spec.tool_names
         )
@@ -4866,7 +5277,8 @@ class OmniAgent:
                 include_web_search,
                 include_skills,
                 False,
-                only_tools=spec.tool_names,
+                extra_definitions=report_definition,
+                only_tools=tool_names,
                 exclude_tools=excluded,
             )
         if self.api_type == API_TYPE_OLLAMA:
@@ -4874,7 +5286,8 @@ class OmniAgent:
                 include_web_search,
                 include_skills,
                 False,
-                only_tools=spec.tool_names,
+                extra_definitions=report_definition,
+                only_tools=tool_names,
                 exclude_tools=excluded,
             )
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
@@ -4882,14 +5295,16 @@ class OmniAgent:
                 include_web_search,
                 include_skills,
                 False,
-                only_tools=spec.tool_names,
+                extra_definitions=report_definition,
+                only_tools=tool_names,
                 exclude_tools=excluded,
             )
         return glm_tool_schemas(
             include_web_search,
             include_skills,
             False,
-            only_tools=spec.tool_names,
+            extra_definitions=report_definition,
+            only_tools=tool_names,
             exclude_tools=excluded,
         )
 

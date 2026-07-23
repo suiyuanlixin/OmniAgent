@@ -36,6 +36,11 @@ from tui.theme import (
     INFO_BAR_BACKGROUND,
     PAGE_BACKGROUND,
     REFERENCE_BACKGROUND,
+    STATUS_ERROR,
+    STATUS_INFO,
+    STATUS_MUTED,
+    STATUS_SUCCESS,
+    STATUS_WARNING,
     SURFACE_BACKGROUND,
     TEXT_PRIMARY,
     TEXT_MUTED,
@@ -109,6 +114,9 @@ class ChatView(Widget):
         height: auto;
         margin: 0;
         padding: 0;
+    }
+    .message-row.message-row-team-incoming {
+        margin-top: 1;
     }
     .message-row-user {
         align-horizontal: right;
@@ -386,14 +394,18 @@ class ChatView(Widget):
         display: none;
     }
 
-    SubagentBlock {
+    SubagentBlock,
+    TeamRunBlock,
+    TeamActionBlock {
         width: 100%;
         height: auto;
         margin: 1 0 0 0;
         padding: 0;
         background: transparent;
     }
-    SubagentBlock > .subagent-toggle {
+    SubagentBlock > .subagent-toggle,
+    TeamRunBlock > .subagent-toggle,
+    TeamActionBlock > .team-action-toggle {
         width: auto;
         height: 1;
         min-width: 1;
@@ -404,18 +416,67 @@ class ChatView(Widget):
         text-align: left;
         content-align: left middle;
     }
-    SubagentBlock > .subagent-content {
+    SubagentBlock > .subagent-content,
+    TeamRunBlock > .subagent-content,
+    TeamActionBlock > .team-action-content {
         width: 100%;
         height: auto;
         margin-top: 0;
         padding: 0 0 0 2;
         background: transparent;
     }
-    SubagentBlock > .subagent-content.hidden {
+    TeamActionBlock > .team-action-content {
+        margin-top: 0;
+        padding-left: 1;
+    }
+    TeamActionBlock .team-roster-card,
+    TeamActionBlock .team-message-bubble {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0 1;
+        color: $TEXT_PRIMARY;
+        background: $SURFACE_BACKGROUND;
+    }
+    TeamActionBlock .team-inbox-card {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        background: $SURFACE_BACKGROUND;
+    }
+    TeamActionBlock .team-inbox-header {
+        width: 100%;
+        height: 1;
+        margin: 0;
+        padding: 0 1;
+        color: $TEXT_MUTED;
+        background: $SURFACE_BACKGROUND;
+    }
+    TeamActionBlock .team-inbox-message {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0 1;
+        color: $TEXT_PRIMARY;
+        background: $SURFACE_BACKGROUND;
+    }
+    TeamActionBlock .team-action-card-top-spacer,
+    TeamActionBlock .team-action-card-bottom-spacer {
+        width: 100%;
+        height: 1;
+        background: $PAGE_BACKGROUND;
+        color: $SURFACE_BACKGROUND;
+    }
+    SubagentBlock > .subagent-content.hidden,
+    TeamRunBlock > .subagent-content.hidden,
+    TeamActionBlock > .team-action-content.hidden {
         display: none;
     }
     SubagentBlock ChatView,
-    SubagentBlock ChatView #chat-log {
+    SubagentBlock ChatView #chat-log,
+    TeamRunBlock ChatView,
+    TeamRunBlock ChatView #chat-log {
         width: 100%;
         height: auto;
         background: transparent;
@@ -742,6 +803,7 @@ class ChatView(Widget):
         self._assistant_markdown_enabled = bool(markdown_enabled)
         self._user_spacer = bool(user_spacer)
         self._stream_target = None
+        self._stream_row: Widget | None = None
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index: int | None = None
@@ -758,13 +820,23 @@ class ChatView(Widget):
         self._compaction_transcript_indices: dict[str, int] = {}
         self._subagent_blocks: dict[str, SubagentBlock] = {}
         self._subagent_transcript_indices: dict[str, int] = {}
+        self._team_blocks: dict[str, TeamRunBlock] = {}
+        self._team_transcript_indices: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
 
-    def add_message(self, role: str, content: str, reference_base_dir=None) -> None:
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        reference_base_dir=None,
+        *,
+        spacing_before: bool = False,
+    ) -> None:
         self._activate_message_output()
         self._stream_target = None
+        self._stream_row = None
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
@@ -778,16 +850,22 @@ class ChatView(Widget):
             assistant_markdown_enabled=self._assistant_markdown_enabled,
             reference_base_dir=reference_base_dir,
         )
+        if spacing_before:
+            row.add_class("message-row-team-incoming")
         self.query_one("#chat-log", VerticalScroll).mount(row)
         self.call_after_refresh(self._scroll_end)
         self.messages.append((role, content, datetime.now().isoformat()))
-        self._append_transcript_entry({
+        transcript_entry = {
             "kind": "message",
             "role": str(role or ""),
             "content": str(content or ""),
-        })
+        }
+        if spacing_before:
+            transcript_entry["spacing_before"] = True
+        self._append_transcript_entry(transcript_entry)
         if role == "assistant":
             self._stream_target = content_widget
+            self._stream_row = row
             self._stream_role = role
             self._stream_content = str(content or "")
             self._stream_transcript_index = len(self._transcript) - 1
@@ -795,6 +873,7 @@ class ChatView(Widget):
     def add_status(self, content: str) -> None:
         self._activate_message_output()
         self._stream_target = None
+        self._stream_row = None
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
@@ -824,6 +903,7 @@ class ChatView(Widget):
             self.query_one("#chat-log", VerticalScroll).mount(row)
             self.call_after_refresh(self._scroll_end)
             self._stream_target = content_widget
+            self._stream_row = row
             self._stream_role = role
             self._stream_content = str(prefix or "")
             self._append_transcript_entry({
@@ -860,6 +940,7 @@ class ChatView(Widget):
         for child in children[-count:]:
             child.remove()
         self._stream_target = None
+        self._stream_row = None
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
@@ -874,6 +955,7 @@ class ChatView(Widget):
         self.messages.clear()
         self._transcript.clear()
         self._stream_target = None
+        self._stream_row = None
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
@@ -890,6 +972,8 @@ class ChatView(Widget):
         self._compaction_transcript_indices.clear()
         self._subagent_blocks.clear()
         self._subagent_transcript_indices.clear()
+        self._team_blocks.clear()
+        self._team_transcript_indices.clear()
 
     def clear_message_selection(self) -> None:
         widgets = [
@@ -1160,6 +1244,125 @@ class ChatView(Widget):
             )
         self.call_after_refresh(self._scroll_end)
 
+    def add_team_entry(
+        self,
+        teammate_name: str,
+        role: str,
+        purpose: str,
+        task_id: str,
+        status: str,
+        transcript: list[dict],
+        result: str = "",
+    ) -> None:
+        self._activate_aux_output("team")
+        block = TeamRunBlock(
+            teammate_name,
+            role,
+            purpose,
+            task_id,
+            status,
+            transcript,
+            self._assistant_markdown_enabled,
+        )
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "team_run",
+            "teammate_name": str(teammate_name or ""),
+            "role": str(role or ""),
+            "purpose": str(purpose or ""),
+            "task_id": str(task_id or ""),
+            "status": str(status or "completed"),
+            "result": str(result or ""),
+            "transcript": deepcopy(list(transcript or [])),
+        })
+        self.call_after_refresh(self._scroll_end)
+
+    def start_team_entry(
+        self,
+        entry_id: str,
+        teammate_name: str,
+        role: str = "",
+        purpose: str = "",
+        task_id: str = "",
+    ) -> None:
+        self._activate_aux_output("team")
+        entry_id = str(entry_id)
+        block = TeamRunBlock(
+            teammate_name,
+            role,
+            purpose,
+            task_id or entry_id,
+            "running",
+            [],
+            self._assistant_markdown_enabled,
+        )
+        self._team_blocks[entry_id] = block
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "team_run",
+            "teammate_name": str(teammate_name or ""),
+            "role": str(role or ""),
+            "purpose": str(purpose or ""),
+            "task_id": str(task_id or entry_id),
+            "status": "running",
+            "result": "",
+            "transcript": [],
+        })
+        self._team_transcript_indices[entry_id] = len(self._transcript) - 1
+        self.call_after_refresh(self._scroll_end)
+
+    def append_team_event(self, entry_id: str, event: dict) -> None:
+        entry_id = str(entry_id)
+        block = self._team_blocks.get(entry_id)
+        if block is None or not isinstance(event, dict):
+            return
+        block.add_event(event)
+        transcript_index = self._team_transcript_indices.get(entry_id)
+        if transcript_index is not None:
+            self._update_transcript_entry(
+                transcript_index,
+                transcript=deepcopy(block.persistent_transcript()),
+            )
+        self.call_after_refresh(self._scroll_end)
+
+    def finish_team_entry(self, entry_id: str, status: str, result: str = "") -> bool:
+        entry_id = str(entry_id)
+        block = self._team_blocks.get(entry_id)
+        if block is None:
+            return False
+        block.finish(status, result)
+        transcript_index = self._team_transcript_indices.get(entry_id)
+        if transcript_index is not None:
+            self._update_transcript_entry(
+                transcript_index,
+                status=str(status or "completed"),
+                result=str(result or ""),
+                transcript=deepcopy(block.persistent_transcript()),
+            )
+        self.call_after_refresh(self._scroll_end)
+        return True
+
+    def add_team_action_entry(
+        self,
+        action: str,
+        summary: str,
+        details: str = "",
+        status: str = "success",
+        metadata: dict | None = None,
+    ) -> None:
+        self._activate_aux_output("team_action")
+        block = TeamActionBlock(action, summary, details, status, metadata)
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_transcript_entry({
+            "kind": "team_action",
+            "action": str(action or "team"),
+            "summary": str(summary or ""),
+            "details": str(details or ""),
+            "status": str(status or "success"),
+            "metadata": deepcopy(dict(metadata or {})),
+        })
+        self.call_after_refresh(self._scroll_end)
+
     def start_compaction_entry(
         self,
         entry_id: str,
@@ -1240,8 +1443,43 @@ class ChatView(Widget):
                 parts.append(f"Compact model: {model}")
         return "\n".join(parts) if parts else ""
 
+    def _discard_empty_assistant_stream(self) -> None:
+        if (
+            self._stream_role != "assistant"
+            or self._stream_content.strip()
+            or self._stream_transcript_index is None
+            or self._stream_transcript_index != len(self._transcript) - 1
+        ):
+            return
+
+        entry = self._transcript[self._stream_transcript_index]
+        if (
+            str(entry.get("kind") or "") != "message"
+            or str(entry.get("role") or "") != "assistant"
+            or str(entry.get("content") or "").strip()
+        ):
+            return
+
+        row = self._stream_row
+        if row is None:
+            row = self._stream_target
+            while row is not None and not row.has_class("message-row"):
+                parent = getattr(row, "parent", None)
+                row = parent if isinstance(parent, Widget) else None
+        if row is not None:
+            row.remove()
+
+        self._transcript.pop()
+        if (
+            self.messages
+            and str(self.messages[-1][0] or "") == "assistant"
+            and not str(self.messages[-1][1] or "").strip()
+        ):
+            self.messages.pop()
+
     def _reset_message_stream(self) -> None:
         self._stream_target = None
+        self._stream_row = None
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
@@ -1283,10 +1521,17 @@ class ChatView(Widget):
         if kind == "message":
             role = str(entry.get("role") or "")
             content = str(entry.get("content") or "")
+            if role == "assistant" and not content.strip():
+                return
             if role == "status":
                 self.add_status(content)
             elif role:
-                self.add_message(role, content, reference_base_dir)
+                self.add_message(
+                    role,
+                    content,
+                    reference_base_dir,
+                    spacing_before=bool(entry.get("spacing_before")),
+                )
             return
         if kind == "thought":
             self.add_thought(
@@ -1353,6 +1598,26 @@ class ChatView(Widget):
                 list(entry.get("transcript") or []),
             )
             return
+        if kind == "team_run":
+            self.add_team_entry(
+                str(entry.get("teammate_name") or ""),
+                str(entry.get("role") or ""),
+                str(entry.get("purpose") or ""),
+                str(entry.get("task_id") or ""),
+                str(entry.get("status") or "completed"),
+                list(entry.get("transcript") or []),
+                str(entry.get("result") or ""),
+            )
+            return
+        if kind == "team_action":
+            self.add_team_action_entry(
+                str(entry.get("action") or "team"),
+                str(entry.get("summary") or ""),
+                str(entry.get("details") or ""),
+                str(entry.get("status") or "success"),
+                dict(entry.get("metadata") or {}),
+            )
+            return
         if kind == "compaction":
             self.start_compaction_entry(
                 f"replay-{len(self._transcript)}",
@@ -1406,6 +1671,7 @@ class ChatView(Widget):
 
     def _activate_aux_output(self, kind: str) -> None:
         if self._active_output_kind != kind:
+            self._discard_empty_assistant_stream()
             self._reset_message_stream()
             self._clear_auxiliary_group_refs(except_kind=kind)
             self._active_output_kind = kind
@@ -2366,6 +2632,232 @@ class TodosBlock(Vertical):
             content.add_class("hidden")
 
 
+def _friendly_team_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    return {
+        "active": "Ready",
+        "starting": "Starting",
+        "running": "Working",
+        "completed": "Done",
+        "failed": "Failed",
+        "cancelling": "Stopping",
+        "cancelled": "Cancelled",
+        "interrupted": "Interrupted",
+        "unknown": "Unknown",
+    }.get(normalized, normalized.replace("_", " ").title() or "Unknown")
+
+
+def _team_status_color(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    return {
+        "active": STATUS_INFO,
+        "starting": STATUS_INFO,
+        "running": STATUS_INFO,
+        "completed": STATUS_SUCCESS,
+        "failed": STATUS_ERROR,
+        "cancelling": STATUS_WARNING,
+        "cancelled": STATUS_MUTED,
+        "interrupted": STATUS_WARNING,
+        "unknown": STATUS_MUTED,
+    }.get(normalized, STATUS_MUTED)
+
+
+def _compact_team_text(text: str, limit: int = 160) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(1, limit - 1)].rstrip() + "\u2026"
+
+
+class TeamActionBlock(Vertical):
+    _ACTION_LABELS = {
+        "list_teammates": "List Teammates",
+        "send_message": "Send Message",
+        "read_inbox": "Read Inbox",
+        "broadcast": "Broadcast",
+        "report_to_lead": "Report to Lead",
+        "shutdown_teammate": "Shutdown Teammate",
+    }
+
+    def __init__(
+        self,
+        action: str,
+        summary: str,
+        details: str,
+        status: str,
+        metadata: dict | None = None,
+    ):
+        super().__init__()
+        self.action = str(action or "team")
+        self.summary = str(summary or "")
+        self.details = str(details or "")
+        self.status = str(status or "success")
+        self.metadata = deepcopy(dict(metadata or {}))
+        self.expanded = False
+        self.can_expand = self._has_expandable_content()
+        self._toggle_widget: Static | None = None
+        self._content_widget: Vertical | None = None
+
+    def compose(self) -> ComposeResult:
+        self._toggle_widget = Static(
+            self._header_label(), classes="team-action-toggle", markup=True
+        )
+        self._content_widget = Vertical(
+            *self._content_with_half_row_gaps(),
+            classes="team-action-content hidden",
+        )
+        yield self._toggle_widget
+        yield self._content_widget
+
+    def on_click(self, event: events.Click) -> None:
+        control = event.control
+        if (
+            not self.can_expand
+            or not hasattr(control, "has_class")
+            or not control.has_class("team-action-toggle")
+        ):
+            return
+        self.expanded = not self.expanded
+        self._refresh()
+        event.stop()
+
+    def _has_expandable_content(self) -> bool:
+        if self.action == "shutdown_teammate":
+            return False
+        if self.action == "list_teammates":
+            return bool(self.metadata.get("roster"))
+        if self.action == "read_inbox":
+            return bool(self.metadata.get("messages"))
+        return bool(self.metadata.get("message") or self.details)
+
+    def _marker(self) -> str:
+        if self.action in {"list_teammates", "read_inbox"}:
+            return "\u2192"
+        if self.action == "shutdown_teammate":
+            return "\u00bb"
+        return "\u00ab" if self.expanded else "\u00bb"
+
+    def _header_label(self) -> str:
+        marker = self._marker()
+        action = self._ACTION_LABELS.get(
+            self.action, self.action.replace("_", " ").title()
+        )
+        action = _escape_markup(action)
+        summary = _escape_markup(self.summary)
+        suffix = f" [gray]{summary}[/gray]" if summary else ""
+        return f"{marker} [white]{action}[/white]{suffix}"
+
+    def _content_with_half_row_gaps(self) -> list[Widget]:
+        spaced_children: list[Widget] = []
+        for child in self._content_children():
+            # Textual spacing is integer-cell based. These half-block spacers
+            # visually create a half-row transition above and below each card.
+            spaced_children.extend((
+                BottomHalfRowSpacer(classes="team-action-card-top-spacer"),
+                child,
+                HalfRowSpacer(classes="team-action-card-bottom-spacer"),
+            ))
+        return spaced_children
+
+    def _content_children(self) -> list[Widget]:
+        if self.action == "list_teammates":
+            return self._roster_children()
+        if self.action == "read_inbox":
+            return self._inbox_children()
+        if self.action in {"send_message", "broadcast", "report_to_lead"}:
+            message = str(self.metadata.get("message") or self.details or "").strip()
+            return (
+                [Static(message, classes="team-message-bubble", markup=False)]
+                if message
+                else []
+            )
+        if self.details and self.can_expand:
+            return [Static(self.details, classes="team-message-bubble", markup=False)]
+        return []
+
+    def _roster_children(self) -> list[Widget]:
+        children: list[Widget] = []
+        for teammate in self.metadata.get("roster") or []:
+            if not isinstance(teammate, dict):
+                continue
+            name = _escape_markup(str(teammate.get("name") or "Teammate"))
+            role = _escape_markup(str(teammate.get("role") or ""))
+            status = _escape_markup(
+                _friendly_team_status(str(teammate.get("status") or "unknown"))
+            )
+            try:
+                task_count = int(teammate.get("task_count") or 0)
+            except (TypeError, ValueError):
+                task_count = 0
+            task_label = "task" if task_count == 1 else "tasks"
+            title = f"[white]{name}[/white]"
+            if role:
+                title += f" [gray]({role})[/gray]"
+            lines = [
+                title,
+                f"[gray]Status[/gray]  {status}    "
+                f"[gray]Tasks[/gray]  {task_count} {task_label}",
+            ]
+            write_scope = [
+                _compact_team_text(str(item), 80)
+                for item in teammate.get("write_scope") or []
+                if str(item).strip()
+            ]
+            if write_scope:
+                lines.append(
+                    f"[gray]Scope[/gray]  {_escape_markup(', '.join(write_scope))}"
+                )
+            current_task = _compact_team_text(str(teammate.get("task") or ""), 160)
+            if current_task:
+                lines.append(
+                    f"[gray]Current[/gray] {_escape_markup(current_task)}"
+                )
+            children.append(
+                Static("\n".join(lines), classes="team-roster-card", markup=True)
+            )
+        return children
+
+    def _inbox_children(self) -> list[Widget]:
+        children: list[Widget] = []
+        for message in self.metadata.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            sender_value = str(message.get("from") or "lead")
+            sender = (
+                "Lead"
+                if sender_value.lower() == "lead"
+                else str(message.get("from") or "Teammate")
+            )
+            status_value = str(message.get("status") or "")
+            status = _friendly_team_status(status_value) if status_value else ""
+            report_kind = str(message.get("report_kind") or "").strip().lower()
+            report_label = report_kind.title() if report_kind else ""
+            header = f"[white]{_escape_markup(sender)}[/white]"
+            if report_label:
+                header += f" [gray]\u00b7 {_escape_markup(report_label)}[/gray]"
+            if status:
+                header += f" [gray]\u00b7 {_escape_markup(status)}[/gray]"
+            body = str(message.get("content") or "").strip()
+            children.append(
+                Vertical(
+                    Static(header, classes="team-inbox-header", markup=True),
+                    Static(body, classes="team-inbox-message", markup=False),
+                    classes="team-inbox-card",
+                )
+            )
+        return children
+
+    def _refresh(self) -> None:
+        if self._toggle_widget is not None:
+            self._toggle_widget.update(self._header_label())
+        if self._content_widget is None:
+            return
+        if self.expanded and self.can_expand:
+            self._content_widget.remove_class("hidden")
+        else:
+            self._content_widget.add_class("hidden")
+
+
 class SubagentBlock(Vertical):
     def __init__(
         self,
@@ -2429,9 +2921,12 @@ class SubagentBlock(Vertical):
         else:
             self._content_widget.add_class("hidden")
 
+    def _chat_transcript(self, transcript: list[dict]) -> list[dict]:
+        return _subagent_chat_transcript(transcript)
+
     def _load_transcript(self) -> None:
         if self._chat_view is not None:
-            self._chat_view.load_transcript(_subagent_chat_transcript(self.transcript))
+            self._chat_view.load_transcript(self._chat_transcript(self.transcript))
             self._loaded = True
 
     def add_event(self, event: dict) -> None:
@@ -2459,7 +2954,7 @@ class SubagentBlock(Vertical):
             return
         if kind in {"tool_call", "tool_result"}:
             self._finish_thought_stream()
-        for entry in _subagent_chat_transcript([event]):
+        for entry in self._chat_transcript([event]):
             self._chat_view._replay_transcript_entry(entry)
 
     def persistent_transcript(self) -> list[dict]:
@@ -2484,6 +2979,71 @@ class SubagentBlock(Vertical):
             max(0.0, time.monotonic() - self._thinking_started_at)
         )
         self._thinking_started_at = None
+
+
+class TeamRunBlock(SubagentBlock):
+    def __init__(
+        self,
+        teammate_name: str,
+        role: str,
+        purpose: str,
+        task_id: str,
+        status: str,
+        transcript: list[dict],
+        markdown_enabled: bool,
+    ):
+        self.teammate_name = str(teammate_name or "teammate")
+        self.role = str(role or "")
+        self.purpose = str(purpose or "")
+        self.task_id = str(task_id or "")
+        self.status = str(status or "running")
+        self.result = ""
+        super().__init__(self.teammate_name, transcript, markdown_enabled)
+
+    def _chat_transcript(self, transcript: list[dict]) -> list[dict]:
+        return _team_chat_transcript(transcript)
+
+    def _header_label(self) -> str:
+        name = _escape_markup(self.teammate_name)
+        role = _escape_markup(self.role)
+        purpose = _escape_markup(self.purpose)
+        status = _escape_markup(_friendly_team_status(self.status))
+        status_color = _team_status_color(self.status)
+        title = f"@ [white]Teammate {name}[/white]"
+        if role:
+            title += f" [gray]({role})[/gray]"
+        title += f" [gray]\u00b7[/gray] [{status_color}]{status}[/]"
+        if purpose:
+            title += f" [gray]\u00b7 {purpose}[/gray]"
+        return title
+
+    def finish(self, status: str, result: str = "") -> None:
+        self.status = str(status or "completed")
+        self.result = str(result or "")
+        self._finish_thought_stream()
+        self._refresh()
+
+
+def _team_chat_transcript(transcript: list[dict]) -> list[dict]:
+    entries = _subagent_chat_transcript(transcript)
+    rendered: list[dict] = []
+    seen_user_message = False
+    for entry in entries:
+        if (
+            str(entry.get("kind") or "") == "message"
+            and str(entry.get("role") or "") == "user"
+        ):
+            is_team_message = (
+                bool(entry.get("team_message"))
+                or str(entry.get("source") or "").strip().lower() == "lead"
+                or seen_user_message
+            )
+            seen_user_message = True
+            if is_team_message:
+                entry = dict(entry)
+                entry["spacing_before"] = True
+        rendered.append(entry)
+    return rendered
 
 
 def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
@@ -2539,6 +3099,35 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
                     "kind": "shell",
                     "command": display.get("command", ""),
                     "output": display.get("output", ""),
+                })
+                continue
+            if display_kind == "team_report":
+                report_kind = str(display.get("report_kind") or "").strip().lower()
+                if not report_kind:
+                    old_summary = str(display.get("summary") or "").strip()
+                    match = re.fullmatch(
+                        r"Reported\s+(.+?)\s+to\s+Lead\.?",
+                        old_summary,
+                        flags=re.IGNORECASE,
+                    )
+                    if match:
+                        report_kind = match.group(1).strip().lower()
+                report_label = (
+                    report_kind.replace("_", " ").title()
+                    if report_kind
+                    else "Report"
+                )
+                message = str(display.get("message") or "").strip()
+                entries.append({
+                    "kind": "team_action",
+                    "action": "report_to_lead",
+                    "summary": report_label,
+                    "details": message,
+                    "status": "success",
+                    "metadata": {
+                        "message": message,
+                        "report_kind": report_kind,
+                    },
                 })
                 continue
     return entries
@@ -2834,9 +3423,9 @@ class DiffFileRow(Vertical):
             return ""
         parts = []
         if self.additions:
-            parts.append(f"[#7fd97f]+{self.additions}[/]")
+            parts.append(f"[{DIFF_ADD_FG}]+{self.additions}[/]")
         if self.deletions:
-            parts.append(f"[#d97f7f]-{self.deletions}[/]")
+            parts.append(f"[{DIFF_DEL_FG}]-{self.deletions}[/]")
         return " ".join(parts)
 
     def _label_markup(self) -> str:
@@ -2864,7 +3453,8 @@ class ChangedFilesBlock(Vertical):
         total_del = sum(int(f.get("deletions", 0) or 0) for f in self.files)
         label = f"{count} Changed file" if count == 1 else f"{count} Changed files"
         return (
-            f"[white]{label}[/white] [#7fd97f]+{total_add}[/] [#d97f7f]-{total_del}[/]"
+            f"[white]{label}[/white] [{DIFF_ADD_FG}]+{total_add}[/] "
+            f"[{DIFF_DEL_FG}]-{total_del}[/]"
         )
 
 
@@ -2889,7 +3479,8 @@ class ChangedFileRow(Vertical):
                 expand=False,
             )
             self._stats_widget = Static(
-                f"[#7fd97f]+{self.additions}[/] [#d97f7f]-{self.deletions}[/]",
+                f"[{DIFF_ADD_FG}]+{self.additions}[/] "
+                f"[{DIFF_DEL_FG}]-{self.deletions}[/]",
                 classes="changed-file-row-stats",
                 markup=True,
                 expand=False,

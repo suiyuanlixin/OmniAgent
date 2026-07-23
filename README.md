@@ -10,8 +10,8 @@ OmniAgent 是一个基于 Python、Textual 和 Rich 的本地 AI Agent 工作台
 - 支持 `[@file:路径]` 与 `[@folder:路径]` 引用；文本文件可直接注入上下文，文件夹以只读方式延迟访问。
 - 支持图片、音频、视频附件；仅在当前模型档案声明 `extra_modalities` 时直接作为多模态输入发送。
 - 支持 Agent Plan mode / Build mode 分工，使用 todo 跟踪执行进度与最终校验。
-- 支持子智能体 `reader`、`researcher`、`auditor`、`builder`。
-- 支持 Team 模式，可启用内置 teammate：`architect`、`reviewer`、`devops`、`debugger`。
+- 支持子智能体：Plan mode 提供 `reader`、`researcher`，Build mode 额外提供 `auditor`、`builder`。
+- 支持 Agent Team，可启用 `architect`、`reviewer`、`implementer`、`devops`、`debugger`，并通过写入范围所有权避免并发修改冲突。
 - 支持持久记忆、偏好记忆、情景记忆、自动上下文压缩与手动 `/comp` 压缩。
 - 支持 Tavily 网络搜索、程序级 / 工作区级 Skills，以及 ClawHub / SkillHub 安装流程。
 - 对写文件、补丁、命令执行等高风险操作提供审批保护。
@@ -188,7 +188,7 @@ Ollama 云端：
 
 - 左侧 Sidebar：项目与会话管理、固定项目/会话、归档浏览。
 - 中央 ChatView：消息流、Thinking 块、工具结果块、Todo 块、Markdown 渲染。
-- 底部 ChatInput：输入、引用、附件、Plan / Build 切换、发送队列。
+- 底部 ChatInput：输入、引用、附件、Plan / Build 切换、追加消息区；slash 命令会立即执行。
 - Settings：模型、Agent、Skills、Web Search、Team 等设置。
 - TodosPanel：展示当前 Agent 执行中的 todo 快照。
 
@@ -260,23 +260,30 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 
 安全限制：
 
-- 必须带工作区启动后才能启用本地 Agent。
+- 必须先在界面中选择工作区后，才能启用本地 Agent。
 - 所有工作区工具只允许访问工作区及其子目录。
 - 普通聊天不会获得工作区任意文件读写权限。
 - 高风险命令仍需要审批。
 
 ## 子智能体与 Team
 
+主 Agent 提供两种委派方式：
+
+- **Subagent**：适合短期、同步、一次性的阅读、调研、审计或小范围实现；任务结束后只返回一份精简结果。
+- **Agent Team**：适合后台、长时间运行、需要状态跟踪、后续消息或持续文件所有权的任务。
+
+同一任务范围不应同时交给 Subagent 和 teammate。Agent Team 仅在 Build mode 可用；Plan mode 只提供只读 Subagent。
+
 ### 子智能体
 
-Agent 默认支持以下子智能体：
+Build mode 支持以下子智能体：
 
-- `reader`：快速阅读和总结代码
-- `researcher`：资料搜索与方案调研
-- `auditor`：审计与风险检查
-- `builder`：小范围实现任务
+- `reader`：快速阅读和总结代码。
+- `researcher`：资料搜索与方案调研，别名 `investigator`。
+- `auditor`：审计、风险检查与验证。
+- `builder`：小范围实现任务，别名 `general`。
 
-主 Agent 可以派发子任务，但子智能体不能继续派发子智能体，也不能直接维护 todo 或向用户提问。
+Plan mode 只暴露并允许 `reader`、`researcher` 及指向它们的别名；`auditor`、`builder`、`general` 会被拒绝。子智能体不能继续派发子智能体、管理 Team、维护主 Agent 的 todo 或直接向用户提问。
 
 工作区中可通过模板覆盖内置 prompt：
 
@@ -288,14 +295,53 @@ Agent 默认支持以下子智能体：
 └── builder.md
 ```
 
-### Team 模式
+### Agent Team
 
-Team 模式支持多 teammate 协作，内置成员包括：
+内置 teammate：
 
-- `architect`
-- `reviewer`
-- `devops`
-- `debugger`
+- `architect`（`arch`）：只读架构分析、技术选型、API 与数据模型设计，可使用 Web 工具。
+- `reviewer`（`rev`）：只读代码审查、安全与测试覆盖分析，可运行安全诊断命令和 `local_http_check`。
+- `implementer`（`impl`）：应用代码实现、局部重构、测试与验收；拥有文件写入工具，不默认提供 Web 工具。
+- `devops`（`ops`）：CI/CD、Docker、部署、构建、环境和基础设施配置；拥有文件写入与 Web 工具，不应修改无关业务代码。
+- `debugger`（`dbg`）：只读错误诊断、日志与运行时问题调查，可使用 Web 工具和 `local_http_check`。
+
+Lead 使用六个管理工具协调 Team：
+
+- `spawn_teammate`：启动后台 teammate 任务。
+- `list_teammates`：查看活跃成员、状态、当前任务与写入范围。
+- `send_message`：向指定成员发送后续消息。
+- `read_inbox`：读取 Lead 或指定成员的 inbox；可使用 `wait_seconds` 等待后台结果，并通过 `clear` 清理已读消息。
+- `broadcast`：向全部或指定成员广播消息。
+- `shutdown_teammate`：停止成员并释放其任务资源。
+
+所有 teammate 都可以使用 teammate-only 的 `report_to_lead` 主动向 Lead 汇报 `progress`、`blocker`、`finding` 或 `question`。每个任务最多主动汇报 3 次；最终任务结果由系统单独投递，不占用该限制。Lead 通过 `read_inbox` 接收汇报和最终结果。
+
+推荐工作流：
+
+1. 使用 `spawn_teammate` 选择职责匹配的角色并给出明确任务；应用代码优先交给 `implementer`，基础设施工作交给 `devops`。
+2. 使用 `list_teammates` 查看生命周期状态；启动或运行中不代表已经得到可依赖的结论。
+3. 任务运行期间可通过 `send_message` 或 `broadcast` 补充要求。
+4. 在最终答复前使用 `read_inbox` 收集所依赖的 teammate 汇报和完成结果。
+5. 不再需要成员时使用 `shutdown_teammate` 清理。
+
+#### 写入范围与所有权
+
+`implementer`、`devops` 以及任何拥有文件写入工具的自定义 teammate，在启动时必须提供非空 `write_scope`：
+
+```json
+{
+  "teammate_type": "implementer",
+  "task": "实现认证模块并补充测试",
+  "write_scope": ["src/auth/**", "tests/auth/**"]
+}
+```
+
+- `write_scope` 使用工作区相对路径或 Glob；绝对路径、工作区外路径和空范围会被拒绝。
+- 活跃写入任务的范围不能重叠；无法精确判断 Glob 时采用保守的静态根路径冲突判断。
+- teammate 的直接文件工具只能修改自己的范围；范围被占用时，Lead、Builder Subagent 和其他 teammate 也不能修改其中的文件。
+- 任务完成、失败、取消或 Shutdown 后自动释放所有权。
+- `scope_limit` 仍是自然语言任务约束，不替代可计算的 `write_scope`。
+- Shell 命令仍受审批模式和 teammate 任务契约限制，不应借助 Shell 绕过写入范围。
 
 团队配置和线程数据位于：
 

@@ -21,6 +21,12 @@ DIFF_ADD_FG = "#7fd97f"
 DIFF_DEL_BG = "#3a1e1e"
 DIFF_DEL_FG = "#d97f7f"
 
+STATUS_INFO = APPROVE_FOR_ME
+STATUS_SUCCESS = DIFF_ADD_FG
+STATUS_ERROR = DIFF_DEL_FG
+STATUS_WARNING = "#e6c86e"
+STATUS_MUTED = TEXT_MUTED
+
 
 def render_css(template: str) -> str:
     return Template(template).substitute(
@@ -39,4 +45,9 @@ def render_css(template: str) -> str:
         DIFF_ADD_FG=DIFF_ADD_FG,
         DIFF_DEL_BG=DIFF_DEL_BG,
         DIFF_DEL_FG=DIFF_DEL_FG,
+        STATUS_INFO=STATUS_INFO,
+        STATUS_SUCCESS=STATUS_SUCCESS,
+        STATUS_ERROR=STATUS_ERROR,
+        STATUS_WARNING=STATUS_WARNING,
+        STATUS_MUTED=STATUS_MUTED,
     )

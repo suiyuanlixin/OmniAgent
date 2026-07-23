@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
+import re
+import threading
+from functools import wraps
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
+
+from subagents import SubagentRunner
 
 TEAM_STORE_DIR = ".omniagent" / Path("team")
 
@@ -12,6 +19,17 @@ DEFAULT_TEAMMATE_TOOL_CALL_FACTOR = 4
 DEFAULT_TEAMMATE_ROLE = "Custom Teammate"
 DEFAULT_TEAMMATE_DESCRIPTION = "Custom teammate."
 DEFAULT_TEAMMATE_PROMPT = "You are a teammate in OmniAgent's team."
+
+WRITE_TOOL_NAMES = frozenset({
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "apply_unified_patch",
+})
+TEAMMATE_REPORT_TOOL_NAME = "report_to_lead"
+TEAMMATE_REPORT_KINDS = frozenset({"progress", "blocker", "finding", "question"})
+MAX_TEAMMATE_REPORTS_PER_TASK = 3
+ACTIVE_TEAMMATE_STATUSES = frozenset({"starting", "running", "cancelling"})
 
 FORBIDDEN_TEAM_TOOL_NAMES = {
     "dispatch_subagent",
@@ -73,6 +91,7 @@ _BUILTIN_TEAMMATES: dict[str, dict[str, Any]] = {
             "- Recommend design patterns, technology choices, and structural improvements.\n"
             "- Identify architectural risks, bottlenecks, and technical debt.\n"
             "- Use read-only tools to inspect the codebase.\n"
+            "- Use report_to_lead for important progress, blockers, findings, or questions.\n"
             "- Do not edit files, run mutating commands, or dispatch subagents.\n"
             "- Reply concisely with: analysis, recommendation, risks, and next steps."
         ),
@@ -89,6 +108,7 @@ _BUILTIN_TEAMMATES: dict[str, dict[str, Any]] = {
             "grep",
             "glob",
             "bash",
+            "local_http_check",
             "git_status",
             "git_diff",
             "list_skills",
@@ -101,8 +121,43 @@ _BUILTIN_TEAMMATES: dict[str, dict[str, Any]] = {
             "- Run safe diagnostic commands (no installs, no file mutations).\n"
             "- Identify bugs, anti-patterns, and improvement opportunities.\n"
             "- Cross-reference changes with existing code conventions.\n"
+            "- Use report_to_lead for important progress, blockers, findings, or questions.\n"
             "- Do not edit files, run mutating commands, or dispatch subagents.\n"
             "- Reply concisely with: findings, severity, evidence, and fix suggestions."
+        ),
+    },
+    "implementer": {
+        "role": "Implementation Engineer",
+        "description": (
+            "Application implementation specialist. Best for scoped feature work, "
+            "bug fixes, local refactors, tests, and acceptance verification."
+        ),
+        "tool_names": (
+            "read_file",
+            "list_dir",
+            "grep",
+            "glob",
+            "bash",
+            "local_http_check",
+            "git_status",
+            "git_diff",
+            "list_skills",
+            "read_skill",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "apply_unified_patch",
+        ),
+        "max_turns": 14,
+        "system_prompt": (
+            "You are an implementation engineer teammate in OmniAgent's team.\n"
+            "- Implement application code, focused bug fixes, local refactors, and tests.\n"
+            "- Work only inside the assigned write_scope and do not touch unrelated files.\n"
+            "- Read existing code and conventions before editing, then verify the result.\n"
+            "- Use report_to_lead for important progress, blockers, findings, or questions.\n"
+            "- Do not handle unrelated CI, deployment, or infrastructure work.\n"
+            "- Do not dispatch subagents or spawn teammates.\n"
+            "- Reply concisely with: changes, evidence, risks, and remaining work."
         ),
     },
     "devops": {
@@ -132,10 +187,12 @@ _BUILTIN_TEAMMATES: dict[str, dict[str, Any]] = {
         "max_turns": 14,
         "system_prompt": (
             "You are a DevOps teammate in OmniAgent's team.\n"
-            "- Handle CI/CD, Docker, deployment, and infrastructure tasks.\n"
+            "- Handle only CI/CD, Docker, deployment, build, environment, and infrastructure tasks.\n"
+            "- Work only inside the assigned write_scope and do not modify unrelated application code.\n"
             "- Read existing configuration before making changes.\n"
             "- Follow security best practices for credentials and secrets.\n"
             "- Write operations require approval unless approve or full mode is enabled.\n"
+            "- Use report_to_lead for important progress, blockers, findings, or questions.\n"
             "- Do not dispatch subagents or spawn teammates.\n"
             "- Reply concisely with: actions taken, evidence, risks, and next steps."
         ),
@@ -152,6 +209,7 @@ _BUILTIN_TEAMMATES: dict[str, dict[str, Any]] = {
             "grep",
             "glob",
             "bash",
+            "local_http_check",
             "web_fetch",
             "web_search",
             "git_status",
@@ -166,6 +224,7 @@ _BUILTIN_TEAMMATES: dict[str, dict[str, Any]] = {
             "- Trace issues through the codebase to find root causes.\n"
             "- Run safe diagnostic commands (no installs, no file mutations).\n"
             "- Suggest fixes with reasoning and evidence.\n"
+            "- Use report_to_lead for important progress, blockers, findings, or questions.\n"
             "- Do not edit files, run mutating commands, or dispatch subagents.\n"
             "- Reply concisely with: diagnosis, root cause, evidence, fix suggestion."
         ),
@@ -176,8 +235,88 @@ _TEAMMATE_ALIASES = {
     "arch": "architect",
     "rev": "reviewer",
     "ops": "devops",
+    "impl": "implementer",
     "dbg": "debugger",
 }
+
+
+def teammate_report_tool_definition() -> dict[str, Any]:
+    return {
+        "name": TEAMMATE_REPORT_TOOL_NAME,
+        "description": (
+            "Send an important progress update, blocker, finding, or question to the Lead. "
+            f"Use sparingly; each teammate task may send at most {MAX_TEAMMATE_REPORTS_PER_TASK} reports."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": sorted(TEAMMATE_REPORT_KINDS),
+                    "description": "The report category.",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Concise report content for the Lead.",
+                },
+            },
+            "required": ["kind", "message"],
+        },
+    }
+
+
+def teammate_has_write_tools(spec: TeammateSpec) -> bool:
+    return bool(WRITE_TOOL_NAMES & set(spec.tool_names))
+
+
+def _scope_compare_text(value: str) -> str:
+    text = str(value or "")
+    return text.casefold() if os.name == "nt" else text
+
+
+def _scope_static_root(scope: str) -> str:
+    parts = []
+    for part in _scope_compare_text(scope).split("/"):
+        if any(char in part for char in "*?["):
+            break
+        parts.append(part)
+    return "/".join(parts).strip("/")
+
+
+def write_scopes_overlap(left: str, right: str) -> bool:
+    left_root = _scope_static_root(left)
+    right_root = _scope_static_root(right)
+    if not left_root or not right_root:
+        return True
+    return (
+        left_root == right_root
+        or left_root.startswith(right_root + "/")
+        or right_root.startswith(left_root + "/")
+    )
+
+
+def _glob_parts_match(path_parts: tuple[str, ...], pattern_parts: tuple[str, ...]) -> bool:
+    if not pattern_parts:
+        return not path_parts
+    head = pattern_parts[0]
+    if head == "**":
+        return any(
+            _glob_parts_match(path_parts[index:], pattern_parts[1:])
+            for index in range(len(path_parts) + 1)
+        )
+    if not path_parts or not fnmatch.fnmatchcase(path_parts[0], head):
+        return False
+    return _glob_parts_match(path_parts[1:], pattern_parts[1:])
+
+
+def path_matches_write_scope(relative_path: str, scope: str) -> bool:
+    path = _scope_compare_text(relative_path).strip("/")
+    pattern = _scope_compare_text(scope).strip("/")
+    if not path or not pattern:
+        return False
+    if not any(char in pattern for char in "*?["):
+        return path == pattern or path.startswith(pattern + "/")
+    return _glob_parts_match(tuple(path.split("/")), tuple(pattern.split("/")))
 
 
 def display_teammate_name(name: str) -> str:
@@ -185,6 +324,15 @@ def display_teammate_name(name: str) -> str:
     if not text:
         return ""
     return text[:1].upper() + text[1:]
+
+
+def _synchronized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 class TeamStore:
@@ -196,9 +344,11 @@ class TeamStore:
         self.workspace_dir = Path(workspace_dir) if workspace_dir else None
         self.templates_dir = Path(templates_dir) if templates_dir else None
         self._builtin_names = set(_BUILTIN_TEAMMATES.keys())
+        self._lock = threading.RLock()
         self._specs: dict[str, TeammateSpec] = {}
         self.reload_specs()
 
+    @_synchronized
     def reload_specs(self) -> None:
         self._specs = {}
         self._load_builtin_specs()
@@ -343,6 +493,7 @@ class TeamStore:
         if self.threads_dir:
             self.threads_dir.mkdir(parents=True, exist_ok=True)
 
+    @_synchronized
     def load_config(self) -> dict[str, Any]:
         cp = self.config_path
         if cp is None or not cp.is_file():
@@ -352,6 +503,7 @@ class TeamStore:
         except (json.JSONDecodeError, OSError):
             return {}
 
+    @_synchronized
     def save_config(self, data: dict[str, Any]) -> None:
         cp = self.config_path
         if cp is None:
@@ -469,15 +621,34 @@ class TeamStore:
             max_turns=DEFAULT_TEAMMATE_MAX_TURNS,
         )
 
+    @_synchronized
     def get_roster(self) -> list[dict[str, Any]]:
         config = self.load_config()
         return config.get("teammates", [])
+
+    @_synchronized
+    def reconcile_stale_tasks(self) -> int:
+        config = self.load_config()
+        teammates = config.get("teammates", [])
+        changed = 0
+        for teammate in teammates:
+            if str(teammate.get("status") or "") not in ACTIVE_TEAMMATE_STATUSES:
+                continue
+            teammate["status"] = "interrupted"
+            teammate["error"] = "The previous OmniAgent session ended before this task completed."
+            teammate["write_scope"] = []
+            teammate["updated_at"] = _now_iso()
+            changed += 1
+        if changed:
+            self.save_config(config)
+        return changed
 
     def is_active(self, name: str) -> bool:
         roster = self.get_roster()
         resolved = self.resolve_name(name)
         return any(self.resolve_name(t.get("name")) == resolved for t in roster)
 
+    @_synchronized
     def add_teammate(self, name: str) -> dict[str, Any]:
         resolved = self.resolve_name(name)
         spec = self.get_spec(resolved)
@@ -505,6 +676,7 @@ class TeamStore:
         self.save_config(config)
         return entry
 
+    @_synchronized
     def remove_teammate(self, name: str) -> bool:
         resolved = self.resolve_name(name)
         config = self.load_config()
@@ -518,19 +690,220 @@ class TeamStore:
         self.save_config(config)
         return True
 
-    def update_status(self, name: str, status: str, task_count: int = 0) -> None:
+    @_synchronized
+    def start_task(
+        self,
+        name: str,
+        *,
+        task_id: str,
+        task: str,
+        write_scope: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_name(name)
+        spec = self.get_spec(resolved)
+        if spec is None:
+            raise ValueError(f"Unknown teammate type: {name!r}")
+        scopes = self.normalize_write_scope(write_scope)
+        if teammate_has_write_tools(spec) and not scopes:
+            raise ValueError(
+                f"Teammate '{spec.name}' has file-writing tools and requires a non-empty write_scope."
+            )
+        config = self.load_config()
+        teammates = config.get("teammates", [])
+        for teammate in teammates:
+            if str(teammate.get("status") or "") not in ACTIVE_TEAMMATE_STATUSES:
+                continue
+            existing_task_id = str(teammate.get("task_id") or "")
+            if self.resolve_name(teammate.get("name")) == resolved and existing_task_id != task_id:
+                raise ValueError(f"Teammate '{spec.name}' already has a running task.")
+            owned_scopes = tuple(
+                str(item) for item in teammate.get("write_scope") or [] if str(item)
+            )
+            if scopes and any(
+                write_scopes_overlap(scope, owned)
+                for scope in scopes
+                for owned in owned_scopes
+            ):
+                owner_name = str(teammate.get("name") or "another teammate")
+                owner_role = str(teammate.get("role") or "writer")
+                raise ValueError(
+                    "write_scope overlaps active owner "
+                    f"{owner_name} ({owner_role}): {', '.join(owned_scopes)}"
+                )
+        entry = next(
+            (
+                teammate
+                for teammate in teammates
+                if self.resolve_name(teammate.get("name")) == resolved
+            ),
+            None,
+        )
+        if entry is None:
+            entry = {
+                "name": spec.name,
+                "role": spec.role,
+                "created_at": _now_iso(),
+                "task_count": 0,
+            }
+            teammates.append(entry)
+        entry.update({
+            "name": spec.name,
+            "role": spec.role,
+            "status": "running",
+            "task_id": str(task_id),
+            "task": str(task or ""),
+            "write_scope": list(scopes),
+            "updated_at": _now_iso(),
+        })
+        entry.pop("error", None)
+        config["teammates"] = teammates
+        self.save_config(config)
+        return dict(entry)
+
+    @_synchronized
+    def update_status(
+        self,
+        name: str,
+        status: str,
+        task_count: int = 0,
+        *,
+        task_id: str | None = None,
+        task: str | None = None,
+        error: str | None = None,
+        write_scope: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         resolved = self.resolve_name(name)
         config = self.load_config()
         teammates = config.get("teammates", [])
         for t in teammates:
             if self.resolve_name(t.get("name")) == resolved:
                 t["name"] = display_teammate_name(resolved)
-                t["status"] = status
+                t["status"] = str(status or "active")
                 t["task_count"] = t.get("task_count", 0) + task_count
+                t["updated_at"] = _now_iso()
+                if task_id is not None:
+                    t["task_id"] = str(task_id)
+                if task is not None:
+                    t["task"] = str(task)
+                if write_scope is not None:
+                    t["write_scope"] = list(write_scope)
+                elif str(status or "") not in ACTIVE_TEAMMATE_STATUSES:
+                    t["write_scope"] = []
+                if error is not None:
+                    t["error"] = str(error)
+                elif status not in {"failed", "cancelled"}:
+                    t.pop("error", None)
                 break
         self.save_config(config)
 
-    def send_message(self, from_name: str, to_name: str, content: str) -> str:
+    def normalize_write_scope(
+        self, values: list[str] | tuple[str, ...] | None
+    ) -> tuple[str, ...]:
+        if values is None:
+            return ()
+        if not isinstance(values, (list, tuple)):
+            raise ValueError("write_scope must be an array of workspace-relative paths or globs.")
+        normalized = []
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("write_scope entries must be strings.")
+            text = value.strip().replace("\\", "/")
+            if (
+                not text
+                or text.startswith("/")
+                or text.startswith("//")
+                or re.match(r"^[A-Za-z]:", text)
+            ):
+                if not text:
+                    raise ValueError("write_scope entries cannot be empty.")
+                raise ValueError(f"write_scope must be workspace-relative: {value!r}")
+            while text.startswith("./"):
+                text = text[2:]
+            text = text.rstrip("/")
+            if not text:
+                raise ValueError("write_scope entries cannot be empty.")
+            raw_parts = text.split("/")
+            if any(part in {"", ".", ".."} for part in raw_parts):
+                raise ValueError(f"Invalid write_scope entry: {value!r}")
+            if "\x00" in text or text.count("[") != text.count("]"):
+                raise ValueError(f"Invalid write_scope entry: {value!r}")
+            normalized_text = PurePosixPath(*raw_parts).as_posix()
+            if normalized_text not in normalized:
+                normalized.append(normalized_text)
+        return tuple(normalized)
+
+    def workspace_relative_path(self, file_path: str | Path) -> str:
+        if self.workspace_dir is None:
+            raise ValueError("No workspace is configured.")
+        root = self.workspace_dir.resolve(strict=False)
+        candidate = Path(file_path)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"Path is outside the workspace: {file_path}") from error
+        return relative.as_posix()
+
+    @_synchronized
+    def active_write_owners(self) -> list[dict[str, Any]]:
+        owners = []
+        for teammate in self.load_config().get("teammates", []):
+            if str(teammate.get("status") or "") not in ACTIVE_TEAMMATE_STATUSES:
+                continue
+            scope = tuple(str(item) for item in teammate.get("write_scope") or [] if str(item))
+            if not scope:
+                continue
+            owners.append({
+                "name": str(teammate.get("name") or ""),
+                "role": str(teammate.get("role") or ""),
+                "task_id": str(teammate.get("task_id") or ""),
+                "write_scope": scope,
+            })
+        return owners
+
+    @_synchronized
+    def find_write_scope_conflict(
+        self, scopes: list[str] | tuple[str, ...], *, exclude_task_id: str = ""
+    ) -> dict[str, Any] | None:
+        for owner in self.active_write_owners():
+            if exclude_task_id and owner.get("task_id") == exclude_task_id:
+                continue
+            if any(
+                write_scopes_overlap(scope, owned)
+                for scope in scopes
+                for owned in owner.get("write_scope", ())
+            ):
+                return owner
+        return None
+
+    @_synchronized
+    def find_write_owner_for_path(
+        self, relative_path: str, *, exclude_task_id: str = ""
+    ) -> dict[str, Any] | None:
+        for owner in self.active_write_owners():
+            if exclude_task_id and owner.get("task_id") == exclude_task_id:
+                continue
+            if any(
+                path_matches_write_scope(relative_path, scope)
+                for scope in owner.get("write_scope", ())
+            ):
+                return owner
+        return None
+
+    @_synchronized
+    def send_message(
+        self,
+        from_name: str,
+        to_name: str,
+        content: str,
+        *,
+        kind: str = "message",
+        task_id: str = "",
+        status: str = "",
+        report_kind: str = "",
+    ) -> str:
         self.ensure_dirs()
         resolved_to = self.resolve_name(to_name)
         inbox_path = self.inbox_dir / f"{resolved_to}.jsonl"
@@ -538,26 +911,38 @@ class TeamStore:
             "from": from_name or "lead",
             "content": content,
             "timestamp": _now_iso(),
+            "kind": str(kind or "message"),
         }
-        with open(str(inbox_path), "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return f"Message sent to teammate '{display_teammate_name(resolved_to)}'."
+        if task_id:
+            entry["task_id"] = str(task_id)
+        if status:
+            entry["status"] = str(status)
+        if report_kind:
+            entry["report_kind"] = str(report_kind)
+        with self._lock:
+            with open(str(inbox_path), "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        target = "lead" if resolved_to == "lead" else display_teammate_name(resolved_to)
+        return f"Message sent to '{target}'."
 
+    @_synchronized
     def read_inbox(self, name: str, clear: bool = False) -> list[dict[str, Any]]:
         self.ensure_dirs()
         resolved = self.resolve_name(name) if name else "lead"
         inbox_path = self.inbox_dir / f"{resolved}.jsonl"
-        if not inbox_path.is_file():
-            return []
-        try:
-            lines = inbox_path.read_text(encoding="utf-8").strip().splitlines()
-            messages = [json.loads(line) for line in lines if line.strip()]
-        except (json.JSONDecodeError, OSError):
-            return []
-        if clear and messages:
-            inbox_path.write_text("", encoding="utf-8")
-        return messages
+        with self._lock:
+            if not inbox_path.is_file():
+                return []
+            try:
+                lines = inbox_path.read_text(encoding="utf-8").strip().splitlines()
+                messages = [json.loads(line) for line in lines if line.strip()]
+            except (json.JSONDecodeError, OSError):
+                return []
+            if clear and messages:
+                inbox_path.write_text("", encoding="utf-8")
+            return messages
 
+    @_synchronized
     def broadcast(
         self, from_name: str, content: str, teammate_names: list[str] | None = None
     ) -> str:
@@ -578,6 +963,7 @@ class TeamStore:
             sent.append(display_teammate_name(t["name"]))
         return f"Broadcast sent to: {', '.join(sent)}."
 
+    @_synchronized
     def save_thread(self, name: str, messages: list[dict[str, Any]]) -> None:
         self.ensure_dirs()
         resolved = self.resolve_name(name)
@@ -586,6 +972,7 @@ class TeamStore:
             for msg in messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
+    @_synchronized
     def load_thread(self, name: str) -> list[dict[str, Any]]:
         resolved = self.resolve_name(name)
         thread_path = self.threads_dir / f"{resolved}.jsonl"
@@ -669,7 +1056,9 @@ def _now_iso() -> str:
     return datetime.datetime.now().isoformat()
 
 
-class TeamRunner:
+class TeamRunner(SubagentRunner):
+    """Background teammate runner with live transcript and inbox delivery."""
+
     def __init__(
         self,
         parent_agent: Any,
@@ -680,230 +1069,46 @@ class TeamRunner:
         team_store: TeamStore | None = None,
         api_type: str = "anthropic",
         max_tool_calls: int | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+        stop_event: Any = None,
     ):
-        self.parent = parent_agent
-        self.spec = spec
-        self.tool_schemas = tool_schemas
-        self.execute_tool = execute_tool
-        self.compact_tool_result = compact_tool_result or (lambda value: value)
         self.team_store = team_store
-        self.api_type = str(api_type or "anthropic")
-        self.max_tool_calls = max(
-            1,
-            int(max_tool_calls or spec.max_turns * DEFAULT_TEAMMATE_TOOL_CALL_FACTOR),
+        self.stop_event = stop_event
+        super().__init__(
+            parent_agent=parent_agent,
+            spec=spec,
+            tool_schemas=tool_schemas,
+            execute_tool=execute_tool,
+            compact_tool_result=compact_tool_result,
+            max_tool_calls=max_tool_calls
+            or spec.max_turns * DEFAULT_TEAMMATE_TOOL_CALL_FACTOR,
+            event_callback=event_callback,
+            worker_label=f"Teammate '{spec.name}'",
+            before_turn_callback=self._drain_inbox,
+            stop_requested=self._stop_requested,
+            forbidden_tool_names=set(FORBIDDEN_TEAM_TOOL_NAMES) | set(TEAM_TOOL_NAMES),
         )
-        self.tool_calls_used = 0
-        self.allowed_tool_names = set(spec.tool_names)
+        self.allowed_tool_names.add(TEAMMATE_REPORT_TOOL_NAME)
 
-    def run(self, task: str) -> str:
-        history: list[dict[str, Any]] = [{"role": "user", "content": task}]
-        final_response = ""
+    def _stop_requested(self) -> bool:
+        return bool(self.stop_event is not None and self.stop_event.is_set())
 
-        for _round_index in range(1, self.spec.max_turns + 1):
-            if self.api_type == "anthropic":
-                assistant_message, _thinking, text, tool_calls = self._anthropic_turn(
-                    history
-                )
-            elif self.api_type == "ollama":
-                assistant_message, _thinking, text, tool_calls = self._ollama_turn(
-                    history
-                )
-            else:
-                assistant_message, _thinking, text, tool_calls = self._chat_turn(
-                    history
-                )
-
-            history.append(assistant_message)
-            final_response += text
-
-            if not tool_calls:
-                return final_response.strip() or (
-                    f"Teammate '{self.spec.name}' completed without a text summary."
-                )
-
-            if self.tool_calls_used + len(tool_calls) > self.max_tool_calls:
-                return (
-                    f"Teammate '{self.spec.name}' stopped after "
-                    f"{self.max_tool_calls} tool calls."
-                )
-
-            self._append_tool_results(history, tool_calls)
-
-        return (
-            f"Teammate '{self.spec.name}' stopped after "
-            f"{self.spec.max_turns} tool rounds."
-        )
-
-    def _chat_turn(self, history: list[dict[str, Any]]):
-        response = self.parent.client.chat.completions.create(
-            **self.parent._chat_completion_kwargs(
-                messages=self._messages(history),
-                tools=self.tool_schemas,
-            )
-        )
-        message = response.choices[0].message
-        return self.parent._chat_message_parts(message)
-
-    def _ollama_turn(self, history: list[dict[str, Any]]):
-        response = self.parent.client.chat(
-            **self.parent._ollama_chat_kwargs(
-                messages=self._messages(history),
-                tools=self.tool_schemas,
-            )
-        )
-        message = self.parent._get_field(response, "message", {})
-        return self.parent._ollama_message_parts(message)
-
-    def _anthropic_turn(self, history: list[dict[str, Any]]):
-        blocks = []
-        active_block_index = None
-        response = self.parent.client.messages.create(
-            model=self.parent.model,
-            max_tokens=self.parent.max_tokens,
-            temperature=self.parent.temperature,
-            messages=self._anthropic_messages(history),
-            system=self.spec.system_prompt,
-            tools=self.tool_schemas,
-            stream=True,
-            **self.parent._anthropic_request_options(),
-        )
-
-        for chunk in response:
-            chunk_type = self.parent._get_field(chunk, "type", "")
-            if chunk_type == "content_block_start":
-                content_block = self.parent._get_field(chunk, "content_block")
-                block_type = self.parent._get_field(content_block, "type", "")
-                initial_reasoning = self.parent._anthropic_reasoning_text(content_block)
-                if block_type == "text":
-                    if initial_reasoning:
-                        blocks.append({
-                            "type": "thinking",
-                            "thinking": initial_reasoning,
-                        })
-                    block = {"type": "text", "text": ""}
-                elif (
-                    self.parent._is_anthropic_reasoning_block_type(block_type)
-                    or initial_reasoning
-                ):
-                    block = {"type": "thinking", "thinking": initial_reasoning}
-                elif block_type == "tool_use":
-                    block = {
-                        "type": "tool_use",
-                        "id": self.parent._get_field(content_block, "id", "") or "",
-                        "name": self.parent._get_field(content_block, "name", "") or "",
-                        "input": {},
-                        "_input_json": "",
-                    }
-                else:
-                    block = {"type": block_type or "unknown"}
-                blocks.append(block)
-                active_block_index = len(blocks) - 1
+    def _drain_inbox(self) -> list[dict[str, Any]]:
+        if self.team_store is None:
+            return []
+        messages = self.team_store.read_inbox(self.spec.name, clear=True)
+        result = []
+        for message in messages:
+            sender = str(message.get("from") or "lead")
+            content = str(message.get("content") or "").strip()
+            if not content:
                 continue
-
-            if chunk_type == "content_block_delta" and active_block_index is not None:
-                delta = self.parent._get_field(chunk, "delta")
-                delta_type = self.parent._get_field(delta, "type", "")
-                block = blocks[active_block_index]
-                if delta_type == "text_delta":
-                    block["text"] = block.get("text", "") + (
-                        self.parent._get_field(delta, "text", "") or ""
-                    )
-                elif self.parent._is_anthropic_reasoning_delta_type(delta_type):
-                    block["thinking"] = block.get(
-                        "thinking", ""
-                    ) + self.parent._anthropic_delta_reasoning_text(delta)
-                elif delta_type == "signature_delta":
-                    block["signature"] = block.get("signature", "") + (
-                        self.parent._get_field(delta, "signature", "") or ""
-                    )
-                elif delta_type == "input_json_delta":
-                    block["_input_json"] = block.get("_input_json", "") + (
-                        self.parent._get_field(delta, "partial_json", "") or ""
-                    )
-                continue
-
-            if chunk_type == "content_block_stop" and active_block_index is not None:
-                block = blocks[active_block_index]
-                if block.get("type") == "tool_use":
-                    raw_input = block.pop("_input_json", "")
-                    if raw_input:
-                        block["input"] = self.parent._parse_tool_arguments(raw_input)
-                active_block_index = None
-
-        for block in blocks:
-            block.pop("_input_json", None)
-        thinking, text, tool_uses = self.parent._parse_anthropic_blocks(blocks)
-        return {"role": "assistant", "content": blocks}, thinking, text, tool_uses
-
-    def _append_tool_results(
-        self,
-        history: list[dict[str, Any]],
-        tool_calls: list[dict[str, Any]],
-    ) -> None:
-        if self.api_type == "anthropic":
-            results = []
-            for tool_call in tool_calls:
-                result = self._run_tool_call(
-                    tool_call.get("name", ""),
-                    tool_call.get("input", {}),
-                )
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_call.get("id", ""),
-                    "content": result,
-                    "is_error": result.startswith("ERROR:"),
-                })
-            history.append({"role": "user", "content": results})
-            return
-
-        for tool_call in tool_calls:
-            result = self._run_tool_call(
-                tool_call.get("name", ""),
-                tool_call.get("arguments", {}),
-            )
-            if self.api_type == "ollama":
-                history.append(
-                    self.parent._ollama_tool_result_message(
-                        tool_call.get("name", ""), result
-                    )
-                )
-            else:
-                history.append(
-                    self.parent._chat_tool_result_message(
-                        tool_call.get("id", ""),
-                        tool_call.get("name", ""),
-                        result,
-                    )
-                )
-
-    def _run_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
-        self.tool_calls_used += 1
-        if name in FORBIDDEN_TEAM_TOOL_NAMES or name in TEAM_TOOL_NAMES:
-            return f"Team tool '{name}' is not available to teammates."
-        if name not in self.allowed_tool_names:
-            return f"Tool '{name}' is not available to teammate '{self.spec.name}'."
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-        if not isinstance(arguments, dict):
-            arguments = {}
-        result = self.execute_tool(name, arguments)
-        return self.compact_tool_result(str(result or ""))
-
-    def _messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [{"role": "system", "content": self.spec.system_prompt}, *history]
-
-    @staticmethod
-    def _anthropic_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        messages = []
-        for message in history:
-            role = message.get("role")
-            if role in {"user", "assistant"}:
-                messages.append({"role": role, "content": message.get("content", "")})
-        return messages
-
+            result.append({
+                "content": content,
+                "source": sender,
+                "team_message": True,
+            })
+        return result
 
 def compose_teammate_task(
     task: str,
@@ -911,6 +1116,7 @@ def compose_teammate_task(
     expected_output: str | None = None,
     evidence_required: str | None = None,
     scope_limit: str | None = None,
+    write_scope: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     contract = []
     if expected_output:
@@ -919,6 +1125,13 @@ def compose_teammate_task(
         contract.append(f"- Evidence required: {evidence_required}")
     if scope_limit:
         contract.append(f"- Scope limit: {scope_limit}")
+    normalized_scope = [str(item) for item in (write_scope or ()) if str(item)]
+    if normalized_scope:
+        contract.append("- Write scope: " + ", ".join(normalized_scope))
+        contract.append(
+            "- You may use direct file-writing tools only inside the write scope. "
+            "Do not use bash or any other tool to modify files outside it."
+        )
     contract.append(
         "- Final reply must include: conclusion, evidence, risks, and suggested next step."
     )

@@ -237,6 +237,32 @@ def append_subagent_event(entry_id, event):
         bridge.append_subagent_event(entry_id, event)
 
 
+def start_team_entry(entry_id, teammate_name, role="", purpose="", task_id=""):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.start_team_entry(entry_id, teammate_name, role, purpose, task_id)
+
+
+def append_team_event(entry_id, event):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.append_team_event(entry_id, event)
+
+
+def finish_team_entry(entry_id, status, result=""):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.finish_team_entry(entry_id, status, result)
+
+
+def add_team_action_entry(action, summary, details="", status="success", metadata=None):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_team_action_entry(
+            action, summary, details, status, metadata or {}
+        )
+
+
 def start_compaction_entry(entry_id, status, mode="auto"):
     bridge = get_bridge()
     if bridge is not None:

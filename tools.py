@@ -21,6 +21,7 @@ from ui import (
     add_question_entry,
     add_shell_entry,
     add_todo_entry,
+    add_team_action_entry,
     add_web_fetch_entry,
     add_web_search_entry,
     add_write_entry,
@@ -53,7 +54,9 @@ from team import (
     READ_INBOX_TOOL_NAME,
     BROADCAST_TOOL_NAME,
     SHUTDOWN_TEAMMATE_TOOL_NAME,
+    TEAM_TOOL_NAMES,
     display_teammate_name,
+    teammate_has_write_tools,
 )
 
 
@@ -67,6 +70,7 @@ GIT_TIMEOUT_SECONDS = 30
 AGENT_APPROVAL_CONFIRM = "confirm"
 AGENT_APPROVAL_APPROVE = "approve"
 AGENT_APPROVAL_FULL = "full"
+PLAN_SUBAGENT_TYPES = frozenset({"reader", "researcher"})
 PROGRAM_DOC_FILENAMES = ("README.md",)
 PROGRAM_DOC_DEFAULT_MAX_CHARS = 30000
 WEB_FETCH_DEFAULT_MAX_CHARS = 8000
@@ -953,6 +957,7 @@ class AgentTools:
         )
         self.subagent_executor = None
         self.team_executor = None
+        self.team_shutdown_executor = None
         self.team_store = None
         self.team_enabled = False
         self.set_approval_mode(approval_mode)
@@ -1054,9 +1059,39 @@ class AgentTools:
     def set_team_executor(self, executor):
         self.team_executor = executor
 
+    def set_team_shutdown_executor(self, executor):
+        self.team_shutdown_executor = executor
+
     @property
     def subagents_available(self):
         return self.enabled and self.subagent_executor is not None
+
+    def _available_subagent_names(self):
+        names = self.subagent_registry.names(include_aliases=True)
+        if not self.plan_mode:
+            return names
+        return [
+            name
+            for name in names
+            if self.subagent_registry.resolve_name(name) in PLAN_SUBAGENT_TYPES
+        ]
+
+    def _available_subagent_description(self):
+        if not self.plan_mode:
+            return self.subagent_registry.describe()
+        lines = []
+        for name in sorted(PLAN_SUBAGENT_TYPES):
+            spec = self.subagent_registry.get(name)
+            if spec is not None:
+                lines.append(f"- {spec.name}: {spec.description}")
+        aliases = [
+            f"{alias} -> {target}"
+            for alias, target in sorted(self.subagent_registry.aliases().items())
+            if target in PLAN_SUBAGENT_TYPES
+        ]
+        if aliases:
+            lines.append("- aliases: " + ", ".join(aliases))
+        return "\n".join(lines)
 
     def subagent_tool_definitions(self):
         if not self.subagents_available:
@@ -1086,25 +1121,32 @@ class AgentTools:
         ]
 
     def _dispatch_subagent_tool_definition(self):
+        usage = (
+            "Use this for independent research or code reading that would otherwise add "
+            "bulky tool output to the main conversation."
+            if self.plan_mode
+            else
+            "Use this for independent research, code reading, audit, or scoped "
+            "implementation tasks that would otherwise add bulky tool output to the main "
+            "conversation."
+        )
         return {
             "name": DISPATCH_SUBAGENT_TOOL_NAME,
             "description": (
                 "Dispatch a focused subagent with independent history and a restricted "
                 "tool whitelist. The subagent returns one concise summary, which is the "
-                "only content added back to the main context. Use this for independent "
-                "research, code reading, audit, or scoped implementation tasks that would "
-                "otherwise add bulky tool output to the main conversation. For non-trivial "
-                "tasks, actively look for a bounded part that can be delegated early instead "
-                "of doing all exploration in the main context.\n\n"
+                "only content added back to the main context. "
+                f"{usage} For non-trivial tasks, actively look for a bounded part that can "
+                "be delegated early instead of doing all exploration in the main context.\n\n"
                 "Available agent_type values:\n"
-                f"{self.subagent_registry.describe()}"
+                f"{self._available_subagent_description()}"
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "agent_type": {
                         "type": "string",
-                        "enum": self.subagent_registry.names(include_aliases=True),
+                        "enum": self._available_subagent_names(),
                         "description": "The subagent role to dispatch.",
                     },
                     "task": {
@@ -1148,9 +1190,11 @@ class AgentTools:
             "description": (
                 "Spawn a persistent teammate into the agent team and optionally assign an "
                 "immediate task. Teammates have independent contexts and tool whitelists. "
-                "The teammate runs immediately and returns a result. Use this to parallelize "
-                "work across different roles. For non-trivial Build tasks, prefer assigning "
-                "a fitting specialist early rather than keeping all work in the lead agent.\n\n"
+                "The teammate starts as a background task and reports completion to the lead inbox. "
+                "Use list_teammates and read_inbox to coordinate and collect results. Use this to parallelize "
+                "work across different roles. Use implementer for application code and devops "
+                "for CI, Docker, deployment, build, environment, or infrastructure work. "
+                "Writing teammates require an explicit write_scope.\n\n"
                 "Available teammate types:\n"
                 f"{store.describe() if store else ''}"
             ),
@@ -1180,7 +1224,15 @@ class AgentTools:
                     },
                     "scope_limit": {
                         "type": "string",
-                        "description": "Optional hard boundary for the task.",
+                        "description": "Optional natural-language hard boundary for the task.",
+                    },
+                    "write_scope": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Workspace-relative paths or globs reserved for this task. "
+                            "Required for any teammate with file-writing tools."
+                        ),
                     },
                 },
                 "required": ["teammate_type", "task"],
@@ -1237,6 +1289,10 @@ class AgentTools:
                     "clear": {
                         "type": "boolean",
                         "description": "Whether to clear messages after reading. Default false.",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Optionally wait up to 30 seconds for a message before returning.",
                     },
                 },
             },
@@ -1608,7 +1664,19 @@ class AgentTools:
                 return plan_gate_result
             return handler(tool_input)
         except Exception as error:
-            return _error_result(str(error))
+            result = _error_result(str(error))
+            if name in TEAM_TOOL_NAMES:
+                try:
+                    self._set_team_action_display(
+                        name,
+                        f"{name} failed",
+                        str(error),
+                        status="error",
+                        metadata={"error": str(error)},
+                    )
+                except Exception:
+                    self._display_payload = None
+            return result
 
     def consume_display_payload(self):
         payload = self._display_payload
@@ -2447,11 +2515,17 @@ class AgentTools:
             raise AgentToolError("Subagent dispatch is not available.")
         agent_type = _required_string(tool_input, "agent_type")
         task = _required_string(tool_input, "task")
-        if self.subagent_registry.get(agent_type) is None:
+        spec = self.subagent_registry.get(agent_type)
+        if spec is None:
             raise AgentToolError(
                 "Unknown subagent "
                 f"{agent_type!r}. Available: "
-                + ", ".join(self.subagent_registry.names(include_aliases=True))
+                + ", ".join(self._available_subagent_names())
+            )
+        if self.plan_mode and self.subagent_registry.resolve_name(agent_type) not in PLAN_SUBAGENT_TYPES:
+            raise AgentToolError(
+                "Plan mode only allows reader and researcher subagents. "
+                f"Requested: {agent_type!r}."
             )
         return self.subagent_executor(
             agent_type=agent_type,
@@ -2461,6 +2535,33 @@ class AgentTools:
             evidence_required=str(tool_input.get("evidence_required") or "").strip(),
             scope_limit=str(tool_input.get("scope_limit") or "").strip(),
         )
+
+    def _set_team_action_display(
+        self,
+        action,
+        summary,
+        details="",
+        *,
+        status="success",
+        metadata=None,
+    ):
+        self._display_payload = {
+            "kind": "team_action",
+            "action": str(action or "team"),
+            "summary": str(summary or ""),
+            "details": str(details or ""),
+            "status": str(status or "success"),
+            "metadata": dict(metadata or {}),
+        }
+        self._before_visible_output()
+        if not self.suppress_visible_output:
+            add_team_action_entry(
+                self._display_payload["action"],
+                self._display_payload["summary"],
+                self._display_payload["details"],
+                self._display_payload["status"],
+                self._display_payload["metadata"],
+            )
 
     def _spawn_teammate(self, tool_input):
         if not self.team_available:
@@ -2477,58 +2578,138 @@ class AgentTools:
         expected_output = str(tool_input.get("expected_output") or "").strip()
         evidence_required = str(tool_input.get("evidence_required") or "").strip()
         scope_limit = str(tool_input.get("scope_limit") or "").strip()
-        self.team_store.add_teammate(spec.name)
+        raw_write_scope = tool_input.get("write_scope")
+        try:
+            write_scope = self.team_store.normalize_write_scope(raw_write_scope)
+        except ValueError as error:
+            raise AgentToolError(str(error)) from error
+        if teammate_has_write_tools(spec) and not write_scope:
+            raise AgentToolError(
+                f"Teammate '{spec.name}' has file-writing tools and requires a non-empty write_scope."
+            )
         if self.team_executor is None:
             raise AgentToolError("Team executor is not configured.")
-        return self.team_executor(
+        launch = self.team_executor(
             spec=spec,
             task=task,
             purpose=purpose,
             expected_output=expected_output,
             evidence_required=evidence_required,
             scope_limit=scope_limit,
+            write_scope=write_scope,
         )
+        if isinstance(launch, dict):
+            display = launch.get("display")
+            result = str(launch.get("result") or "Teammate task started.")
+            if isinstance(display, dict):
+                self._display_payload = display
+            elif result.startswith("ERROR:"):
+                self._set_team_action_display(
+                    "spawn_teammate",
+                    f"Failed to start {display_teammate_name(spec.name)}",
+                    result,
+                    status="error",
+                    metadata={"teammate_name": spec.name},
+                )
+            return result
+        return str(launch or "Teammate task started.")
 
     def _list_teammates(self, tool_input):
         if not self.team_available:
             raise AgentToolError("Agent team is disabled.")
         roster = self.team_store.get_roster()
         if not roster:
-            return "No active teammates."
+            result = "No active teammates."
+            self._set_team_action_display("list_teammates", result)
+            return result
         lines = []
-        for t in roster:
-            lines.append(
-                f"- {display_teammate_name(t['name'])} ({t.get('role', '?')}) "
-                f"[{t.get('status', 'unknown')}] "
-                f"tasks: {t.get('task_count', 0)}"
+        for teammate in roster:
+            line = (
+                f"- {display_teammate_name(teammate.get('name', ''))} "
+                f"({teammate.get('role', '?')}) [{teammate.get('status', 'unknown')}] "
+                f"tasks: {teammate.get('task_count', 0)}"
             )
-        return "Active teammates:\n" + "\n".join(lines)
+            task_id = str(teammate.get("task_id") or "")
+            if task_id:
+                line += f" task_id={task_id}"
+            lines.append(line)
+        result = "Active teammates:\n" + "\n".join(lines)
+        teammate_count = len(roster)
+        teammate_label = "teammate" if teammate_count == 1 else "teammates"
+        self._set_team_action_display(
+            "list_teammates",
+            f"{teammate_count} active {teammate_label}",
+            result,
+            metadata={"count": len(roster), "roster": roster},
+        )
+        return result
 
     def _send_message(self, tool_input):
         if not self.team_available:
             raise AgentToolError("Agent team is disabled.")
         teammate_name = _required_string(tool_input, "teammate_name")
         message = _required_string(tool_input, "message")
-        return self.team_store.send_message("lead", teammate_name, message)
+        if not self.team_store.is_active(teammate_name):
+            raise AgentToolError(f"No active teammate found: {teammate_name!r}.")
+        result = self.team_store.send_message("lead", teammate_name, message)
+        self._set_team_action_display(
+            "send_message",
+            f"Message sent to {display_teammate_name(teammate_name)}",
+            message,
+            metadata={"target": teammate_name, "message": message},
+        )
+        return result
 
     def _read_inbox(self, tool_input):
         if not self.team_available:
             raise AgentToolError("Agent team is disabled.")
         teammate_name = str(tool_input.get("teammate_name") or "").strip()
         clear = bool(tool_input.get("clear", False))
-        messages = self.team_store.read_inbox(teammate_name, clear=clear)
+        try:
+            wait_seconds = float(tool_input.get("wait_seconds") or 0)
+        except (TypeError, ValueError):
+            wait_seconds = 0
+        wait_seconds = min(30.0, max(0.0, wait_seconds))
+        deadline = time.monotonic() + wait_seconds
+        messages = []
+        while True:
+            messages = self.team_store.read_inbox(teammate_name, clear=clear)
+            if messages or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        mailbox = display_teammate_name(teammate_name) if teammate_name else "lead"
         if not messages:
-            return "Inbox is empty."
-        lines = []
-        for msg in messages:
-            sender = msg.get("from", "?")
-            content = str(msg.get("content", ""))
-            ts = msg.get("timestamp", "?")
-            sender_text = (
-                display_teammate_name(sender) if str(sender) != "lead" else "lead"
+            result = "Inbox is empty."
+            self._set_team_action_display(
+                "read_inbox",
+                "No new messages",
+                metadata={"mailbox": mailbox, "count": 0, "cleared": clear},
             )
-            lines.append(f"[{ts}] {sender_text}: {content}")
-        return "Inbox messages:\n" + "\n".join(lines)
+            return result
+        lines = []
+        for message in messages:
+            sender = message.get("from", "?")
+            content = str(message.get("content", ""))
+            timestamp = message.get("timestamp", "?")
+            sender_text = display_teammate_name(sender) if str(sender) != "lead" else "lead"
+            status = str(message.get("status") or "")
+            suffix = f" [{status}]" if status else ""
+            lines.append(f"[{timestamp}] {sender_text}{suffix}: {content}")
+        result = "Inbox messages:\n" + "\n".join(lines)
+        message_count = len(messages)
+        message_label = "message" if message_count == 1 else "messages"
+        self._set_team_action_display(
+            "read_inbox",
+            f"{message_count} {message_label} from {mailbox}",
+            result,
+            metadata={
+                "mailbox": mailbox,
+                "count": len(messages),
+                "cleared": clear,
+                "messages": messages,
+            },
+        )
+        return result
 
     def _broadcast(self, tool_input):
         if not self.team_available:
@@ -2536,23 +2717,54 @@ class AgentTools:
         message = _required_string(tool_input, "message")
         teammate_names = tool_input.get("teammate_names")
         if teammate_names is not None and not isinstance(teammate_names, list):
-            teammate_names = None
-        return self.team_store.broadcast("lead", message, teammate_names)
+            raise AgentToolError("teammate_names must be an array when provided.")
+        result = self.team_store.broadcast("lead", message, teammate_names)
+        targets = list(teammate_names or [
+            teammate.get("name", "") for teammate in self.team_store.get_roster()
+        ])
+        target_count = len(targets)
+        target_label = "teammate" if target_count == 1 else "teammates"
+        self._set_team_action_display(
+            "broadcast",
+            f"Sent to {target_count} {target_label}" if targets else result,
+            message,
+            metadata={"targets": targets, "message": message},
+        )
+        return result
 
     def _shutdown_teammate(self, tool_input):
         if not self.team_available:
             raise AgentToolError("Agent team is disabled.")
         teammate_name = _required_string(tool_input, "teammate_name")
+        cancellation = ""
+        if self.team_shutdown_executor is not None:
+            cancellation = str(self.team_shutdown_executor(teammate_name) or "")
         removed = self.team_store.remove_teammate(teammate_name)
         if removed:
-            return (
+            result = (
                 "Teammate "
                 f"'{display_teammate_name(teammate_name)}' shutdown and removed from team."
             )
-        return (
+            if cancellation:
+                result += f" {cancellation}"
+            self._set_team_action_display(
+                "shutdown_teammate",
+                f"Shutdown {display_teammate_name(teammate_name)}",
+                result,
+                metadata={"teammate_name": teammate_name, "cancelled": bool(cancellation)},
+            )
+            return result
+        result = (
             "No active teammate found with name "
             f"'{display_teammate_name(teammate_name)}'."
         )
+        self._set_team_action_display(
+            "shutdown_teammate",
+            result,
+            status="warning",
+            metadata={"teammate_name": teammate_name},
+        )
+        return result
 
     def _web_search(self, tool_input):
         if not self.web_search_enabled:
