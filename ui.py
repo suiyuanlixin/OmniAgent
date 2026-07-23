@@ -6,7 +6,7 @@ from rich.console import Console
 from tui.runtime import get_bridge
 
 
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 
 _console_override = threading.local()
 
