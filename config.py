@@ -25,6 +25,7 @@ DEFAULT_API_TYPE = API_TYPE_GLM
 DEFAULT_BASE_URL = ""
 DEFAULT_MODEL = "glm-4.7"
 DEFAULT_MODEL_ALIAS = "Default"
+DEFAULT_PROVIDER = "Default"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_STREAM_MODE = False
@@ -122,6 +123,8 @@ GLOBAL_FIELD_KEYS = {
 
 @dataclass
 class ModelConfig:
+    provider: str = DEFAULT_PROVIDER
+    profile_name: str = DEFAULT_MODEL_ALIAS
     api_type: str = DEFAULT_API_TYPE
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
@@ -234,15 +237,43 @@ class AppConfig:
     def context_window_tokens(self):
         return self.active_model.context_window_tokens
 
+    @property
+    def active_model_label(self):
+        return str(self.active_model.profile_name or "").strip()
+
+    def model_label(self, key):
+        profile = self.model_list.get(str(key or ""))
+        return str(profile.profile_name or "").strip() if profile else ""
+
+    def model_backend_id(self, key):
+        profile = self.model_list.get(str(key or ""))
+        return str(profile.model or "").strip() if profile else ""
+
+    def selected_backend_model(self, value):
+        if normalize_optional_model_selection(value) == AUTO_MODEL_SELECTION:
+            return self.active_model.model
+        return self.model_backend_id(value) or self.active_model.model
+
+    def selected_model_label(self, value):
+        if normalize_optional_model_selection(value) == AUTO_MODEL_SELECTION:
+            return self.active_model_label
+        return self.model_label(value) or self.active_model_label
+
+    def _nested_model_list(self):
+        nested = {}
+        for model in self.model_list.values():
+            nested.setdefault(model.provider, {})[model.profile_name] = model.to_dict()
+        return nested
+
     def to_dict(self):
         return {
             "general": {
                 "render_markdown": self.render_markdown,
             },
-            "model_list": {
-                name: model.to_dict() for name, model in self.model_list.items()
-            },
-            "current_model": self.active_model_name,
+            "model_list": self._nested_model_list(),
+            "current_model": model_profile_reference(
+                self.model_list.get(self.active_model_name)
+            ),
             "agent_mode": {
                 "max_rounds": self.max_agent_rounds,
                 "max_tool_calls": self.max_agent_tool_calls,
@@ -265,10 +296,14 @@ class AppConfig:
                 "enable": self.compaction_enable,
                 "trigger_ratio": self.compaction_trigger_ratio,
                 "keep_recent_messages": self.compaction_keep_recent_messages,
-                "compact_model": self.compaction_compact_model,
+                "compact_model": _optional_model_reference(
+                    self.compaction_compact_model, self.model_list
+                ),
             },
             "memory_system": {
-                "memory_model": self.memory_model,
+                "memory_model": _optional_model_reference(
+                    self.memory_model, self.model_list
+                ),
             },
             "web_search": {
                 "enable": self.web_search_enable,
@@ -314,6 +349,67 @@ def normalize_api_type(api_type):
     return str(api_type or DEFAULT_API_TYPE).strip().lower()
 
 
+def normalize_provider(provider):
+    normalized = str(provider or "").strip()
+    if not normalized:
+        raise ValueError("Provider cannot be empty.")
+    return normalized
+
+
+def model_profile_key(provider, model_name):
+    provider_name = str(provider or "").strip()
+    profile_name = str(model_name or "").strip()
+    if not provider_name or not profile_name:
+        return ""
+    return json.dumps([provider_name, profile_name], ensure_ascii=False, separators=(",", ":"))
+
+
+def model_profile_reference(model_config):
+    if model_config is None:
+        return None
+    return {
+        "provider": str(model_config.provider or "").strip(),
+        "model_name": str(model_config.profile_name or "").strip(),
+    }
+
+
+def _model_reference_key(value, model_list):
+    if not isinstance(value, dict):
+        return ""
+    candidate = model_profile_key(value.get("provider"), value.get("model_name"))
+    return candidate if candidate in model_list else ""
+
+
+def _runtime_model_key(value, model_list):
+    candidate = str(value or "").strip()
+    if candidate in model_list:
+        return candidate
+    return _model_reference_key(value, model_list)
+
+
+def _optional_model_reference(value, model_list):
+    if normalize_optional_model_selection(value) == AUTO_MODEL_SELECTION:
+        return AUTO_MODEL_SELECTION
+    key = _runtime_model_key(value, model_list)
+    if not key:
+        raise ValueError(f"Unknown model profile: {value}")
+    return model_profile_reference(model_list[key])
+
+
+def _config_optional_model_key(value, model_list, field_name):
+    if value is None or (
+        isinstance(value, str) and value.strip().lower() == AUTO_MODEL_SELECTION
+    ):
+        return AUTO_MODEL_SELECTION
+    key = _model_reference_key(value, model_list)
+    if not key:
+        raise ValueError(
+            f"{field_name} must be auto or contain provider and model_name "
+            "for an existing model."
+        )
+    return key
+
+
 def requires_api_key(api_type):
     return normalize_api_type(api_type) != API_TYPE_OLLAMA
 
@@ -328,6 +424,10 @@ def _normalize_base_url(api_type, base_url):
 
 
 def normalize_optional_model_selection(value):
+    if isinstance(value, dict):
+        provider = str(value.get("provider") or "").strip()
+        model_name = str(value.get("model_name") or "").strip()
+        return model_profile_key(provider, model_name) or AUTO_MODEL_SELECTION
     normalized = str(value or "").strip()
     if not normalized:
         return AUTO_MODEL_SELECTION
@@ -560,8 +660,16 @@ def _model_defaults():
     return ModelConfig()
 
 
-def _sanitize_model_config(data):
+def _sanitize_model_config(data, *, provider, profile_name):
     data = dict(data or {})
+    if "provider" in data or "profile_name" in data:
+        raise ValueError(
+            "Provider and model name must be declared by model_list.<provider>.<model_name>."
+        )
+    provider = normalize_provider(provider)
+    profile_name = str(profile_name or "").strip()
+    if not profile_name:
+        raise ValueError("Model profile name cannot be empty.")
     api_type = normalize_api_type(data.get("api_type", DEFAULT_API_TYPE))
     if api_type not in SUPPORTED_API_TYPES:
         api_type = DEFAULT_API_TYPE
@@ -603,6 +711,8 @@ def _sanitize_model_config(data):
     else:
         extra_modalities = normalize_extra_modalities(raw_extra_modalities)
     return ModelConfig(
+        provider=provider,
+        profile_name=profile_name,
         api_type=api_type,
         base_url=base_url,
         model=model_name,
@@ -624,15 +734,36 @@ def _default_config():
 def _sanitize_config(data):
     data = dict(data or {})
     raw_models = data.get("model_list", {})
+    if not isinstance(raw_models, dict):
+        raise ValueError("model_list must be an object grouped by Provider.")
     model_list = {}
-    if isinstance(raw_models, dict):
-        for name, model_data in raw_models.items():
-            model_name = str(name or "").strip()
-            if not model_name:
-                continue
-            model_list[model_name] = _sanitize_model_config(model_data)
-    current_model = str(data.get("current_model") or "").strip()
-    if current_model not in model_list:
+    for provider, provider_models in raw_models.items():
+        provider = normalize_provider(provider)
+        if not isinstance(provider_models, dict):
+            raise ValueError(f"model_list.{provider} must be an object.")
+        for profile_name, profile_data in provider_models.items():
+            profile_name = str(profile_name or "").strip()
+            if not profile_name:
+                raise ValueError(f"model_list.{provider} contains an empty model name.")
+            if not isinstance(profile_data, dict):
+                raise ValueError(
+                    f"model_list.{provider}.{profile_name} must be an object."
+                )
+            profile = _sanitize_model_config(
+                profile_data,
+                provider=provider,
+                profile_name=profile_name,
+            )
+            key = model_profile_key(provider, profile_name)
+            model_list[key] = profile
+
+    raw_current_model = data.get("current_model")
+    current_model = _model_reference_key(raw_current_model, model_list)
+    if raw_current_model is not None and model_list and not current_model:
+        raise ValueError(
+            "current_model must contain provider and model_name for an existing model."
+        )
+    if not current_model:
         current_model = next(iter(model_list.keys()), "")
 
     agent_config = data.get("agent_mode", {})
@@ -751,11 +882,15 @@ def _sanitize_config(data):
         ),
         compaction_trigger_ratio=compaction_trigger_ratio,
         compaction_keep_recent_messages=compaction_keep_recent_messages,
-        compaction_compact_model=normalize_optional_model_selection(
-            compaction_config.get("compact_model")
+        compaction_compact_model=_config_optional_model_key(
+            compaction_config.get("compact_model"),
+            model_list,
+            "auto_compact.compact_model",
         ),
-        memory_model=normalize_optional_model_selection(
-            memory_config.get("memory_model")
+        memory_model=_config_optional_model_key(
+            memory_config.get("memory_model"),
+            model_list,
+            "memory_system.memory_model",
         ),
         render_markdown=_parse_bool(
             general_config.get("render_markdown"), DEFAULT_RENDER_MARKDOWN
@@ -810,73 +945,65 @@ def save_config_field(key, value):
     save_config_fields({key: value})
 
 
-def add_model_profile(name, source_name=""):
-    config = _load_existing_config()
-    model_name = str(name or "").strip()
-    if not model_name:
-        raise ValueError("Model profile name cannot be empty.")
-    if model_name in config.model_list:
-        raise ValueError(f"Model profile already exists: {model_name}")
-
-    source_key = str(source_name or "").strip()
-    if source_key and source_key in config.model_list:
-        source_model = config.model_list[source_key]
-    else:
-        source_model = config.active_model
-
-    config.model_list[model_name] = _sanitize_model_config(source_model.to_dict())
-    config.current_model = model_name
-    _persist_config(_sanitize_config(config.to_dict()))
-    return model_name
-
-
 def add_model_profile_with_config(name, model_config):
     config = _load_existing_config()
     model_name = str(name or "").strip()
     if not model_name:
         raise ValueError("Model profile name cannot be empty.")
-    if model_name in config.model_list:
-        raise ValueError(f"Model profile already exists: {model_name}")
+    payload = dict(model_config or {})
+    provider = normalize_provider(payload.pop("provider", None))
+    key = model_profile_key(provider, model_name)
+    if key in config.model_list:
+        raise ValueError(f"Model profile already exists: {provider}/{model_name}")
 
-    config.model_list[model_name] = _sanitize_model_config(dict(model_config or {}))
-    config.current_model = model_name
+    config.model_list[key] = _sanitize_model_config(
+        payload, provider=provider, profile_name=model_name
+    )
+    config.current_model = key
     _persist_config(_sanitize_config(config.to_dict()))
-    return model_name
+    return key
 
 
 def delete_model_profile(name):
     config = _load_existing_config()
-    model_name = str(name or "").strip()
-    if not model_name:
-        raise ValueError("Model profile name cannot be empty.")
-    if model_name not in config.model_list:
-        raise ValueError(f"Model profile not found: {model_name}")
-    del config.model_list[model_name]
-    if config.current_model == model_name:
+    key = _runtime_model_key(name, config.model_list)
+    if not key:
+        raise ValueError(f"Model profile not found: {name}")
+    del config.model_list[key]
+    if config.current_model == key:
         config.current_model = next(iter(config.model_list.keys()), "")
+    if config.compaction_compact_model == key:
+        config.compaction_compact_model = AUTO_MODEL_SELECTION
+    if config.memory_model == key:
+        config.memory_model = AUTO_MODEL_SELECTION
     _persist_config(_sanitize_config(config.to_dict()))
 
 
 def rename_model_profile(old_name, new_name):
     config = _load_existing_config()
-    old_key = str(old_name or "").strip()
-    new_key = str(new_name or "").strip()
-    if not old_key or not new_key:
+    old_key = _runtime_model_key(old_name, config.model_list)
+    new_profile_name = str(new_name or "").strip()
+    if not old_key or not new_profile_name:
         raise ValueError("Model profile name cannot be empty.")
-    if old_key not in config.model_list:
-        raise ValueError(f"Model profile not found: {old_key}")
+    profile = config.model_list[old_key]
+    new_key = model_profile_key(profile.provider, new_profile_name)
     if new_key != old_key and new_key in config.model_list:
-        raise ValueError(f"Model profile already exists: {new_key}")
-
+        raise ValueError(
+            f"Model profile already exists: {profile.provider}/{new_profile_name}"
+        )
     if new_key == old_key:
         return new_key
 
+    profile.profile_name = new_profile_name
     config.model_list[new_key] = config.model_list.pop(old_key)
     if config.current_model == old_key:
         config.current_model = new_key
+    if config.compaction_compact_model == old_key:
+        config.compaction_compact_model = new_key
+    if config.memory_model == old_key:
+        config.memory_model = new_key
     _persist_config(_sanitize_config(config.to_dict()))
     return new_key
-
 
 def save_config_fields(fields):
     config = _load_existing_config()
@@ -935,10 +1062,10 @@ def save_config_fields(fields):
             raise ValueError(f"Unknown config key: {key}")
 
         if key == "current_model":
-            value = str(value or "").strip()
-            if value not in config.model_list:
+            model_key = _runtime_model_key(value, config.model_list)
+            if not model_key:
                 raise ValueError(f"Unknown model profile: {value}")
-            config.current_model = value
+            config.current_model = model_key
         elif key == "max_agent_rounds":
             config.max_agent_rounds = parse_agent_rounds(value)
         elif key == "max_agent_tool_calls":
@@ -970,9 +1097,23 @@ def save_config_fields(fields):
                 parse_compaction_keep_recent_messages(value)
             )
         elif key == "compaction_compact_model":
-            config.compaction_compact_model = normalize_optional_model_selection(value)
+            normalized = normalize_optional_model_selection(value)
+            config.compaction_compact_model = (
+                AUTO_MODEL_SELECTION
+                if normalized == AUTO_MODEL_SELECTION
+                else _runtime_model_key(value, config.model_list)
+            )
+            if not config.compaction_compact_model:
+                raise ValueError(f"Unknown model profile: {value}")
         elif key == "memory_model":
-            config.memory_model = normalize_optional_model_selection(value)
+            normalized = normalize_optional_model_selection(value)
+            config.memory_model = (
+                AUTO_MODEL_SELECTION
+                if normalized == AUTO_MODEL_SELECTION
+                else _runtime_model_key(value, config.model_list)
+            )
+            if not config.memory_model:
+                raise ValueError(f"Unknown model profile: {value}")
         elif key == "render_markdown":
             config.render_markdown = _parse_bool(value, config.render_markdown)
         elif key == "web_search_enable":

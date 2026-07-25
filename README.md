@@ -79,21 +79,26 @@ python main.py
     "render_markdown": true
   },
   "model_list": {
-    "DeepSeek-V4-Pro": {
-      "api_type": "openai",
-      "base_url": "https://api.deepseek.com",
-      "model": "deepseek-v4-pro",
-      "api_key": "sk-xxxxxxxx",
-      "max_tokens": 32000,
-      "temperature": 1,
-      "stream_mode": true,
-      "thinking_mode": true,
-      "reasoning_effort": "max",
-      "extra_modalities": [],
-      "context_window_tokens": 1000000
+    "DeepSeek": {
+      "DeepSeek V4 Pro": {
+        "api_type": "openai",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-v4-pro",
+        "api_key": "sk-xxxxxxxx",
+        "max_tokens": 32000,
+        "temperature": 1,
+        "stream_mode": true,
+        "thinking_mode": true,
+        "reasoning_effort": "max",
+        "extra_modalities": [],
+        "context_window_tokens": 1000000
+      }
     }
   },
-  "current_model": "DeepSeek-V4-Pro",
+  "current_model": {
+    "provider": "DeepSeek",
+    "model_name": "DeepSeek V4 Pro"
+  },
   "agent_mode": {
     "max_rounds": 150,
     "max_tool_calls": 500,
@@ -110,7 +115,7 @@ python main.py
       "workspace": false
     },
     "auto_catalog": true,
-    "max_skill_chars": 32000
+    "max_skill_chars": 64000
   },
   "auto_compact": {
     "enable": true,
@@ -136,7 +141,8 @@ python main.py
 
 - `general.render_markdown`：是否将回答按 Markdown 渲染到聊天区。
 - `model_list`：模型档案集合，可配置多个 profile。
-- `current_model`：当前启用的模型档案名。
+- `model_list.<provider>.<model_name>`：Provider 和模型档案名构成两级结构，允许不同 Provider 使用相同模型名。
+- `current_model`：使用 `{"provider": "...", "model_name": "..."}` 引用当前模型。
 - `api_type`：支持 `glm`、`anthropic`、`openai`、`gemini`、`ollama`。
 - `base_url`：兼容端点地址。`gemini` 留空时自动使用官方 OpenAI 兼容地址；`ollama` 留空时走本地默认服务。
 - `thinking_mode` 与 `reasoning_effort`：控制推理内容显示与强度。
@@ -146,8 +152,8 @@ python main.py
 - `agent_mode.agent_team.enable`：是否启用 Team 模式。
 - `skills.sources.app`：是否加载程序目录 `skills/`。
 - `skills.sources.workspace`：是否加载工作区 `.omniagent/skills/`。
-- `auto_compact.compact_model`：上下文压缩模型，`auto` 表示跟随当前模型。
-- `memory_system.memory_model`：记忆写入模型，`auto` 表示跟随当前模型。
+- `auto_compact.compact_model`：上下文压缩模型，使用同样的 Provider/Model 引用对象，`auto` 表示跟随当前模型。
+- `memory_system.memory_model`：记忆写入模型，使用同样的 Provider/Model 引用对象，`auto` 表示跟随当前模型。
 - `web_search.provider`：当前仅支持 `tavily`。
 
 `reasoning_effort` 的有效值按提供商不同：

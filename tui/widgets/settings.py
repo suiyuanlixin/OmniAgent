@@ -482,7 +482,7 @@ class SettingsModal(ModalScreen[None]):
         background: $INFO_BAR_BACKGROUND;
         color: $TEXT_PRIMARY;
         padding: 0 1;
-        margin: 0;
+        margin: 0 0 0 1;
     }
 
     .settings-modalities-add,
@@ -823,11 +823,11 @@ class SettingsModal(ModalScreen[None]):
         self._model_groups: list[dict] = []
         self._model_sidebar_content_rows: int = 0
         self._show_model_group_titles: bool = True
-        self._collapsed_model_api_types: set[str] = set()
+        self._collapsed_model_groups: set[str] = set()
         self._add_model_draft: dict[str, object] = {}
         self._editing_row_index: int | None = None
         self._select_open_index: int | None = None
-        self._select_group_toggle_api_types: dict[str, str] = {}
+        self._select_group_toggle_keys: dict[str, str] = {}
         self._select_group_toggle_list_ids: dict[str, str] = {}
         self._collapsed_select_groups: dict[str, set[str]] = {}
         self._render_generation: int = 0
@@ -960,7 +960,7 @@ class SettingsModal(ModalScreen[None]):
             group = self._model_groups[group_index]
             if not bool(group.get("allow_collapse", True)):
                 return
-            api_type = str(group.get("api_type") or "")
+            group_key = str(group.get("group_key") or "")
             list_id = str(group.get("list_id") or "")
             if not list_id:
                 return
@@ -970,13 +970,13 @@ class SettingsModal(ModalScreen[None]):
                 return
             if lst.has_class("hidden"):
                 lst.remove_class("hidden")
-                self._collapsed_model_api_types.discard(api_type)
+                self._collapsed_model_groups.discard(group_key)
             else:
                 lst.add_class("hidden")
-                self._collapsed_model_api_types.add(api_type)
+                self._collapsed_model_groups.add(group_key)
             visible = 0
             for g in self._model_groups:
-                if str(g.get("api_type") or "") not in self._collapsed_model_api_types:
+                if str(g.get("group_key") or "") not in self._collapsed_model_groups:
                     visible += int(g.get("count") or 0)
             header_rows = (
                 len(self._model_groups) if self._show_model_group_titles else 0
@@ -1139,16 +1139,16 @@ class SettingsModal(ModalScreen[None]):
             return
 
         if control_id.startswith("settings-select-group-toggle-"):
-            api_type = self._select_group_toggle_api_types.get(control_id)
+            group_key = self._select_group_toggle_keys.get(control_id)
             list_id = self._select_group_toggle_list_ids.get(control_id)
             parsed = self._parse_select_group_indices(control_id)
-            if api_type is None or list_id is None or parsed is None:
+            if group_key is None or list_id is None or parsed is None:
                 return
             row_index, _group_index = parsed
             rows = self._visible_rows()
             if row_index < 0 or row_index >= len(rows):
                 return
-            self._toggle_select_group(rows[row_index], api_type, list_id)
+            self._toggle_select_group(rows[row_index], group_key, list_id)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "settings-search":
@@ -1541,28 +1541,28 @@ class SettingsModal(ModalScreen[None]):
         keywords = str(row.get("keywords") or "")
         return f"{page_id}:{name}:{keywords}"
 
-    def _collapsed_select_api_types(self, row: dict) -> set[str]:
+    def _collapsed_select_group_keys(self, row: dict) -> set[str]:
         key = self._select_group_state_key(row)
         collapsed = self._collapsed_select_groups.setdefault(key, set())
         return set(collapsed)
 
-    def _set_collapsed_select_api_types(self, row: dict, values: set[str]) -> None:
+    def _set_collapsed_select_group_keys(self, row: dict, values: set[str]) -> None:
         key = self._select_group_state_key(row)
         self._collapsed_select_groups[key] = set(values)
 
-    def _toggle_select_group(self, row: dict, api_type: str, list_id: str) -> None:
+    def _toggle_select_group(self, row: dict, group_key: str, list_id: str) -> None:
         try:
             group_list = self.query_one(f"#{list_id}", Vertical)
         except Exception:
             return
-        collapsed = self._collapsed_select_api_types(row)
+        collapsed = self._collapsed_select_group_keys(row)
         if group_list.has_class("hidden"):
             group_list.remove_class("hidden")
-            collapsed.discard(api_type)
+            collapsed.discard(group_key)
         else:
             group_list.add_class("hidden")
-            collapsed.add(api_type)
-        self._set_collapsed_select_api_types(row, collapsed)
+            collapsed.add(group_key)
+        self._set_collapsed_select_group_keys(row, collapsed)
 
     def _disabled_option_values(self, row: dict) -> set[str]:
         return {str(value) for value in list(row.get("disabled_options") or [])}
@@ -1859,16 +1859,16 @@ class SettingsModal(ModalScreen[None]):
             child.remove()
 
         if not groups and all_model_names:
-            groups = [{"api_type": "", "title": "Models", "models": all_model_names}]
+            groups = [{"provider": "", "title": "Models", "models": all_model_names}]
 
-        selected_api_type = ""
+        selected_group_key = ""
         for group in groups:
-            api_type = str(group.get("api_type") or "")
+            group_key = str(group.get("provider") or "")
             if self._selected_model_name in list(group.get("models") or []):
-                selected_api_type = api_type
+                selected_group_key = group_key
                 break
-        if selected_api_type:
-            self._collapsed_model_api_types.discard(selected_api_type)
+        if selected_group_key:
+            self._collapsed_model_groups.discard(selected_group_key)
 
         self._model_groups = []
         self._current_model_names = []
@@ -1876,8 +1876,8 @@ class SettingsModal(ModalScreen[None]):
         header_count = 0
 
         for group_index, group in enumerate(groups):
-            api_type = str(group.get("api_type") or "")
-            title = str(group.get("title") or "") or (api_type or "Other")
+            group_key = str(group.get("provider") or "")
+            title = str(group.get("title") or "") or (group_key or "Other")
             group_models = [str(name) for name in list(group.get("models") or [])]
             if show_group_titles:
                 header_count += 1
@@ -1895,11 +1895,11 @@ class SettingsModal(ModalScreen[None]):
                 )
             group_list_id = self._model_group_list_id(group_index)
             group_list_classes = "settings-model-group-list"
-            if allow_group_collapse and api_type in self._collapsed_model_api_types:
+            if allow_group_collapse and group_key in self._collapsed_model_groups:
                 group_list_classes += " hidden"
             group_list = Vertical(id=group_list_id, classes=group_list_classes)
             self._model_groups.append({
-                "api_type": api_type,
+                "group_key": group_key,
                 "list_id": group_list_id,
                 "count": len(group_models),
                 "allow_collapse": allow_group_collapse,
@@ -1914,7 +1914,7 @@ class SettingsModal(ModalScreen[None]):
                 if model_name == self._selected_model_name:
                     classes += " selected"
                 if (not allow_group_collapse) or (
-                    api_type not in self._collapsed_model_api_types
+                    group_key not in self._collapsed_model_groups
                 ):
                     visible_model_count += 1
                 flat_index = len(self._current_model_names)
@@ -1992,19 +1992,19 @@ class SettingsModal(ModalScreen[None]):
             select_groups = self._select_groups(row)
             grouped_select = bool(row.get("option_groups"))
             selected_value = str(row.get("value") or "")
-            collapsed_api_types = self._collapsed_select_api_types(row)
-            selected_api_type = ""
+            collapsed_group_keys = self._collapsed_select_group_keys(row)
+            selected_group_key = ""
             for group in select_groups:
-                group_api_type = str(group.get("api_type") or "")
+                group_key = str(group.get("provider") or "")
                 for _label, opt_value in list(group.get("options") or []):
                     if str(opt_value) == selected_value:
-                        selected_api_type = group_api_type
+                        selected_group_key = group_key
                         break
-                if selected_api_type:
+                if selected_group_key:
                     break
-            if selected_api_type:
-                collapsed_api_types.discard(selected_api_type)
-                self._set_collapsed_select_api_types(row, collapsed_api_types)
+            if selected_group_key:
+                collapsed_group_keys.discard(selected_group_key)
+                self._set_collapsed_select_group_keys(row, collapsed_group_keys)
             option_width = max(
                 (
                     len(str(label))
@@ -2022,9 +2022,9 @@ class SettingsModal(ModalScreen[None]):
             )
             option_width = max(option_width, len(display_value)) + 2
             flat_option_index = 0
-            self._select_group_toggle_api_types = {
+            self._select_group_toggle_keys = {
                 key: value
-                for key, value in self._select_group_toggle_api_types.items()
+                for key, value in self._select_group_toggle_keys.items()
                 if not key.startswith(
                     f"settings-select-group-toggle-{self._render_generation}-{row_index}-"
                 )
@@ -2038,7 +2038,7 @@ class SettingsModal(ModalScreen[None]):
             }
             for group_index, group in enumerate(select_groups):
                 title = str(group.get("title") or "")
-                api_type = str(group.get("api_type") or "")
+                group_key = str(group.get("provider") or "")
                 if grouped_select and title:
                     if group_index > 0:
                         option_widgets.append(
@@ -2049,7 +2049,7 @@ class SettingsModal(ModalScreen[None]):
                         )
                     toggle_id = self._select_group_toggle_id(row_index, group_index)
                     list_id = self._select_group_list_id(row_index, group_index)
-                    self._select_group_toggle_api_types[toggle_id] = api_type
+                    self._select_group_toggle_keys[toggle_id] = group_key
                     self._select_group_toggle_list_ids[toggle_id] = list_id
                     option_widgets.append(
                         _SelectGroupToggle(
@@ -2059,7 +2059,7 @@ class SettingsModal(ModalScreen[None]):
                         )
                     )
                     list_classes = "settings-select-group-list"
-                    if api_type in collapsed_api_types:
+                    if group_key in collapsed_group_keys:
                         list_classes += " hidden"
                     group_list_children = []
                     for label, opt_value in list(group.get("options") or []):
@@ -2363,6 +2363,7 @@ class SettingsModal(ModalScreen[None]):
 
     def _begin_add_model(self, source_name: str = "") -> None:
         self._add_model_draft = {
+            "provider": "",
             "name": "",
             "api_type": API_TYPE_OLLAMA,
             "base_url": "",
@@ -2412,6 +2413,13 @@ class SettingsModal(ModalScreen[None]):
         if current_effort not in {value for _, value in reasoning_choices}:
             current_effort = "medium"
         rows = [
+            {
+                "name": "Provider",
+                "value": str(draft.get("provider") or ""),
+                "keywords": "provider",
+                "edit_type": "input",
+                "on_change": lambda v: self._set_add_model_field("provider", str(v)),
+            },
             {
                 "name": "Name",
                 "value": str(draft.get("name") or ""),
@@ -2534,6 +2542,10 @@ class SettingsModal(ModalScreen[None]):
         if self.app_ref is None:
             return ""
         draft = dict(self._add_model_draft or {})
+        provider = str(draft.get("provider") or "").strip()
+        if not provider:
+            self.app_ref.add_status_message("[!]", "Provider cannot be empty.")
+            return ""
         name = str(draft.get("name") or "").strip()
         if not name:
             self.app_ref.add_status_message("[!]", "Model name cannot be empty.")
@@ -2548,6 +2560,7 @@ class SettingsModal(ModalScreen[None]):
         context_tokens = str(draft.get("context_window_tokens") or "").strip()
         temperature = str(draft.get("temperature") or "").strip()
         payload = {
+            "provider": provider,
             "api_type": str(draft.get("api_type") or API_TYPE_OLLAMA),
             "base_url": str(draft.get("base_url") or ""),
             "model": str(draft.get("model") or ""),

@@ -25,7 +25,6 @@ from config import (
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
     AUTO_MODEL_SELECTION,
-    add_model_profile,
     delete_model_profile,
     format_extra_modalities,
     load_config,
@@ -477,13 +476,16 @@ class AgentTUIApp(App):
 
     def _model_profile_choices(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = [(AUTO_MODEL_SELECTION, AUTO_MODEL_SELECTION)]
-        options.extend((name, name) for name in self.config.model_list.keys())
+        options.extend(
+            (profile.profile_name, key)
+            for key, profile in self.config.model_list.items()
+        )
         return options
 
     def _optional_model_choice_groups(self) -> list[dict]:
         groups = [
             {
-                "api_type": "auto",
+                "provider": "auto",
                 "title": "Auto",
                 "models": [AUTO_MODEL_SELECTION],
                 "options": [(AUTO_MODEL_SELECTION, AUTO_MODEL_SELECTION)],
@@ -500,34 +502,23 @@ class AgentTUIApp(App):
             return normalized
         return AUTO_MODEL_SELECTION
 
-    def _api_type_title(self, api_type: str) -> str:
-        api_type = str(api_type or "").strip().lower()
-        titles = {
-            API_TYPE_OLLAMA: "Ollama",
-            API_TYPE_OPENAI: "OpenAI",
-            API_TYPE_ANTHROPIC: "Anthropic",
-            API_TYPE_GEMINI: "Gemini",
-            API_TYPE_GLM: "GLM",
-        }
-        if api_type in titles:
-            return titles[api_type]
-        return (api_type or "Other").title()
-
     def _grouped_model_choices(self) -> list[dict]:
         grouped: dict[str, list[tuple[str, str]]] = {}
-        for model_name, profile in self.config.model_list.items():
-            api_type = str(getattr(profile, "api_type", "") or "").strip().lower()
-            grouped.setdefault(api_type, []).append((str(model_name), str(model_name)))
+        for model_key, profile in self.config.model_list.items():
+            provider = str(getattr(profile, "provider", "") or "").strip() or "Other"
+            grouped.setdefault(provider, []).append(
+                (str(profile.profile_name), str(model_key))
+            )
         groups = [
             {
-                "api_type": api_type,
-                "title": self._api_type_title(api_type),
+                "provider": provider,
+                "title": provider,
                 "models": [
                     value for _, value in sorted(options, key=lambda x: x[0].lower())
                 ],
                 "options": sorted(options, key=lambda x: x[0].lower()),
             }
-            for api_type, options in grouped.items()
+            for provider, options in grouped.items()
         ]
         groups.sort(key=lambda g: str(g.get("title") or "").lower())
         return groups
@@ -1723,7 +1714,10 @@ class AgentTUIApp(App):
             chat_input = self.query_one("#chat-input", ChatInput)
         except NoMatches:
             return
-        model_options = [(name, name) for name in self.config.model_list.keys()]
+        model_options = [
+            (profile.profile_name, key)
+            for key, profile in self.config.model_list.items()
+        ]
         chat_input.set_model_options(
             model_options,
             self.config.current_model,
@@ -2094,7 +2088,6 @@ class AgentTUIApp(App):
                 "show_search": False,
                 "state": self._settings_model_page_state,
                 "on_select_model": self._on_setting_model_changed,
-                "on_add_model": self._on_setting_add_model,
             },
             "agent_mode": {
                 "title": "Agent mode",
@@ -2245,7 +2238,7 @@ class AgentTUIApp(App):
         ]
 
     def _settings_model_page_state(self, selected_name: str = "") -> dict:
-        models = [name for name in self.config.model_list.keys()]
+        models = list(self.config.model_list.keys())
         current_model = (
             self.config.current_model if self.config.current_model in models else ""
         )
@@ -2266,6 +2259,10 @@ class AgentTUIApp(App):
             "models": models,
             "groups": self._grouped_model_choices(),
             "selected_model": current_model,
+            "item_labels": {
+                key: profile.profile_name
+                for key, profile in self.config.model_list.items()
+            },
             "rows": self._settings_model_rows(),
             "footer_actions": [
                 {
@@ -2291,14 +2288,28 @@ class AgentTUIApp(App):
 
         rows = [
             {
-                "name": "API type",
-                "value": self._api_type_title(active_model.api_type),
-                "keywords": "api_type",
+                "name": "Provider",
+                "value": active_model.provider,
+                "keywords": "provider",
                 "edit_type": "none",
             },
             {
+                "name": "API type",
+                "value": active_model.api_type,
+                "keywords": "api_type",
+                "edit_type": "select",
+                "options": [
+                    ("Ollama", API_TYPE_OLLAMA),
+                    ("OpenAI", API_TYPE_OPENAI),
+                    ("Anthropic", API_TYPE_ANTHROPIC),
+                    ("Gemini", API_TYPE_GEMINI),
+                    ("GLM", API_TYPE_GLM),
+                ],
+                "on_change": lambda v: self._on_setting_model_api_type_changed(v),
+            },
+            {
                 "name": "Model name",
-                "value": self.config.current_model,
+                "value": active_model.profile_name,
                 "keywords": "model name rename",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_model_name_changed(v),
@@ -3587,19 +3598,6 @@ class AgentTUIApp(App):
     def _open_memory(self) -> None:
         self.push_screen(MemoryModal(self._memory_sections()))
 
-    def _on_setting_add_model(self, model_name: str, source_name: str = "") -> str:
-        model_name = str(model_name or "").strip()
-        if not model_name:
-            return ""
-        try:
-            created_name = add_model_profile(model_name, source_name)
-        except Exception as error:
-            self.add_status_message("[✗]", f"新增模型失败: {error}")
-            return ""
-        self._reload_config()
-        self._sync_chat_from_active_model()
-        self._apply_config_to_controls()
-        return created_name
 
     def _on_setting_delete_current_model(self) -> None:
         name = str(self.config.current_model or "").strip()
@@ -4023,8 +4021,18 @@ class AgentTUIApp(App):
             compaction_enable=self.config.compaction_enable,
             compaction_trigger_ratio=self.config.compaction_trigger_ratio,
             compaction_keep_recent_messages=self.config.compaction_keep_recent_messages,
-            compaction_compact_model=self.config.compaction_compact_model,
-            memory_model=self.config.memory_model,
+            compaction_compact_model=(
+                AUTO_MODEL_SELECTION
+                if self.config.compaction_compact_model == AUTO_MODEL_SELECTION
+                else self.config.selected_backend_model(
+                    self.config.compaction_compact_model
+                )
+            ),
+            memory_model=(
+                AUTO_MODEL_SELECTION
+                if self.config.memory_model == AUTO_MODEL_SELECTION
+                else self.config.selected_backend_model(self.config.memory_model)
+            ),
             web_search_enabled=self.config.web_search_enable,
             web_search_provider=self.config.web_search_provider,
             web_search_api_key=self.config.web_search_api_key,
@@ -4033,7 +4041,7 @@ class AgentTUIApp(App):
             web_search_topic=self.config.web_search_topic,
             agent_plan_enabled=self.config.agent_plan_enable,
             agent_team_enable=self.config.agent_team_enable,
-            current_model_name=self.config.active_model_name,
+            current_model_name=self.config.active_model_label,
             history_path=session_record.get("history_path"),
         )
         return chat
@@ -4416,8 +4424,10 @@ class AgentTUIApp(App):
         if not text:
             return ""
         model_name_by_id = {
-            str(getattr(profile, "model", "") or "").strip(): str(name or "").strip()
-            for name, profile in self.config.model_list.items()
+            str(getattr(profile, "model", "") or "").strip(): str(
+                profile.profile_name or ""
+            ).strip()
+            for profile in self.config.model_list.values()
             if str(getattr(profile, "model", "") or "").strip()
         }
         lines: list[str] = []

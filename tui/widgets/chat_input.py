@@ -1125,8 +1125,8 @@ class ChatInput(Widget):
         self._model_button_values: dict[str, str] = {}
         self._model_dropdown_serial = 0
         self._model_option_groups: list[dict[str, object]] = []
-        self._collapsed_model_api_types: set[str] = set()
-        self._model_group_button_api_types: dict[str, str] = {}
+        self._collapsed_model_groups: set[str] = set()
+        self._model_group_button_keys: dict[str, str] = {}
         self._model_group_button_list_ids: dict[str, str] = {}
         self._prompt_question = ""
         self._prompt_options: list[tuple[str, str, bool]] = []
@@ -1429,7 +1429,7 @@ class ChatInput(Widget):
         self._close_all_dropdowns()
 
     def _toggle_model_group(self, button_id: str) -> None:
-        api_type = self._model_group_button_api_types.get(button_id, "")
+        group_key = self._model_group_button_keys.get(button_id, "")
         list_id = self._model_group_button_list_ids.get(button_id, "")
         if not list_id:
             return
@@ -1439,10 +1439,10 @@ class ChatInput(Widget):
             return
         if group_list.has_class("hidden"):
             group_list.remove_class("hidden")
-            self._collapsed_model_api_types.discard(api_type)
+            self._collapsed_model_groups.discard(group_key)
         else:
             group_list.add_class("hidden")
-            self._collapsed_model_api_types.add(api_type)
+            self._collapsed_model_groups.add(group_key)
 
     def on_text_area_changed(self, event) -> None:
         text_area = getattr(event, "text_area", None)
@@ -2073,7 +2073,7 @@ class ChatInput(Widget):
             if not group_options:
                 continue
             normalized_groups.append({
-                "api_type": str(group.get("api_type") or ""),
+                "provider": str(group.get("provider") or ""),
                 "title": str(group.get("title") or "") or "Other",
                 "options": group_options,
             })
@@ -2086,7 +2086,7 @@ class ChatInput(Widget):
             return []
         return [
             {
-                "api_type": "",
+                "provider": "",
                 "title": "Models",
                 "options": normalized_options,
             }
@@ -2106,17 +2106,17 @@ class ChatInput(Widget):
 
         groups = self._normalize_model_groups(options, self._model_option_groups)
         selected_label = options[0][0]
-        selected_api_type = ""
+        selected_group_key = ""
         for group in groups:
             for label, value in list(group.get("options") or []):
                 if value == selected_value:
                     selected_label = label
-                    selected_api_type = str(group.get("api_type") or "")
+                    selected_group_key = str(group.get("provider") or "")
                     break
-            if selected_api_type:
+            if selected_group_key:
                 break
-        if selected_api_type:
-            self._collapsed_model_api_types.discard(selected_api_type)
+        if selected_group_key:
+            self._collapsed_model_groups.discard(selected_group_key)
 
         max_width = 0
         for group in groups:
@@ -2129,7 +2129,7 @@ class ChatInput(Widget):
         self._model_dropdown_serial += 1
         serial = self._model_dropdown_serial
         self._model_button_values = {}
-        self._model_group_button_api_types = {}
+        self._model_group_button_keys = {}
         self._model_group_button_list_ids = {}
         option_index = 0
 
@@ -2137,17 +2137,17 @@ class ChatInput(Widget):
             if group_index > 0:
                 container.mount(Static("", classes="model-group-gap"))
             title = str(group.get("title") or "") or "Other"
-            api_type = str(group.get("api_type") or "")
+            group_key = str(group.get("provider") or "")
             button_id = f"model-group-toggle-{serial}-{group_index}"
             list_id = f"model-group-list-{serial}-{group_index}"
-            self._model_group_button_api_types[button_id] = api_type
+            self._model_group_button_keys[button_id] = group_key
             self._model_group_button_list_ids[button_id] = list_id
             container.mount(
                 ModelGroupToggle(title, id=button_id, classes="model-group-toggle")
             )
 
             list_classes = "model-group-list"
-            if api_type in self._collapsed_model_api_types:
+            if group_key in self._collapsed_model_groups:
                 list_classes += " hidden"
             group_list = Vertical(id=list_id, classes=list_classes)
             container.mount(group_list)
