@@ -1598,6 +1598,15 @@ class ChatView(Widget):
                 list(entry.get("transcript") or []),
             )
             return
+        if kind == "subagent_batch":
+            for item in list(entry.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                self.add_subagent_entry(
+                    str(item.get("agent_type") or ""),
+                    list(item.get("transcript") or []),
+                )
+            return
         if kind == "team_run":
             self.add_team_entry(
                 str(entry.get("teammate_name") or ""),

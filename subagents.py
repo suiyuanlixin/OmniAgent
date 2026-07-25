@@ -16,6 +16,13 @@ FORBIDDEN_SUBAGENT_TOOL_NAMES = {
     "ask_user",
 }
 DEFAULT_SUBAGENT_TOOL_CALL_FACTOR = 4
+MAX_PARALLEL_SUBAGENTS = 8
+SUBAGENT_WRITE_TOOL_NAMES = frozenset({
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "apply_unified_patch",
+})
 WORKSPACE_SUBAGENTS_RELATIVE_DIR = Path(".omniagent") / "subagents"
 
 
@@ -82,6 +89,10 @@ class SubagentSpec:
     system_prompt: str
     tool_names: tuple[str, ...] = field(default_factory=tuple)
     max_turns: int = 12
+
+
+def subagent_has_write_tools(spec: SubagentSpec) -> bool:
+    return bool(set(spec.tool_names) & SUBAGENT_WRITE_TOOL_NAMES)
 
 
 _BUILTIN_SPECS: dict[str, dict[str, Any]] = {

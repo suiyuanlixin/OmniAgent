@@ -4700,6 +4700,20 @@ class AgentTUIApp(App):
             if agent_type and isinstance(transcript, list):
                 view.add_subagent_entry(agent_type, transcript)
                 return True
+        if kind == "subagent_batch":
+            rendered = False
+            for item in list(display.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                agent_type = clean_display_text_preserve_newlines(
+                    item.get("agent_type", "")
+                )
+                transcript = item.get("transcript")
+                if agent_type and isinstance(transcript, list):
+                    view.add_subagent_entry(agent_type, transcript)
+                    rendered = True
+            if rendered:
+                return True
         if kind == "team_run":
             transcript = display.get("transcript")
             if isinstance(transcript, list):

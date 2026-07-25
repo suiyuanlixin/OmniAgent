@@ -45,6 +45,7 @@ from search import (
 )
 from subagents import (
     DISPATCH_SUBAGENT_TOOL_NAME,
+    MAX_PARALLEL_SUBAGENTS,
     SubagentRegistry,
 )
 from team import (
@@ -1130,56 +1131,77 @@ class AgentTools:
             "implementation tasks that would otherwise add bulky tool output to the main "
             "conversation."
         )
+        task_properties = {
+            "agent_type": {
+                "type": "string",
+                "enum": self._available_subagent_names(),
+                "description": "The subagent role to dispatch.",
+            },
+            "task": {
+                "type": "string",
+                "description": (
+                    "The delegated task. Include enough local context, target files, "
+                    "and the desired summary shape."
+                ),
+            },
+            "purpose": {
+                "type": "string",
+                "description": "Optional short label used for terminal status output.",
+            },
+            "expected_output": {
+                "type": "string",
+                "description": "Optional specific deliverable or format.",
+            },
+            "evidence_required": {
+                "type": "string",
+                "description": (
+                    "Optional evidence requirement, such as file paths, line numbers, "
+                    "URLs, command output, or diff summaries."
+                ),
+            },
+            "scope_limit": {
+                "type": "string",
+                "description": (
+                    "Optional hard boundary, such as read-only, a directory, or files "
+                    "the subagent must not touch."
+                ),
+            },
+        }
         return {
             "name": DISPATCH_SUBAGENT_TOOL_NAME,
             "description": (
-                "Dispatch a focused subagent with independent history and a restricted "
-                "tool whitelist. The subagent returns one concise summary, which is the "
-                "only content added back to the main context. "
-                f"{usage} For non-trivial tasks, actively look for a bounded part that can "
-                "be delegated early instead of doing all exploration in the main context.\n\n"
+                "Dispatch one or more focused subagents with independent histories and "
+                "restricted tool whitelists. Read-only tasks run concurrently. Write-capable "
+                "subagents run one at a time in tasks-array order and may overlap independent "
+                "read-only work. The call returns after every subagent finishes. Each subagent "
+                "returns one concise summary, which is "
+                "added back to the main context. "
+                f"{usage} For non-trivial tasks, actively look for independent bounded parts "
+                "that can be delegated together early instead of doing all exploration in "
+                "the main context.\n\n"
                 "Available agent_type values:\n"
                 f"{self._available_subagent_description()}"
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "agent_type": {
-                        "type": "string",
-                        "enum": self._available_subagent_names(),
-                        "description": "The subagent role to dispatch.",
-                    },
-                    "task": {
-                        "type": "string",
+                    "tasks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_PARALLEL_SUBAGENTS,
                         "description": (
-                            "The delegated task. Include enough local context, target files, "
-                            "and the desired summary shape."
+                            "Independent subagent tasks. Read-only roles run concurrently; "
+                            "write-capable roles are queued in array order."
                         ),
-                    },
-                    "purpose": {
-                        "type": "string",
-                        "description": "Optional short label used for terminal status output.",
-                    },
-                    "expected_output": {
-                        "type": "string",
-                        "description": "Optional specific deliverable or format.",
-                    },
-                    "evidence_required": {
-                        "type": "string",
-                        "description": (
-                            "Optional evidence requirement, such as file paths, line numbers, "
-                            "URLs, command output, or diff summaries."
-                        ),
-                    },
-                    "scope_limit": {
-                        "type": "string",
-                        "description": (
-                            "Optional hard boundary, such as read-only, a directory, or files "
-                            "the subagent must not touch."
-                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": task_properties,
+                            "required": ["agent_type", "task"],
+                        },
                     },
                 },
-                "required": ["agent_type", "task"],
+                "required": ["tasks"],
+                "additionalProperties": False,
             },
         }
 
@@ -2513,28 +2535,55 @@ class AgentTools:
     def _dispatch_subagent(self, tool_input):
         if self.subagent_executor is None:
             raise AgentToolError("Subagent dispatch is not available.")
-        agent_type = _required_string(tool_input, "agent_type")
-        task = _required_string(tool_input, "task")
-        spec = self.subagent_registry.get(agent_type)
-        if spec is None:
+
+        unexpected = sorted(set(tool_input) - {"tasks"})
+        if unexpected:
             raise AgentToolError(
-                "Unknown subagent "
-                f"{agent_type!r}. Available: "
-                + ", ".join(self._available_subagent_names())
+                "dispatch_subagent only accepts the tasks array. Unexpected top-level "
+                f"fields: {', '.join(unexpected)}."
             )
-        if self.plan_mode and self.subagent_registry.resolve_name(agent_type) not in PLAN_SUBAGENT_TYPES:
+        if "tasks" not in tool_input:
+            raise AgentToolError("dispatch_subagent requires the tasks array.")
+        raw_tasks = tool_input["tasks"]
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            raise AgentToolError("dispatch_subagent requires a non-empty tasks array.")
+        if len(raw_tasks) > MAX_PARALLEL_SUBAGENTS:
             raise AgentToolError(
-                "Plan mode only allows reader and researcher subagents. "
-                f"Requested: {agent_type!r}."
+                f"dispatch_subagent accepts at most {MAX_PARALLEL_SUBAGENTS} tasks per batch."
             )
-        return self.subagent_executor(
-            agent_type=agent_type,
-            task=task,
-            purpose=str(tool_input.get("purpose") or "").strip(),
-            expected_output=str(tool_input.get("expected_output") or "").strip(),
-            evidence_required=str(tool_input.get("evidence_required") or "").strip(),
-            scope_limit=str(tool_input.get("scope_limit") or "").strip(),
-        )
+
+        tasks = []
+        for index, raw_task in enumerate(raw_tasks, start=1):
+            if not isinstance(raw_task, dict):
+                raise AgentToolError(f"Subagent task {index} must be an object.")
+            agent_type = _required_string(raw_task, "agent_type")
+            task = _required_string(raw_task, "task")
+            spec = self.subagent_registry.get(agent_type)
+            if spec is None:
+                raise AgentToolError(
+                    "Unknown subagent "
+                    f"{agent_type!r}. Available: "
+                    + ", ".join(self._available_subagent_names())
+                )
+            if (
+                self.plan_mode
+                and self.subagent_registry.resolve_name(agent_type)
+                not in PLAN_SUBAGENT_TYPES
+            ):
+                raise AgentToolError(
+                    "Plan mode only allows reader and researcher subagents. "
+                    f"Requested: {agent_type!r}."
+                )
+            tasks.append({
+                "agent_type": agent_type,
+                "task": task,
+                "purpose": str(raw_task.get("purpose") or "").strip(),
+                "expected_output": str(raw_task.get("expected_output") or "").strip(),
+                "evidence_required": str(raw_task.get("evidence_required") or "").strip(),
+                "scope_limit": str(raw_task.get("scope_limit") or "").strip(),
+            })
+
+        return self.subagent_executor(tasks=tasks)
 
     def _set_team_action_display(
         self,

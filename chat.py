@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -63,11 +64,14 @@ from tools import (
     openai_tool_schemas,
 )
 from subagents import (
+    DISPATCH_SUBAGENT_TOOL_NAME,
     FORBIDDEN_SUBAGENT_TOOL_NAMES,
+    MAX_PARALLEL_SUBAGENTS,
     SubagentSpec,
     SubagentRunner,
     compose_subagent_task,
     format_worker_request_error,
+    subagent_has_write_tools,
 )
 from team import (
     MAX_TEAMMATE_REPORTS_PER_TASK,
@@ -342,6 +346,7 @@ class OmniAgent:
         self.agent_response_started = False
         self.agent_output_needs_separator = False
         self._last_tool_display = None
+        self._subagent_dispatch_display = None
         self.resume_existing_plan = False
         self.configure(
             api_type,
@@ -3524,30 +3529,62 @@ class OmniAgent:
 
     def _execute_agent_tool(self, name, tool_input):
         self.agent_tool_calls += 1
-        with self._agent_tools_execution_lock:
-            self.agent_tools.set_budget_context(
-                self.max_agent_tool_calls,
-                self.agent_tool_calls,
-            )
-            change_count_before = self.agent_tools.session_change_count()
-            todo_revision_before = self.agent_tools.todo_revision()
-            self.agent_tools.consume_display_payload()
-            scope_error = self._write_scope_violation(
-                name, tool_input, {"kind": "lead", "name": "Lead"}
-            )
+        if name == DISPATCH_SUBAGENT_TOOL_NAME:
+            self._subagent_dispatch_display = None
+            with self._agent_tools_execution_lock:
+                self.agent_tools.set_budget_context(
+                    self.max_agent_tool_calls,
+                    self.agent_tool_calls,
+                )
+                change_count_before = self.agent_tools.session_change_count()
+                todo_revision_before = self.agent_tools.todo_revision()
+                self.agent_tools.consume_display_payload()
+                scope_error = self._write_scope_violation(
+                    name, tool_input, {"kind": "lead", "name": "Lead"}
+                )
             if scope_error:
                 tool_result = _error_text(scope_error)
                 self._last_tool_display = None
             else:
+                # Do not hold the shared tool lock while subagents wait on model calls.
+                # Their individual tool executions still acquire the lock briefly.
                 tool_result = self.agent_tools.execute(name, tool_input)
-            if self.agent_tools.consume_output_separator():
-                self.agent_output_needs_separator = True
-            if (
-                self.agent_tools.session_change_count() > change_count_before
-                or self.agent_tools.todo_revision() != todo_revision_before
-            ):
-                self.agent_final_check_done = False
-            self._last_tool_display = self.agent_tools.consume_display_payload()
+            with self._agent_tools_execution_lock:
+                if self.agent_tools.consume_output_separator():
+                    self.agent_output_needs_separator = True
+                if (
+                    self.agent_tools.session_change_count() > change_count_before
+                    or self.agent_tools.todo_revision() != todo_revision_before
+                ):
+                    self.agent_final_check_done = False
+                self.agent_tools.consume_display_payload()
+                self._last_tool_display = self._subagent_dispatch_display
+                self._subagent_dispatch_display = None
+        else:
+            with self._agent_tools_execution_lock:
+                self.agent_tools.set_budget_context(
+                    self.max_agent_tool_calls,
+                    self.agent_tool_calls,
+                )
+                change_count_before = self.agent_tools.session_change_count()
+                todo_revision_before = self.agent_tools.todo_revision()
+                self.agent_tools.consume_display_payload()
+                scope_error = self._write_scope_violation(
+                    name, tool_input, {"kind": "lead", "name": "Lead"}
+                )
+                if scope_error:
+                    tool_result = _error_text(scope_error)
+                    self._last_tool_display = None
+                else:
+                    tool_result = self.agent_tools.execute(name, tool_input)
+                if self.agent_tools.consume_output_separator():
+                    self.agent_output_needs_separator = True
+                if (
+                    self.agent_tools.session_change_count() > change_count_before
+                    or self.agent_tools.todo_revision() != todo_revision_before
+                ):
+                    self.agent_final_check_done = False
+                self._last_tool_display = self.agent_tools.consume_display_payload()
         self._track_explored_tool(name, tool_input)
         context_result = _compact_tool_result_for_context(tool_result)
         return context_result
@@ -3586,68 +3623,191 @@ class OmniAgent:
         if description:
             add_explored_entry(name, description)
 
-    def _dispatch_subagent(
-        self,
-        *,
-        agent_type,
-        task,
-        purpose="",
-        expected_output="",
-        evidence_required="",
-        scope_limit="",
-    ):
-        spec = self.agent_tools.subagent_registry.get(agent_type)
-        if (
-            self.agent_tools.plan_mode
-            and self.agent_tools.subagent_registry.resolve_name(agent_type)
-            not in PLAN_SUBAGENT_TYPES
-        ):
+    def _dispatch_subagent(self, *, tasks):
+        if not isinstance(tasks, list) or not tasks:
+            return _error_text("dispatch_subagent requires at least one task.")
+        if len(tasks) > MAX_PARALLEL_SUBAGENTS:
             return _error_text(
-                "Plan mode only allows reader and researcher subagents. "
-                f"Requested: {agent_type!r}."
-            )
-        if spec is None:
-            return _error_text(
-                "Unknown subagent "
-                f"{agent_type!r}. Available: "
-                + ", ".join(
-                    self.agent_tools.subagent_registry.names(include_aliases=True)
-                )
+                f"dispatch_subagent accepts at most {MAX_PARALLEL_SUBAGENTS} tasks per batch."
             )
 
-        subagent_task = compose_subagent_task(
-            task,
-            expected_output=expected_output,
-            evidence_required=evidence_required,
-            scope_limit=scope_limit,
-        )
-        effective_spec = self._effective_subagent_spec(spec)
-        label = _single_line(purpose or task, 120)
+        prepared = []
+        for index, item in enumerate(tasks, start=1):
+            if not isinstance(item, dict):
+                return _error_text(f"Subagent task {index} must be an object.")
+            item_agent_type = str(item.get("agent_type") or "").strip()
+            item_task = str(item.get("task") or "").strip()
+            spec = self.agent_tools.subagent_registry.get(item_agent_type)
+            if (
+                self.agent_tools.plan_mode
+                and self.agent_tools.subagent_registry.resolve_name(item_agent_type)
+                not in PLAN_SUBAGENT_TYPES
+            ):
+                return _error_text(
+                    "Plan mode only allows reader and researcher subagents. "
+                    f"Requested: {item_agent_type!r}."
+                )
+            if spec is None:
+                return _error_text(
+                    "Unknown subagent "
+                    f"{item_agent_type!r}. Available: "
+                    + ", ".join(
+                        self.agent_tools.subagent_registry.names(include_aliases=True)
+                    )
+                )
+            if not item_task:
+                return _error_text(f"Subagent task {index} is empty.")
+            item_purpose = str(item.get("purpose") or "").strip()
+            subagent_task = compose_subagent_task(
+                item_task,
+                expected_output=str(item.get("expected_output") or "").strip(),
+                evidence_required=str(item.get("evidence_required") or "").strip(),
+                scope_limit=str(item.get("scope_limit") or "").strip(),
+            )
+            prepared.append({
+                "index": index,
+                "spec": spec,
+                "effective_spec": self._effective_subagent_spec(spec),
+                "task": item_task,
+                "subagent_task": subagent_task,
+                "purpose": item_purpose,
+                "label": _single_line(item_purpose or item_task, 120),
+                "entry_id": uuid.uuid4().hex,
+            })
+
+        read_only_items = [
+            item
+            for item in prepared
+            if not subagent_has_write_tools(item["spec"])
+        ]
+        write_items = [
+            item
+            for item in prepared
+            if subagent_has_write_tools(item["spec"])
+        ]
+
         self._before_agent_visible_output()
-        entry_id = uuid.uuid4().hex
-        start_subagent_entry(entry_id, spec.name)
+        for item in prepared:
+            start_subagent_entry(item["entry_id"], item["spec"].name)
+        if len(write_items) > 1:
+            for queue_position, item in enumerate(write_items[1:], start=2):
+                append_subagent_event(item["entry_id"], {
+                    "kind": "message",
+                    "role": "status",
+                    "content": (
+                        "Queued for serialized file editing "
+                        f"({queue_position}/{len(write_items)})."
+                    ),
+                })
+
+        if len(prepared) == 1:
+            completed = [self._run_subagent_dispatch(prepared[0])]
+        else:
+            completed_by_index = {}
+            worker_count = len(read_only_items) + (1 if write_items else 0)
+            with ThreadPoolExecutor(
+                max_workers=min(worker_count, MAX_PARALLEL_SUBAGENTS),
+                thread_name_prefix="omni-subagent",
+            ) as executor:
+                futures = {
+                    executor.submit(self._run_subagent_dispatch, item): ("single", [item])
+                    for item in read_only_items
+                }
+                if write_items:
+                    futures[
+                        executor.submit(self._run_subagent_write_queue, write_items)
+                    ] = ("writers", write_items)
+
+                for future in as_completed(futures):
+                    future_kind, future_items = futures[future]
+                    try:
+                        future_result = future.result()
+                        if future_kind == "writers":
+                            for item in future_result:
+                                completed_by_index[item["index"]] = item
+                        else:
+                            completed_by_index[future_items[0]["index"]] = future_result
+                    except Exception as error:
+                        for item in future_items:
+                            completed_by_index[item["index"]] = {
+                                **item,
+                                "result": _error_text(
+                                    f"Subagent '{item['spec'].name}' failed: {error}"
+                                ),
+                                "transcript": [],
+                            }
+            completed = [completed_by_index[item["index"]] for item in prepared]
+
+        displays = [
+            {
+                "kind": "subagent",
+                "agent_type": item["spec"].name,
+                "purpose": item["label"],
+                "transcript": item["transcript"],
+            }
+            for item in completed
+        ]
+        self._subagent_dispatch_display = (
+            displays[0]
+            if len(displays) == 1
+            else {"kind": "subagent_batch", "items": displays}
+        )
+        if len(completed) == 1:
+            return completed[0]["result"]
+
+        failure_count = sum(
+            str(item["result"] or "").startswith("ERROR:") for item in completed
+        )
+        status = (
+            f"Completed {len(completed)} subagent tasks with parallel reads "
+            "and serialized writes"
+            + (f" with {failure_count} failure(s)." if failure_count else ".")
+        )
+        sections = [status]
+        for item in completed:
+            sections.append(
+                f"[{item['index']}] {item['spec'].name} - {item['label']}\n"
+                f"{item['result']}"
+            )
+        return "\n\n".join(sections)
+
+    def _run_subagent_write_queue(self, items):
+        completed = []
+        total = len(items)
+        for queue_position, item in enumerate(items, start=1):
+            if queue_position > 1:
+                append_subagent_event(item["entry_id"], {
+                    "kind": "message",
+                    "role": "status",
+                    "content": (
+                        "Write slot acquired; starting queued task "
+                        f"({queue_position}/{total})."
+                    ),
+                })
+            completed.append(self._run_subagent_dispatch(item))
+        return completed
+
+    def _run_subagent_dispatch(self, item):
+        spec = item["spec"]
         runner = SubagentRunner(
             parent_agent=self,
-            spec=effective_spec,
+            spec=item["effective_spec"],
             tool_schemas=self._subagent_tool_schemas(spec),
             execute_tool=lambda name, args: self._execute_subagent_tool(
                 spec, name, args
             ),
             compact_tool_result=_compact_tool_result_for_context,
-            event_callback=lambda event: append_subagent_event(entry_id, event),
+            event_callback=lambda event: append_subagent_event(item["entry_id"], event),
         )
         try:
-            result = runner.run(subagent_task)
+            result = runner.run(item["subagent_task"])
         except Exception as error:
-            return _error_text(f"Subagent '{spec.name}' failed: {error}")
-
-        self.agent_tools._display_payload = {
-            "kind": "subagent",
-            "agent_type": spec.name,
-            "purpose": label,
+            result = _error_text(f"Subagent '{spec.name}' failed: {error}")
+        return {
+            **item,
+            "result": result,
             "transcript": runner.transcript,
         }
-        return result
 
     def _execute_subagent_tool(self, spec, name, tool_input):
         return self._execute_delegated_tool(
@@ -4916,8 +5076,10 @@ class OmniAgent:
                     "\n- In Plan mode, use dispatch_subagent only for bounded read-only repository "
                     "inspection or external research. Choose reader or researcher (including "
                     "their read-role aliases); do not delegate implementation or mutation."
-                    "\n- The subagent has its own history and restricted tools; only its final "
-                    "summary returns. Keep ownership of planning decisions and the final plan."
+                    "\n- Batch independent read-only tasks in one dispatch_subagent call so they "
+                    "run concurrently; the call returns after every task finishes."
+                    "\n- Each subagent has its own history and restricted tools; only final "
+                    "summaries return. Keep ownership of planning decisions and the final plan."
                 )
             else:
                 prompt += (
@@ -4925,9 +5087,15 @@ class OmniAgent:
                     "repository exploration, external research, auditing, verification, or a "
                     "scoped implementation whose final summary is sufficient. Dispatch it early "
                     "when that shape fits so detailed tool output stays out of the main context."
-                    "\n- If two or more parts are independent, issue multiple dispatch_subagent "
-                    "calls in the same assistant tool-use turn. Choose the narrowest matching role "
-                    "and provide a concrete task, expected output, evidence requirement, and scope."
+                    "\n- If two or more parts are independent, place them together in one "
+                    "dispatch_subagent tasks batch so they run concurrently. Choose the narrowest "
+                    "matching role and provide a concrete task, expected output, evidence requirement, "
+                    "and scope for each item."
+                    "\n- Read-only tasks run concurrently. Write-capable builders are serialized "
+                    "in tasks-array order and may run alongside independent read-only tasks."
+                    "\n- Do not batch dependent work. If a task needs another subagent's result "
+                    "or must inspect a builder's finished changes, dispatch it only after the "
+                    "earlier call returns."
                     "\n- Handle work directly only when it is a simple one-step task, tightly "
                     "coupled to the main reasoning, requires immediate user clarification, or no "
                     "available subagent has a useful tool set. Do not delegate merely to repeat "

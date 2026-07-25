@@ -291,6 +291,8 @@ Build mode 支持以下子智能体：
 
 Plan mode 只暴露并允许 `reader`、`researcher` 及指向它们的别名；`auditor`、`builder`、`general` 会被拒绝。子智能体不能继续派发子智能体、管理 Team、维护主 Agent 的 todo 或直接向用户提问。
 
+`dispatch_subagent` 只接受 `tasks` 数组，不再兼容顶层 `agent_type`、`task` 等旧单任务格式。一次可提交最多 8 个独立任务：只读 Subagent 会并行运行；拥有文件写入工具的多个 `builder` 按 `tasks` 数组顺序排队，同一时间只运行一个，但可以与相互独立的只读任务并行。主 Agent 等全部任务返回后，仍按原始数组顺序汇总结果。需要依赖前序结果或检查 Builder 最终修改的任务不应放在同一批次，而应在前一批完成后再下发。
+
 工作区中可通过模板覆盖内置 prompt：
 
 ```text
