@@ -27,6 +27,7 @@ _EDIT_NONE = "none"
 _EDIT_TOGGLE = "toggle"
 _EDIT_SELECT = "select"
 _EDIT_INPUT = "input"
+_EDIT_AUTOCOMPLETE = "autocomplete"
 _EDIT_MODALITIES = "modalities"
 _EDIT_NAV = "nav"
 _EDIT_ACTION = "action"
@@ -632,6 +633,13 @@ class SettingsModal(ModalScreen[None]):
         padding: 0 1;
     }
 
+    .settings-autocomplete-drop {
+        width: auto;
+        height: 1;
+        min-width: 0;
+        margin: 0;
+    }
+
     #settings-model-panel {
         width: 100%;
         height: auto;
@@ -826,6 +834,8 @@ class SettingsModal(ModalScreen[None]):
         self._collapsed_model_groups: set[str] = set()
         self._add_model_draft: dict[str, object] = {}
         self._editing_row_index: int | None = None
+        self._autocomplete_filtered_options: list[str] = []
+        self._autocomplete_render_generation: int = 0
         self._select_open_index: int | None = None
         self._select_group_toggle_keys: dict[str, str] = {}
         self._select_group_toggle_list_ids: dict[str, str] = {}
@@ -1089,6 +1099,32 @@ class SettingsModal(ModalScreen[None]):
                     self._apply_change(row, format_extra_modalities(current))
             return
 
+        if control_id == "settings-edit-input":
+            if self._editing_row_index is not None:
+                rows = self._visible_rows()
+                if 0 <= self._editing_row_index < len(rows):
+                    row = rows[self._editing_row_index]
+                    if row.get("edit_type") == _EDIT_AUTOCOMPLETE:
+                        try:
+                            input_widget = self.query_one("#settings-edit-input", Input)
+                            self._refresh_autocomplete_options(input_widget.value)
+                        except Exception:
+                            pass
+            return
+
+        if control_id.startswith("settings-autocomplete-opt-"):
+            option_index = self._parse_autocomplete_option_index(control_id)
+            if (
+                option_index is not None
+                and self._editing_row_index is not None
+                and 0 <= option_index < len(self._autocomplete_filtered_options)
+            ):
+                self._commit_input(
+                    self._editing_row_index,
+                    self._autocomplete_filtered_options[option_index],
+                )
+            return
+
         if control_id.startswith("settings-row-"):
             row_index = self._parse_row_index(control_id, "settings-row-")
             if row_index is None:
@@ -1154,8 +1190,19 @@ class SettingsModal(ModalScreen[None]):
         if event.input.id == "settings-search":
             self._close_header_select()
             self._editing_row_index = None
+            self._autocomplete_filtered_options = []
             self._select_open_index = None
             self._render_current_page(event.value)
+            return
+        if (
+            event.input.id == "settings-edit-input"
+            and self._editing_row_index is not None
+        ):
+            rows = self._visible_rows()
+            if 0 <= self._editing_row_index < len(rows):
+                row = rows[self._editing_row_index]
+                if row.get("edit_type") == _EDIT_AUTOCOMPLETE:
+                    self._refresh_autocomplete_options(event.value)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if (
@@ -1344,6 +1391,16 @@ class SettingsModal(ModalScreen[None]):
             f"settings-modal-opt-{self._render_generation}-{row_index}-{option_index}"
         )
 
+    def _autocomplete_options_id(self, row_index: int) -> str:
+        return f"settings-autocomplete-options-{self._render_generation}-{row_index}"
+
+    def _autocomplete_option_id(self, row_index: int, option_index: int) -> str:
+        return (
+            f"settings-autocomplete-opt-"
+            f"{self._render_generation}-{row_index}-"
+            f"{self._autocomplete_render_generation}-{option_index}"
+        )
+
     def _parse_row_index(self, control_id: str, prefix: str) -> int | None:
         if not control_id.startswith(prefix):
             return None
@@ -1371,6 +1428,15 @@ class SettingsModal(ModalScreen[None]):
         try:
             _generation, row_text, group_text = payload.split("-", 2)
             return int(row_text), int(group_text)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_autocomplete_option_index(self, control_id: str) -> int | None:
+        prefix = "settings-autocomplete-opt-"
+        if not control_id.startswith(prefix):
+            return None
+        try:
+            return int(control_id.rsplit("-", 1)[1])
         except (TypeError, ValueError):
             return None
 
@@ -1592,7 +1658,7 @@ class SettingsModal(ModalScreen[None]):
             self._toggle_select_options(row_index)
         elif edit_type == _EDIT_MODALITIES:
             return
-        elif edit_type == _EDIT_INPUT:
+        elif edit_type in {_EDIT_INPUT, _EDIT_AUTOCOMPLETE}:
             self._start_input_edit(row_index)
 
     def _is_toggle_enabled(self, value: str) -> bool:
@@ -2211,7 +2277,7 @@ class SettingsModal(ModalScreen[None]):
             display_value = self._display_value(row)
             placeholder_value = str(row.get("placeholder_value") or "")
             if (
-                edit_type == _EDIT_INPUT
+                edit_type in {_EDIT_INPUT, _EDIT_AUTOCOMPLETE}
                 and not str(row.get("value") or "")
                 and placeholder_value
             ):
@@ -2292,6 +2358,9 @@ class SettingsModal(ModalScreen[None]):
                 )
                 input_widget = row_widget.query_one("#settings-edit-input", Input)
                 input_widget.focus()
+                row = self._visible_rows()[row_index]
+                if row.get("edit_type") == _EDIT_AUTOCOMPLETE:
+                    self._refresh_autocomplete_options(input_widget.value)
                 return
             except Exception:
                 pass
@@ -2314,9 +2383,127 @@ class SettingsModal(ModalScreen[None]):
         if placeholder_value:
             input_kwargs["placeholder"] = placeholder_value
         input_widget = Input(**input_kwargs)
-        input_widget.styles.width = max(len(current_value or placeholder_value) + 3, 8)
-        row_widget.mount(input_widget)
+        input_width = max(len(current_value or placeholder_value) + 3, 8)
+        input_widget.styles.width = input_width
+        if row.get("edit_type") == _EDIT_AUTOCOMPLETE:
+            options = self._autocomplete_options(row)
+            normalized_query = current_value.strip()
+            filtered = [
+                option
+                for option in options
+                if not normalized_query or normalized_query in option
+            ]
+            self._autocomplete_filtered_options = filtered
+            self._autocomplete_render_generation += 1
+            option_widgets: list[Static] = []
+            if filtered:
+                option_widgets.extend(
+                    _OptionItem(
+                        option,
+                        markup=False,
+                        id=self._autocomplete_option_id(row_index, option_index),
+                        classes="settings-option-btn",
+                    )
+                    for option_index, option in enumerate(filtered)
+                )
+                longest_label = max(len(option) for option in filtered)
+            else:
+                longest_label = input_width
+            option_classes = "settings-options settings-autocomplete-options"
+            if filtered:
+                option_classes += " open"
+            options_container = Vertical(
+                *option_widgets,
+                id=self._autocomplete_options_id(row_index),
+                classes=option_classes,
+            )
+            option_width = max(input_width, longest_label + 2)
+            options_container.styles.width = option_width
+            options_container.styles.min_width = option_width
+            options_container.styles.offset = (input_width - option_width, 0)
+            drop_container = Container(
+                input_widget,
+                options_container,
+                classes="settings-control-drop settings-autocomplete-drop",
+            )
+            drop_container.styles.width = input_width
+            drop_container.styles.min_width = input_width
+            row_widget.mount(drop_container)
+        else:
+            row_widget.mount(input_widget)
         input_widget.focus()
+
+    def _autocomplete_options(self, row: dict) -> list[str]:
+        options: list[str] = []
+        seen: set[str] = set()
+        for option in list(row.get("suggestions") or []):
+            value = str(option or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            options.append(value)
+        return options
+
+    def _refresh_autocomplete_options(self, query: str) -> None:
+        if self._editing_row_index is None:
+            return
+        rows = self._visible_rows()
+        if not (0 <= self._editing_row_index < len(rows)):
+            return
+        row = rows[self._editing_row_index]
+        if row.get("edit_type") != _EDIT_AUTOCOMPLETE:
+            return
+        try:
+            options_container = self.query_one(
+                f"#{self._autocomplete_options_id(self._editing_row_index)}", Vertical
+            )
+            input_widget = self.query_one("#settings-edit-input", Input)
+            drop_container = options_container.parent
+        except Exception:
+            return
+
+        options = self._autocomplete_options(row)
+        normalized_query = str(query or "").strip()
+        filtered = [
+            option
+            for option in options
+            if not normalized_query or normalized_query in option
+        ]
+        self._autocomplete_filtered_options = filtered
+        self._autocomplete_render_generation += 1
+        for child in list(options_container.children):
+            child.remove()
+
+        input_width = max(len(str(query or "")) + 3, 8)
+        input_widget.styles.width = input_width
+        drop_container.styles.width = input_width
+        drop_container.styles.min_width = input_width
+        if not options:
+            options_container.remove_class("open")
+            return
+
+        if not filtered:
+            options_container.remove_class("open")
+            return
+
+        for option_index, option in enumerate(filtered):
+            options_container.mount(
+                _OptionItem(
+                    option,
+                    markup=False,
+                    id=self._autocomplete_option_id(
+                        self._editing_row_index, option_index
+                    ),
+                    classes="settings-option-btn",
+                )
+            )
+        longest_label = max(len(option) for option in filtered)
+
+        option_width = max(input_width, longest_label + 2)
+        options_container.styles.width = option_width
+        options_container.styles.min_width = option_width
+        options_container.styles.offset = (input_width - option_width, 0)
+        options_container.add_class("open")
 
     def _finish_input_edit(self) -> None:
         if self._editing_row_index is None:
@@ -2330,13 +2517,20 @@ class SettingsModal(ModalScreen[None]):
             )
             value_button.display = True
             try:
-                input_widget = row_widget.query_one("#settings-edit-input", Input)
-                input_widget.remove()
+                autocomplete_drop = row_widget.query_one(
+                    ".settings-autocomplete-drop", Container
+                )
+                autocomplete_drop.remove()
             except Exception:
-                pass
+                try:
+                    input_widget = row_widget.query_one("#settings-edit-input", Input)
+                    input_widget.remove()
+                except Exception:
+                    pass
         except Exception:
             pass
         self._editing_row_index = None
+        self._autocomplete_filtered_options = []
 
     def _commit_input(self, row_index: int, new_value: str) -> None:
         new_value = str(new_value or "").strip()
@@ -2378,6 +2572,24 @@ class SettingsModal(ModalScreen[None]):
             "context_window_tokens": "0",
         }
 
+    def _existing_model_providers(self) -> list[str]:
+        providers: set[str] = set()
+        if self.app_ref is not None:
+            try:
+                model_list = getattr(self.app_ref.config, "model_list", {}) or {}
+                for profile in model_list.values():
+                    provider = str(getattr(profile, "provider", "") or "").strip()
+                    if provider:
+                        providers.add(provider)
+            except Exception:
+                pass
+        if not providers:
+            for group in self._model_groups:
+                provider = str(group.get("provider") or "").strip()
+                if provider:
+                    providers.add(provider)
+        return sorted(providers, key=str.casefold)
+
     def _set_add_model_field(self, key: str, value: str) -> None:
         if not self._add_model_draft:
             self._add_model_draft = {}
@@ -2417,7 +2629,8 @@ class SettingsModal(ModalScreen[None]):
                 "name": "Provider",
                 "value": str(draft.get("provider") or ""),
                 "keywords": "provider",
-                "edit_type": "input",
+                "edit_type": "autocomplete",
+                "suggestions": self._existing_model_providers(),
                 "on_change": lambda v: self._set_add_model_field("provider", str(v)),
             },
             {
