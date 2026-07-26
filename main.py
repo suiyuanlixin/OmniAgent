@@ -2,8 +2,15 @@ import base64
 import mimetypes
 from pathlib import Path
 
+from config import (
+    DEFAULT_EXTRA_MODALITY_LIMITS,
+    DEFAULT_FILE_INLINE_CHARS,
+    DEFAULT_MULTIMODAL_LIMIT,
+    parse_extra_modalities_config,
+    parse_file_inline_chars,
+    parse_multimodal_limit,
+)
 from references import resolve_references, reference_path_key
-from tools import MAX_READ_CHARS
 
 
 IMAGE_MEDIA_TYPES = {
@@ -30,10 +37,7 @@ VIDEO_MEDIA_TYPES = {
     "video/quicktime",
     "video/x-matroska",
 }
-IMAGE_FILE_MAX_BYTES = 10 * 1024 * 1024
-AUDIO_FILE_MAX_BYTES = 50 * 1024 * 1024
-VIDEO_FILE_MAX_BYTES = 50 * 1024 * 1024
-MULTIMODAL_REQUEST_MAX_BYTES = 64 * 1024 * 1024
+MEBIBYTE = 1024 * 1024
 
 
 def _resolve_external_file_reference(path_text, base_dir=None):
@@ -106,37 +110,42 @@ def _detect_reference_media_type(path):
     return "text", ""
 
 
-def _read_external_file_reference(path_text, base_dir=None):
+def _read_external_file_reference(
+    path_text,
+    base_dir=None,
+    file_inline_chars=DEFAULT_FILE_INLINE_CHARS,
+):
     path = _resolve_external_file_reference(path_text, base_dir)
+    inline_chars = parse_file_inline_chars(file_inline_chars)
 
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
+        with path.open("r", encoding="utf-8", errors="replace") as source:
+            content = source.read(inline_chars + 1)
     except OSError as error:
         raise ValueError(f"Failed to read referenced file: {path}") from error
 
-    truncated = content[:MAX_READ_CHARS]
-    if len(content) > MAX_READ_CHARS:
-        truncated += (
-            f"\n\n[referenced file truncated after {MAX_READ_CHARS} characters]"
-        )
-    return path, truncated
+    if len(content) > inline_chars:
+        return path, None
+    return path, content
 
 
-def _read_external_media_reference(path_text, encoded_bytes_before=0, base_dir=None):
+def _read_external_media_reference(
+    path_text,
+    encoded_bytes_before=0,
+    base_dir=None,
+    extra_modalities=None,
+    multimodal_limit=DEFAULT_MULTIMODAL_LIMIT,
+):
     path = _resolve_external_file_reference(path_text, base_dir)
     kind, mime_type = _detect_reference_media_type(path)
     if kind not in {"audio", "image", "video"}:
         return None
 
+    modality_limits = parse_extra_modalities_config(extra_modalities)
     size = path.stat().st_size
-    if kind == "image":
-        max_bytes = IMAGE_FILE_MAX_BYTES
-    elif kind == "audio":
-        max_bytes = AUDIO_FILE_MAX_BYTES
-    else:
-        max_bytes = VIDEO_FILE_MAX_BYTES
+    limit_mb = modality_limits.get(kind, DEFAULT_EXTRA_MODALITY_LIMITS[kind])
+    max_bytes = limit_mb * MEBIBYTE
     if size > max_bytes:
-        limit_mb = max_bytes // (1024 * 1024)
         raise ValueError(
             f"Referenced {kind} file is too large for multimodal base64 input "
             f"({size} bytes > {limit_mb} MB): {path}"
@@ -149,11 +158,16 @@ def _read_external_media_reference(path_text, encoded_bytes_before=0, base_dir=N
 
     encoded_bytes = len(data.encode("ascii"))
     total_encoded = encoded_bytes_before + encoded_bytes
-    if total_encoded > MULTIMODAL_REQUEST_MAX_BYTES:
-        limit_mb = MULTIMODAL_REQUEST_MAX_BYTES // (1024 * 1024)
+    total_limit = (
+        DEFAULT_MULTIMODAL_LIMIT
+        if multimodal_limit is None
+        else parse_multimodal_limit(multimodal_limit)
+    )
+    request_max_bytes = total_limit * MEBIBYTE
+    if total_encoded > request_max_bytes:
         raise ValueError(
             f"Referenced media files exceed multimodal request body budget "
-            f"({total_encoded} encoded bytes > {limit_mb} MB)."
+            f"({total_encoded} encoded bytes > {total_limit} MB)."
         )
 
     return {
@@ -167,7 +181,13 @@ def _read_external_media_reference(path_text, encoded_bytes_before=0, base_dir=N
     }
 
 
-def attach_external_file_references_with_media(user_input, base_dir=None):
+def attach_external_file_references_with_media(
+    user_input,
+    base_dir=None,
+    extra_modalities=None,
+    multimodal_limit=DEFAULT_MULTIMODAL_LIMIT,
+    file_inline_chars=DEFAULT_FILE_INLINE_CHARS,
+):
     parsed = resolve_references(user_input, base_dir)
     references = []
     files = {}
@@ -209,6 +229,8 @@ def attach_external_file_references_with_media(user_input, base_dir=None):
             path_text,
             encoded_media_bytes,
             base_dir,
+            extra_modalities,
+            multimodal_limit,
         )
         if media_reference:
             media_references.append(media_reference)
@@ -225,9 +247,22 @@ def attach_external_file_references_with_media(user_input, base_dir=None):
             )
             continue
 
-        path, content = _read_external_file_reference(path_text, base_dir)
+        path, content = _read_external_file_reference(
+            path_text, base_dir, file_inline_chars
+        )
         files[reference.display] = path
-        blocks.append(f"--- File: {path} ---\n{content}\n--- End file: {path} ---")
+        if content is None:
+            blocks.append(
+                f"--- File: {path} ---\n"
+                "Not embedded because it exceeds the configured file inline chars. "
+                "It remains attached as a read-only reference and can be read with "
+                f"the read_file tool using reference={reference.display!r}.\n"
+                f"--- End file: {path} ---"
+            )
+        else:
+            blocks.append(
+                f"--- File: {path} ---\n{content}\n--- End file: {path} ---"
+            )
 
     if folders:
         folder_lines = "\n".join(f"- {name}" for name in folders)

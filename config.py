@@ -31,6 +31,8 @@ DEFAULT_TEMPERATURE = 0.7
 DEFAULT_STREAM_MODE = False
 DEFAULT_THINKING_MODE = False
 DEFAULT_REASONING_EFFORT = ""
+DEFAULT_MULTIMODAL_LIMIT = 100
+DEFAULT_FILE_INLINE_CHARS = 50000
 EXTRA_MODALITY_AUDIO = "audio"
 EXTRA_MODALITY_IMAGE = "image"
 EXTRA_MODALITY_VIDEO = "video"
@@ -39,6 +41,11 @@ SUPPORTED_EXTRA_MODALITIES = (
     EXTRA_MODALITY_IMAGE,
     EXTRA_MODALITY_VIDEO,
 )
+DEFAULT_EXTRA_MODALITY_LIMITS = {
+    EXTRA_MODALITY_AUDIO: 50,
+    EXTRA_MODALITY_IMAGE: 10,
+    EXTRA_MODALITY_VIDEO: 50,
+}
 DEFAULT_AGENT_MODE = False
 DEFAULT_MAX_AGENT_ROUNDS = 12
 DEFAULT_MAX_AGENT_TOOL_CALLS = 40
@@ -92,12 +99,14 @@ MODEL_FIELD_KEYS = {
     "thinking_mode",
     "reasoning_effort",
     "extra_modalities",
+    "multimodal_limit",
     "context_window_tokens",
 }
 GLOBAL_FIELD_KEYS = {
     "current_model",
     "max_agent_rounds",
     "max_agent_tool_calls",
+    "file_inline_chars",
     "agent_approval_mode",
     "agent_plan_enable",
     "agent_team_enable",
@@ -134,11 +143,12 @@ class ModelConfig:
     stream_mode: bool = DEFAULT_STREAM_MODE
     thinking_mode: bool = DEFAULT_THINKING_MODE
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
-    extra_modalities: tuple[str, ...] = field(default_factory=tuple)
+    extra_modalities: dict[str, int] = field(default_factory=dict)
+    multimodal_limit: int | None = None
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
 
     def to_dict(self):
-        return {
+        data = {
             "api_type": self.api_type,
             "base_url": self.base_url,
             "model": self.model,
@@ -148,9 +158,14 @@ class ModelConfig:
             "stream_mode": self.stream_mode,
             "thinking_mode": self.thinking_mode,
             "reasoning_effort": self.reasoning_effort,
-            "extra_modalities": list(self.extra_modalities),
+            "extra_modalities": dict(self.extra_modalities),
             "context_window_tokens": self.context_window_tokens,
         }
+        if self.api_type == API_TYPE_GLM:
+            data.pop("base_url", None)
+        if self.extra_modalities:
+            data["multimodal_limit"] = self.multimodal_limit
+        return data
 
 
 @dataclass
@@ -159,6 +174,7 @@ class AppConfig:
     model_list: dict[str, ModelConfig] = field(default_factory=dict)
     max_agent_rounds: int = DEFAULT_MAX_AGENT_ROUNDS
     max_agent_tool_calls: int = DEFAULT_MAX_AGENT_TOOL_CALLS
+    file_inline_chars: int = DEFAULT_FILE_INLINE_CHARS
     agent_approval_mode: str = DEFAULT_AGENT_APPROVAL_MODE
     agent_plan_enable: bool = DEFAULT_AGENT_PLAN_ENABLE
     agent_team_enable: bool = DEFAULT_AGENT_TEAM_ENABLE
@@ -277,6 +293,7 @@ class AppConfig:
             "agent_mode": {
                 "max_rounds": self.max_agent_rounds,
                 "max_tool_calls": self.max_agent_tool_calls,
+                "file_inline_chars": self.file_inline_chars,
                 "approve": self.agent_approval_mode,
                 "plan_mode": self.agent_plan_enable,
                 "agent_team": {
@@ -320,6 +337,7 @@ class AppConfig:
             "current_model": self.active_model_name,
             "max_agent_rounds": self.max_agent_rounds,
             "max_agent_tool_calls": self.max_agent_tool_calls,
+            "file_inline_chars": self.file_inline_chars,
             "agent_approval_mode": self.agent_approval_mode,
             "agent_plan_enable": self.agent_plan_enable,
             "agent_team_enable": self.agent_team_enable,
@@ -444,6 +462,8 @@ def normalize_extra_modalities(value):
         if stripped.lower() == "none":
             return ()
         tokens = re.split(r"[\s,，]+", stripped)
+    elif isinstance(value, dict):
+        tokens = [str(item or "").strip() for item in value]
     elif isinstance(value, (list, tuple, set)):
         tokens = [str(item or "").strip() for item in value]
     elif value is None:
@@ -537,6 +557,35 @@ def parse_max_tokens(value):
 
 def parse_context_window_tokens(value):
     return _parse_positive_integer(value, "Model context window tokens")
+
+
+def parse_file_inline_chars(value):
+    return _parse_positive_integer(value, "File inline chars")
+
+
+def parse_extra_modalities_config(value):
+    if not isinstance(value, dict):
+        raise ValueError(
+            "Extra modalities must be an object mapping modality names to limits."
+        )
+    unknown = sorted(
+        str(key) for key in value if str(key) not in SUPPORTED_EXTRA_MODALITIES
+    )
+    if unknown:
+        raise ValueError(
+            "Unsupported extra modalities: " + ", ".join(unknown)
+        )
+    return {
+        modality: _parse_positive_integer(
+            value[modality], f"{modality.title()} limit (MB)"
+        )
+        for modality in SUPPORTED_EXTRA_MODALITIES
+        if modality in value
+    }
+
+
+def parse_multimodal_limit(value):
+    return _parse_positive_integer(value, "Multimodal total limit (MB)")
 
 
 def parse_skill_max_chars(value):
@@ -700,16 +749,26 @@ def _sanitize_model_config(data, *, provider, profile_name):
         reasoning_effort = normalize_reasoning_effort_for_api(
             api_type, reasoning_effort
         )
+    if "multimodal_limits" in data:
+        raise ValueError(
+            "Model config does not support multimodal_limits. "
+            "Put per-modality limits inside extra_modalities."
+        )
     if "extra_modalities" not in data:
         raise ValueError("Model config requires extra_modalities.")
-    raw_extra_modalities = data.get("extra_modalities")
-    if isinstance(raw_extra_modalities, str):
-        extra_modalities = parse_extra_modalities_input(
-            raw_extra_modalities,
-            required=True,
-        )
+    extra_modalities = parse_extra_modalities_config(data.get("extra_modalities"))
+    if extra_modalities:
+        if "multimodal_limit" not in data:
+            raise ValueError(
+                "Model config requires multimodal_limit when extra modalities are enabled."
+            )
+        multimodal_limit = parse_multimodal_limit(data.get("multimodal_limit"))
     else:
-        extra_modalities = normalize_extra_modalities(raw_extra_modalities)
+        if "multimodal_limit" in data:
+            raise ValueError(
+                "Model config must omit multimodal_limit when extra_modalities is empty."
+            )
+        multimodal_limit = None
     return ModelConfig(
         provider=provider,
         profile_name=profile_name,
@@ -723,6 +782,7 @@ def _sanitize_model_config(data, *, provider, profile_name):
         thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
         extra_modalities=extra_modalities,
+        multimodal_limit=multimodal_limit,
         context_window_tokens=context_window_tokens,
     )
 
@@ -804,6 +864,12 @@ def _sanitize_config(data):
     except ValueError:
         max_agent_tool_calls = DEFAULT_MAX_AGENT_TOOL_CALLS
     try:
+        file_inline_chars = parse_file_inline_chars(
+            agent_config.get("file_inline_chars", DEFAULT_FILE_INLINE_CHARS)
+        )
+    except ValueError:
+        file_inline_chars = DEFAULT_FILE_INLINE_CHARS
+    try:
         agent_approval_mode = parse_agent_approval_mode(
             agent_config.get("approve", DEFAULT_AGENT_APPROVAL_MODE)
         )
@@ -859,6 +925,7 @@ def _sanitize_config(data):
         model_list=model_list,
         max_agent_rounds=max_agent_rounds,
         max_agent_tool_calls=max_agent_tool_calls,
+        file_inline_chars=file_inline_chars,
         agent_approval_mode=agent_approval_mode,
         agent_plan_enable=_parse_bool(
             agent_config.get("plan_mode"), DEFAULT_AGENT_PLAN_ENABLE
@@ -945,6 +1012,10 @@ def save_config_field(key, value):
     save_config_fields({key: value})
 
 
+def save_model_profile_field(name, key, value):
+    save_config_fields({key: value}, model_name=name)
+
+
 def add_model_profile_with_config(name, model_config):
     config = _load_existing_config()
     model_name = str(name or "").strip()
@@ -1005,9 +1076,15 @@ def rename_model_profile(old_name, new_name):
     _persist_config(_sanitize_config(config.to_dict()))
     return new_key
 
-def save_config_fields(fields):
+def save_config_fields(fields, model_name=None):
     config = _load_existing_config()
-    active_name = config.active_model_name
+    active_name = (
+        _runtime_model_key(model_name, config.model_list)
+        if model_name is not None
+        else config.active_model_name
+    )
+    if model_name is not None and not active_name:
+        raise ValueError(f"Model profile not found: {model_name}")
     active_model = config.model_list.get(active_name)
     for key, value in dict(fields or {}).items():
         if key in MODEL_FIELD_KEYS:
@@ -1047,13 +1124,18 @@ def save_config_fields(fields):
                 else:
                     active_model.reasoning_effort = ""
             elif key == "extra_modalities":
-                if isinstance(value, str):
-                    active_model.extra_modalities = parse_extra_modalities_input(
-                        value,
-                        required=True,
-                    )
+                active_model.extra_modalities = parse_extra_modalities_config(value)
+                if active_model.extra_modalities:
+                    if active_model.multimodal_limit is None:
+                        active_model.multimodal_limit = DEFAULT_MULTIMODAL_LIMIT
                 else:
-                    active_model.extra_modalities = normalize_extra_modalities(value)
+                    active_model.multimodal_limit = None
+            elif key == "multimodal_limit":
+                if not active_model.extra_modalities:
+                    raise ValueError(
+                        "Cannot set multimodal_limit without extra modalities."
+                    )
+                active_model.multimodal_limit = parse_multimodal_limit(value)
             elif key == "context_window_tokens":
                 active_model.context_window_tokens = parse_context_window_tokens(value)
             continue
@@ -1070,6 +1152,8 @@ def save_config_fields(fields):
             config.max_agent_rounds = parse_agent_rounds(value)
         elif key == "max_agent_tool_calls":
             config.max_agent_tool_calls = parse_agent_tool_calls(value)
+        elif key == "file_inline_chars":
+            config.file_inline_chars = parse_file_inline_chars(value)
         elif key == "agent_approval_mode":
             config.agent_approval_mode = parse_agent_approval_mode(value)
         elif key == "agent_plan_enable":

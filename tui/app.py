@@ -25,15 +25,21 @@ from config import (
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
     AUTO_MODEL_SELECTION,
+    DEFAULT_EXTRA_MODALITY_LIMITS,
+    SUPPORTED_EXTRA_MODALITIES,
     delete_model_profile,
     format_extra_modalities,
     load_config,
     normalize_optional_model_selection,
+    parse_extra_modalities_config,
     parse_extra_modalities_input,
+    parse_file_inline_chars,
+    parse_multimodal_limit,
     normalize_reasoning_effort_for_api,
     rename_model_profile,
     save_config_field,
     save_config_fields,
+    save_model_profile_field,
     supported_reasoning_efforts,
 )
 from installer import PROVIDERS, install_registry_skill
@@ -464,6 +470,8 @@ class AgentTUIApp(App):
         self._title_summary_sessions: set[str] = set()
         self._archived_project_filter = "__all__"
         self._interrupt_send_payload: tuple[str, str] | None = None
+        self._settings_model_limit_key = "total"
+        self._settings_model_profile_key = ""
 
     @property
     def config(self):
@@ -2087,7 +2095,6 @@ class AgentTUIApp(App):
                 "layout": "model_list",
                 "show_search": False,
                 "state": self._settings_model_page_state,
-                "on_select_model": self._on_setting_model_changed,
             },
             "agent_mode": {
                 "title": "Agent mode",
@@ -2238,13 +2245,10 @@ class AgentTUIApp(App):
         ]
 
     def _settings_model_page_state(self, selected_name: str = "") -> dict:
-        models = list(self.config.model_list.keys())
-        current_model = (
-            self.config.current_model if self.config.current_model in models else ""
-        )
-        if selected_name and selected_name in models:
-            current_model = selected_name
+        config = self.config
+        models = list(config.model_list.keys())
         if not models:
+            self._settings_model_profile_key = ""
             return {
                 "models": [],
                 "groups": [],
@@ -2255,28 +2259,44 @@ class AgentTUIApp(App):
                 "blank_detail_when_empty": True,
             }
 
+        if selected_name in config.model_list:
+            selected_model = selected_name
+        elif self._settings_model_profile_key in config.model_list:
+            selected_model = self._settings_model_profile_key
+        elif config.current_model in config.model_list:
+            selected_model = config.current_model
+        else:
+            selected_model = models[0]
+        self._settings_model_profile_key = selected_model
+
         return {
             "models": models,
             "groups": self._grouped_model_choices(),
-            "selected_model": current_model,
+            "selected_model": selected_model,
             "item_labels": {
                 key: profile.profile_name
-                for key, profile in self.config.model_list.items()
+                for key, profile in config.model_list.items()
             },
-            "rows": self._settings_model_rows(),
+            "rows": self._settings_model_rows(selected_model),
             "footer_actions": [
                 {
                     "label": "Delete",
-                    "disabled": not bool(current_model),
-                    "on_activate": self._on_setting_delete_current_model,
+                    "disabled": not bool(selected_model),
+                    "on_activate": lambda key=selected_model: (
+                        self._on_setting_delete_model(key)
+                    ),
                 }
             ],
             "empty_list_label": "",
             "blank_detail_when_empty": True,
         }
 
-    def _settings_model_rows(self) -> list[dict]:
-        active_model = self.config.active_model
+    def _settings_model_rows(self, model_key: str = "") -> list[dict]:
+        config = self.config
+        selected_key = (
+            model_key if model_key in config.model_list else config.active_model_name
+        )
+        active_model = config.model_list.get(selected_key, config.active_model)
         bool_choices = [("true", "true"), ("false", "false")]
         reasoning_choices = self._reasoning_choices_for_api(active_model.api_type)
         current_effort = normalize_reasoning_effort_for_api(
@@ -2380,6 +2400,13 @@ class AgentTUIApp(App):
                 ),
             },
             {
+                "name": "Limit",
+                "keywords": "extra_modalities multimodal_limit upload size total",
+                "edit_type": "input",
+                "unit": "MB",
+                "limit_selector": True,
+            },
+            {
                 "name": "Context",
                 "value": str(active_model.context_window_tokens),
                 "keywords": "context_window_tokens context",
@@ -2387,9 +2414,45 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_model_context_changed(v),
             },
         ]
+        if active_model.api_type == API_TYPE_GLM:
+            rows = [row for row in rows if row.get("name") != "Base URL"]
+        if active_model.extra_modalities:
+            limit_options = [
+                (modality.title(), modality)
+                for modality in SUPPORTED_EXTRA_MODALITIES
+                if modality in active_model.extra_modalities
+            ]
+            limit_options.append(("Total", "total"))
+            available_limit_keys = {value for _label, value in limit_options}
+            if self._settings_model_limit_key not in available_limit_keys:
+                self._settings_model_limit_key = limit_options[0][1]
+            selected_limit_key = self._settings_model_limit_key
+            limit_row = next(row for row in rows if row.get("name") == "Limit")
+            limit_row.update(
+                {
+                    "limit_key": selected_limit_key,
+                    "options": limit_options,
+                    "value": str(
+                        active_model.multimodal_limit
+                        if selected_limit_key == "total"
+                        else active_model.extra_modalities[selected_limit_key]
+                    ),
+                    "on_limit_select": self._on_setting_model_limit_selected,
+                    "on_change": lambda v, key=selected_limit_key: (
+                        self._on_setting_model_limit_changed(key, v)
+                    ),
+                }
+            )
+        else:
+            rows = [row for row in rows if row.get("name") != "Limit"]
+
         if active_model.thinking_mode:
             rows.insert(
-                len(rows) - 2,
+                next(
+                    index
+                    for index, row in enumerate(rows)
+                    if row.get("name") == "Extra modalities"
+                ),
                 {
                     "name": "Reasoning effort",
                     "value": current_effort,
@@ -2407,16 +2470,20 @@ class AgentTUIApp(App):
         new_name = str(value or "").strip()
         if not new_name:
             return
-        old_name = str(self.config.current_model or "").strip()
+        old_name = self._settings_model_target_key()
         if not old_name:
             return
+        was_current = old_name == self.config.current_model
         try:
             renamed = rename_model_profile(old_name, new_name)
         except Exception as error:
-            self.add_status_message("[✗]", f"重命名失败: {error}")
+            self.add_status_message("[?]", f"?????: {error}")
             return
+        self._settings_model_profile_key = renamed
         self._reload_config()
-        self._on_setting_model_changed(renamed)
+        if was_current:
+            self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
 
     def _settings_agent_mode_rows(self) -> list[dict]:
         bool_choices = [("true", "true"), ("false", "false")]
@@ -2434,6 +2501,13 @@ class AgentTUIApp(App):
                 "keywords": "max_tool_calls",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_tool_calls_changed(v),
+            },
+            {
+                "name": "File inline chars",
+                "value": str(self.config.file_inline_chars),
+                "keywords": "file_inline_chars file attachment upload reference characters",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_file_inline_chars_changed(v),
             },
             {
                 "name": "Agent team",
@@ -3599,17 +3673,43 @@ class AgentTUIApp(App):
         self.push_screen(MemoryModal(self._memory_sections()))
 
 
-    def _on_setting_delete_current_model(self) -> None:
-        name = str(self.config.current_model or "").strip()
-        if not name:
+    def _settings_model_target_key(self) -> str:
+        config = self.config
+        if self._settings_model_profile_key in config.model_list:
+            return self._settings_model_profile_key
+        return config.current_model if config.current_model in config.model_list else ""
+
+    def _save_settings_model_field(self, key: str, value) -> bool:
+        target = self._settings_model_target_key()
+        if not target:
+            return False
+        was_current = target == self.config.current_model
+        save_model_profile_field(target, key, value)
+        self._reload_config()
+        if was_current:
+            self._sync_chat_from_active_model()
+        self._apply_config_to_controls()
+        return True
+
+    def _on_setting_delete_model(self, name: str) -> None:
+        target = str(name or "").strip()
+        if not target:
             return
+        was_current = target == self.config.current_model
         try:
-            delete_model_profile(name)
+            delete_model_profile(target)
         except Exception as error:
-            self.add_status_message("[✗]", f"删除模型失败: {error}")
+            self.add_status_message("[?]", f"??????: {error}")
             return
         self._reload_config()
-        self._sync_chat_from_active_model()
+        config = self.config
+        self._settings_model_profile_key = (
+            config.current_model
+            if config.current_model in config.model_list
+            else next(iter(config.model_list.keys()), "")
+        )
+        if was_current:
+            self._sync_chat_from_active_model()
         self._apply_config_to_controls()
 
     def _on_setting_model_changed(self, value: str) -> None:
@@ -3619,107 +3719,108 @@ class AgentTUIApp(App):
         self._apply_config_to_controls()
 
     def _on_setting_model_api_type_changed(self, value: str) -> None:
-        save_config_field("api_type", value)
-        self._reload_config()
-        self._sync_chat_from_active_model()
-        self._apply_config_to_controls()
+        self._save_settings_model_field("api_type", value)
 
     def _on_setting_model_base_url_changed(self, value: str) -> None:
-        save_config_field("base_url", value)
-        self._reload_config()
-        self._sync_chat_from_active_model()
-        self._apply_config_to_controls()
+        self._save_settings_model_field("base_url", value)
 
     def _on_setting_model_id_changed(self, value: str) -> None:
         model_id = str(value or "").strip()
         if not model_id:
             return
-        save_config_field("model", model_id)
-        self._reload_config()
-        self._sync_chat_from_active_model()
-        self._apply_config_to_controls()
+        self._save_settings_model_field("model", model_id)
 
     def _on_setting_model_api_key_changed(self, value: str) -> None:
-        save_config_field("api_key", str(value or "").strip())
-        self._reload_config()
-        self._sync_chat_from_active_model()
-        self._apply_config_to_controls()
+        self._save_settings_model_field("api_key", str(value or "").strip())
 
     def _on_setting_model_thinking_changed(self, value: str) -> None:
         enabled = str(value or "").lower() in ("on", "true", "yes")
-        save_config_field("thinking_mode", enabled)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_thinking_mode(enabled)
-            if enabled:
-                self.chat.set_reasoning_effort(
-                    self.config.active_model.reasoning_effort
-                )
-        self._apply_config_to_controls()
+        self._save_settings_model_field("thinking_mode", enabled)
 
     def _on_setting_model_reasoning_effort_changed(self, value: str) -> None:
+        target = self._settings_model_target_key()
+        profile = self.config.model_list.get(target)
+        if profile is None:
+            return
         effort = normalize_reasoning_effort_for_api(
-            self.config.active_model.api_type,
+            profile.api_type,
             value or "medium",
         )
-        save_config_field("reasoning_effort", effort)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_reasoning_effort(effort)
-        self._apply_config_to_controls()
+        self._save_settings_model_field("reasoning_effort", effort)
 
     def _on_setting_model_extra_modalities_changed(self, value: str) -> None:
         text = str(value or "")
         try:
-            parse_extra_modalities_input(text, required=True)
+            selected = parse_extra_modalities_input(text, required=True)
         except ValueError as error:
             self.add_status_message("[!]", str(error))
             return
-        save_config_field("extra_modalities", text)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_extra_modalities(self.config.active_model.extra_modalities)
-        self._apply_config_to_controls()
+        target = self._settings_model_target_key()
+        profile = self.config.model_list.get(target)
+        if profile is None:
+            return
+        current = profile.extra_modalities
+        updated = {
+            modality: current.get(
+                modality, DEFAULT_EXTRA_MODALITY_LIMITS[modality]
+            )
+            for modality in selected
+        }
+        self._save_settings_model_field("extra_modalities", updated)
+
+    def _on_setting_model_limit_selected(self, key: str) -> None:
+        self._settings_model_limit_key = str(key or "total")
+
+    def _on_setting_model_limit_changed(self, key: str, value: str) -> None:
+        if key == "total":
+            try:
+                limit = parse_multimodal_limit(value)
+            except ValueError as error:
+                self.add_status_message("[!]", str(error))
+                return
+            self._save_settings_model_field("multimodal_limit", limit)
+            return
+
+        target = self._settings_model_target_key()
+        profile = self.config.model_list.get(target)
+        if profile is None:
+            return
+        limits = dict(profile.extra_modalities)
+        if key not in limits:
+            return
+        limits[key] = value
+        try:
+            limits = parse_extra_modalities_config(limits)
+        except ValueError as error:
+            self.add_status_message("[!]", str(error))
+            return
+        self._save_settings_model_field("extra_modalities", limits)
 
     def _on_setting_model_context_changed(self, value: str) -> None:
         try:
             tokens = max(1, int(value))
         except (TypeError, ValueError):
             return
-        save_config_field("context_window_tokens", tokens)
-        self._reload_config()
-        self._refresh_context_label_for_active_model()
-        self._apply_config_to_controls()
+        if self._save_settings_model_field("context_window_tokens", tokens):
+            self._refresh_context_label_for_active_model()
 
     def _on_setting_token_changed(self, value: str) -> None:
         try:
             tokens = max(1, int(value))
         except (TypeError, ValueError):
             return
-        save_config_field("max_tokens", tokens)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_max_tokens(tokens)
-        self._apply_config_to_controls()
+        self._save_settings_model_field("max_tokens", tokens)
 
     def _on_setting_temp_changed(self, value: str) -> None:
         try:
             temp = max(0.0, min(1.0, float(value)))
         except (TypeError, ValueError):
             return
-        save_config_field("temperature", temp)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_temperature(temp)
-        self._apply_config_to_controls()
+        self._save_settings_model_field("temperature", temp)
 
     def _on_setting_stream_changed(self, value: str) -> None:
         enabled = value.lower() in ("on", "true", "yes")
-        save_config_field("stream_mode", enabled)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_stream_mode(enabled)
-        self._apply_config_to_controls()
+        self._save_settings_model_field("stream_mode", enabled)
 
     def _on_setting_thinking_changed(self, value: str) -> None:
         thinking_enabled = value != "none"
@@ -3773,6 +3874,16 @@ class AgentTUIApp(App):
         self._reload_config()
         if self.chat is not None:
             self.chat.set_agent_limits(max_tool_calls=calls)
+        self._apply_config_to_controls()
+
+    def _on_setting_file_inline_chars_changed(self, value: str) -> None:
+        try:
+            chars = parse_file_inline_chars(value)
+        except ValueError as error:
+            self.add_status_message("[!]", str(error))
+            return
+        save_config_field("file_inline_chars", chars)
+        self._reload_config()
         self._apply_config_to_controls()
 
     def _on_setting_skills_changed(self, value: str) -> None:
@@ -4055,7 +4166,13 @@ class AgentTUIApp(App):
             project = self._selected_project()
             base_dir = project.path if project is not None else None
             enriched_text, media_references, reference_files, reference_folders = (
-                attach_external_file_references_with_media(user_text, base_dir)
+                attach_external_file_references_with_media(
+                    user_text,
+                    base_dir,
+                    self.config.active_model.extra_modalities,
+                    self.config.active_model.multimodal_limit,
+                    self.config.file_inline_chars,
+                )
             )
             response = self.chat.send_message(
                 enriched_text,

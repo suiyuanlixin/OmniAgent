@@ -90,7 +90,12 @@ python main.py
         "stream_mode": true,
         "thinking_mode": true,
         "reasoning_effort": "max",
-        "extra_modalities": [],
+        "extra_modalities": {
+          "image": 10,
+          "audio": 50,
+          "video": 50
+        },
+        "multimodal_limit": 100,
         "context_window_tokens": 1000000
       }
     }
@@ -102,6 +107,7 @@ python main.py
   "agent_mode": {
     "max_rounds": 150,
     "max_tool_calls": 500,
+    "file_inline_chars": 50000,
     "approve": "approve",
     "plan_mode": false,
     "agent_team": {
@@ -143,10 +149,13 @@ python main.py
 - `model_list`：模型档案集合，可配置多个 profile。
 - `model_list.<provider>.<model_name>`：Provider 和模型档案名构成两级结构，允许不同 Provider 使用相同模型名。
 - `current_model`：使用 `{"provider": "...", "model_name": "..."}` 引用当前模型。
+- Model list 左侧列表只用于选择要查看和编辑的模型档案，不会更改 `current_model`。
 - `api_type`：支持 `glm`、`anthropic`、`openai`、`gemini`、`ollama`。
-- `base_url`：兼容端点地址。`gemini` 留空时自动使用官方 OpenAI 兼容地址；`ollama` 留空时走本地默认服务。
+- `base_url`：兼容端点地址；GLM 不使用该字段，即使配置中存在也会静默清除，Settings 也不会显示该项。`gemini` 留空时自动使用官方 OpenAI 兼容地址；`ollama` 留空时走本地默认服务。
 - `thinking_mode` 与 `reasoning_effort`：控制推理内容显示与强度。
-- `extra_modalities`：声明当前模型允许直接发送的附件模态，支持 `audio`、`image`、`video`。
+- `extra_modalities`：以 `{"image": 10, "audio": 50, "video": 50}` 的形式同时声明已启用模态和单文件上限，单位为 MB；不需要的模态直接省略。
+- `multimodal_limit`：单次请求中所有媒体经 Base64 编码后的总量上限，单位为 MB；仅当 `extra_modalities` 非空时配置，无多模态模型必须省略该字段。
+- `agent_mode.file_inline_chars`：普通文本文件直接附加到请求上下文的全局字符数上限，默认值为 `50000`，所有模型共用；超过该值的文件会保留为只读引用，Agent 可通过 `read_file` 按需读取。
 - `agent_mode.approve`：审批模式，支持 `confirm`、`approve`、`full`。
 - `agent_mode.plan_mode`：是否启用只读的 Plan mode。
 - `agent_mode.agent_team.enable`：是否启用 Team 模式。
@@ -230,17 +239,18 @@ Ollama 云端：
 
 - 相对路径只有在已选择工作区后可用。
 - 路径会做真实存在校验；不存在的目标不会转换成引用标签。
-- 文本文件内容会以只读上下文附加到本次请求，单文件最多附加 `60000` 个字符。
+- 普通文本文件最多以内联方式附加全局 Agent Mode 的 `file_inline_chars` 字符数（默认 `50000`），所有模型共用。
+- 超过该字符数的文件不会被拒绝，也不会截断后直接发送；它们会保留为只读引用，Agent 可通过 `read_file` 按需读取。
 - 文件夹不会直接展开进上下文，而是作为本次请求的只读目录权限来源。
 - 图片、音频、视频会按文件头和后缀识别类型。
 - 只有当前模型档案的 `extra_modalities` 声明了对应模态，媒体才会直接随请求发送。
 
-媒体限制：
+媒体限制按当前模型档案配置：
 
-- 图片最大 `10 MB`
-- 音频最大 `50 MB`
-- 视频最大 `50 MB`
-- 单次多模态请求体总量最大 `64 MB`
+- `extra_modalities` 的 key 表示已启用的模态，value 表示对应单文件大小上限。
+- `multimodal_limit` 表示单次请求所有 Base64 媒体的总量上限；启用首个模态时默认生成 `100 MB`，当 `extra_modalities` 为 `{}` 时必须完全省略。
+- Settings 仅在当前模型启用了至少一种额外模态时显示 Limit 设置；左侧下拉栏只列出已配置的模态和 `Total`，右侧数值后显示 `MB`。
+- 所有限制必须为大于 `0` 的整数。
 
 ## Agent 模式
 
@@ -530,7 +540,7 @@ ollama run deepseek-r1:671b
 检查：
 
 - `api_key` 是否正确
-- `base_url` 是否匹配目标服务
+- 非 GLM 接口的 `base_url` 是否匹配目标服务
 - `model` 是否存在
 - 当前网络是否可访问相应 API
 

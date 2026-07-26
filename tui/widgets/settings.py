@@ -13,9 +13,14 @@ from config import (
     API_TYPE_GLM,
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
+    DEFAULT_EXTRA_MODALITY_LIMITS,
+    DEFAULT_MULTIMODAL_LIMIT,
+    SUPPORTED_EXTRA_MODALITIES,
     add_model_profile_with_config,
     format_extra_modalities,
+    parse_extra_modalities_config,
     parse_extra_modalities_input,
+    parse_multimodal_limit,
     normalize_reasoning_effort_for_api,
     supported_reasoning_efforts,
 )
@@ -633,6 +638,73 @@ class SettingsModal(ModalScreen[None]):
         padding: 0 1;
     }
 
+    .settings-control-trigger-unit,
+    .settings-control-trigger-unit:hover,
+    .settings-control-trigger-unit:focus,
+    .settings-control-trigger-unit.-active {
+        padding-right: 0;
+    }
+
+    #settings-edit-input.settings-edit-input-unit {
+        padding-right: 0;
+    }
+
+    .settings-input-unit {
+        width: auto;
+        height: 1;
+        color: $TEXT_MUTED;
+        padding: 0 1 0 0;
+        margin: 0;
+        content-align: left middle;
+    }
+
+    .settings-limit-name {
+        width: 1fr;
+        height: 1;
+        min-width: 0;
+        margin: 0;
+        padding: 0;
+    }
+
+    .settings-limit-selector-drop {
+        width: auto;
+        height: 1;
+        min-width: 0;
+        margin: 0;
+    }
+
+    .settings-limit-selector-trigger,
+    .settings-limit-selector-trigger:hover,
+    .settings-limit-selector-trigger:focus,
+    .settings-limit-selector-trigger.-active {
+        width: auto;
+        height: 1;
+        min-width: 0;
+        background: $SURFACE_BACKGROUND;
+        background-tint: $SURFACE_BACKGROUND;
+        tint: transparent;
+        border: none;
+        outline: none;
+        color: $TEXT_PRIMARY;
+        margin: 0;
+        padding: 0 1 0 0;
+        text-align: left;
+        content-align: left middle;
+    }
+
+    .settings-limit-label {
+        width: auto;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        margin: 0;
+        padding: 0;
+        content-align: left middle;
+    }
+
+    .settings-limit-selector-options {
+        align-horizontal: left;
+    }
+
     .settings-autocomplete-drop {
         width: auto;
         height: 1;
@@ -1099,6 +1171,14 @@ class SettingsModal(ModalScreen[None]):
                     self._apply_change(row, format_extra_modalities(current))
             return
 
+        if control_id.startswith("settings-limit-selector-"):
+            row_index = self._parse_row_index(
+                control_id, "settings-limit-selector-"
+            )
+            if row_index is not None:
+                self._toggle_select_options(row_index)
+            return
+
         if control_id == "settings-edit-input":
             if self._editing_row_index is not None:
                 rows = self._visible_rows()
@@ -1171,7 +1251,10 @@ class SettingsModal(ModalScreen[None]):
                 option_value = str(options[option_index][1])
                 if option_value in self._disabled_option_values(row):
                     return
-                self._commit_select(row_index, option_value)
+                if bool(row.get("limit_selector")):
+                    self._commit_limit_selector(row_index, option_value)
+                else:
+                    self._commit_select(row_index, option_value)
             return
 
         if control_id.startswith("settings-select-group-toggle-"):
@@ -1349,6 +1432,9 @@ class SettingsModal(ModalScreen[None]):
 
     def _option_id(self, row_index: int, option_index: int) -> str:
         return f"settings-opt-{self._render_generation}-{row_index}-{option_index}"
+
+    def _limit_selector_id(self, row_index: int) -> str:
+        return f"settings-limit-selector-{self._render_generation}-{row_index}"
 
     def _accessory_id(self, row_index: int) -> str:
         return f"settings-accessory-{self._render_generation}-{row_index}"
@@ -2032,7 +2118,63 @@ class SettingsModal(ModalScreen[None]):
     def _build_row_widget(self, row: dict, row_index: int):
         edit_type = row.get("edit_type", _EDIT_NONE)
         name = str(row.get("name") or "")
-        header_children = [Static(name, classes="settings-name")]
+        unit = str(row.get("unit") or "").strip()
+        limit_selector = bool(row.get("limit_selector"))
+        header_children = [] if limit_selector else [Static(name, classes="settings-name")]
+        if limit_selector:
+            options = self._select_options(row)
+            selected = str(row.get("limit_key") or "")
+            selected_label = next(
+                (label for label, value in options if value == selected),
+                selected.title(),
+            )
+            trigger_width = max(len(selected_label) + 1, 6)
+            option_width = max(
+                max((len(label) for label, _value in options), default=0) + 2,
+                trigger_width,
+            )
+            option_widgets = [
+                _OptionItem(
+                    label,
+                    markup=False,
+                    id=self._option_id(row_index, option_index),
+                    classes=(
+                        "settings-option-btn selected"
+                        if value == selected
+                        else "settings-option-btn"
+                    ),
+                )
+                for option_index, (label, value) in enumerate(options)
+            ]
+            options_container = Vertical(
+                *option_widgets,
+                id=self._options_id(row_index),
+                classes="settings-options settings-limit-selector-options",
+            )
+            options_container.styles.width = option_width
+            options_container.styles.min_width = option_width
+            selector_trigger = _ValueTrigger(
+                selected_label,
+                markup=False,
+                id=self._limit_selector_id(row_index),
+                classes="settings-limit-selector-trigger",
+            )
+            selector_trigger.styles.width = trigger_width
+            selector_trigger.styles.min_width = trigger_width
+            selector_drop = Container(
+                selector_trigger,
+                options_container,
+                classes="settings-limit-selector-drop",
+            )
+            selector_drop.styles.width = trigger_width
+            selector_drop.styles.min_width = trigger_width
+            header_children.append(
+                Horizontal(
+                    selector_drop,
+                    Static("limit", markup=False, classes="settings-limit-label"),
+                    classes="settings-limit-name",
+                )
+            )
         accessory_label = str(row.get("accessory_label") or "").strip()
         accessory_widget = None
         if accessory_label:
@@ -2272,6 +2414,8 @@ class SettingsModal(ModalScreen[None]):
             header_children.extend(controls)
         else:
             trigger_classes = "settings-control-trigger"
+            if unit and edit_type == _EDIT_INPUT:
+                trigger_classes += " settings-control-trigger-unit"
             if edit_type == _EDIT_NAV:
                 trigger_classes += " settings-nav-trigger"
             display_value = self._display_value(row)
@@ -2293,6 +2437,10 @@ class SettingsModal(ModalScreen[None]):
                     classes=trigger_classes,
                 )
             )
+            if unit and edit_type == _EDIT_INPUT:
+                header_children.append(
+                    Static(unit, markup=False, classes="settings-input-unit")
+                )
 
         row_classes = ["settings-row"]
         if edit_type in {_EDIT_NAV, _EDIT_ACTION}:
@@ -2345,6 +2493,14 @@ class SettingsModal(ModalScreen[None]):
         row = self._visible_rows()[row_index]
         self._apply_change(row, new_value)
 
+    def _commit_limit_selector(self, row_index: int, new_value: str) -> None:
+        self._close_select_options()
+        row = self._visible_rows()[row_index]
+        on_change = row.get("on_limit_select")
+        if callable(on_change):
+            on_change(str(new_value))
+        self._render_current_page(self._current_query())
+
     def _commit_toggle(self, row_index: int) -> None:
         row = self._visible_rows()[row_index]
         self._apply_change(row, self._toggle_next_value(row))
@@ -2373,7 +2529,9 @@ class SettingsModal(ModalScreen[None]):
         placeholder_value = str(row.get("placeholder_value") or "")
 
         row_widget = self.query_one(f"#{self._row_widget_id(row_index)}", Horizontal)
-        value_button = row_widget.query_one(".settings-control-trigger", _ValueTrigger)
+        value_button = row_widget.query_one(
+            f"#{self._trigger_id(row_index)}", _ValueTrigger
+        )
         value_button.display = False
 
         input_kwargs = {
@@ -2383,6 +2541,8 @@ class SettingsModal(ModalScreen[None]):
         if placeholder_value:
             input_kwargs["placeholder"] = placeholder_value
         input_widget = Input(**input_kwargs)
+        if row.get("unit"):
+            input_widget.add_class("settings-edit-input-unit")
         input_width = max(len(current_value or placeholder_value) + 3, 8)
         input_widget.styles.width = input_width
         if row.get("edit_type") == _EDIT_AUTOCOMPLETE:
@@ -2430,7 +2590,11 @@ class SettingsModal(ModalScreen[None]):
             drop_container.styles.min_width = input_width
             row_widget.mount(drop_container)
         else:
-            row_widget.mount(input_widget)
+            if row.get("unit"):
+                unit_widget = row_widget.query_one(".settings-input-unit", Static)
+                row_widget.mount(input_widget, before=unit_widget)
+            else:
+                row_widget.mount(input_widget)
         input_widget.focus()
 
     def _autocomplete_options(self, row: dict) -> list[str]:
@@ -2513,17 +2677,19 @@ class SettingsModal(ModalScreen[None]):
                 f"#{self._row_widget_id(self._editing_row_index)}", Horizontal
             )
             value_button = row_widget.query_one(
-                ".settings-control-trigger", _ValueTrigger
+                f"#{self._trigger_id(self._editing_row_index)}", _ValueTrigger
             )
             value_button.display = True
             try:
                 autocomplete_drop = row_widget.query_one(
                     ".settings-autocomplete-drop", Container
                 )
+                autocomplete_drop.display = False
                 autocomplete_drop.remove()
             except Exception:
                 try:
                     input_widget = row_widget.query_one("#settings-edit-input", Input)
+                    input_widget.display = False
                     input_widget.remove()
                 except Exception:
                     pass
@@ -2569,6 +2735,11 @@ class SettingsModal(ModalScreen[None]):
             "thinking_mode": "false",
             "reasoning_effort": "medium",
             "extra_modalities": "none",
+            "image_limit": str(DEFAULT_EXTRA_MODALITY_LIMITS["image"]),
+            "audio_limit": str(DEFAULT_EXTRA_MODALITY_LIMITS["audio"]),
+            "video_limit": str(DEFAULT_EXTRA_MODALITY_LIMITS["video"]),
+            "multimodal_limit": str(DEFAULT_MULTIMODAL_LIMIT),
+            "selected_limit": "total",
             "context_window_tokens": "0",
         }
 
@@ -2599,6 +2770,8 @@ class SettingsModal(ModalScreen[None]):
             self._add_model_draft["reasoning_effort"] = (
                 normalize_reasoning_effort_for_api(value, current_effort)
             )
+            if value == API_TYPE_GLM:
+                self._add_model_draft.pop("base_url", None)
         self._add_model_draft[key] = value
 
     def _add_model_rows(self) -> list[dict]:
@@ -2716,6 +2889,13 @@ class SettingsModal(ModalScreen[None]):
                 ),
             },
             {
+                "name": "Limit",
+                "keywords": "extra_modalities multimodal_limit upload size total",
+                "edit_type": "input",
+                "unit": "MB",
+                "limit_selector": True,
+            },
+            {
                 "name": "Context",
                 "value": str(draft.get("context_window_tokens") or ""),
                 "keywords": "context_window_tokens context",
@@ -2725,9 +2905,54 @@ class SettingsModal(ModalScreen[None]):
                 ),
             },
         ]
+        if draft_api_type == API_TYPE_GLM:
+            rows = [row for row in rows if row.get("name") != "Base URL"]
+        selected_modalities = parse_extra_modalities_input(
+            str(draft.get("extra_modalities") or "none"), required=True
+        )
+        if selected_modalities:
+            limit_options = [
+                (modality.title(), modality)
+                for modality in SUPPORTED_EXTRA_MODALITIES
+                if modality in selected_modalities
+            ]
+            limit_options.append(("Total", "total"))
+            available_limit_keys = {value for _label, value in limit_options}
+            selected_limit = str(draft.get("selected_limit") or "total")
+            if selected_limit not in available_limit_keys:
+                selected_limit = limit_options[0][1]
+                self._add_model_draft["selected_limit"] = selected_limit
+            limit_row = next(row for row in rows if row.get("name") == "Limit")
+            limit_row.update(
+                {
+                    "limit_key": selected_limit,
+                    "options": limit_options,
+                    "value": str(
+                        draft.get("multimodal_limit")
+                        if selected_limit == "total"
+                        else draft.get(f"{selected_limit}_limit")
+                    ),
+                    "on_limit_select": lambda v: self._set_add_model_field(
+                        "selected_limit", str(v)
+                    ),
+                    "on_change": lambda v, key=selected_limit: (
+                        self._set_add_model_field(
+                            "multimodal_limit" if key == "total" else f"{key}_limit",
+                            str(v),
+                        )
+                    ),
+                }
+            )
+        else:
+            rows = [row for row in rows if row.get("name") != "Limit"]
+
         if thinking_enabled:
             rows.insert(
-                len(rows) - 2,
+                next(
+                    index
+                    for index, row in enumerate(rows)
+                    if row.get("name") == "Extra modalities"
+                ),
                 {
                     "name": "Reasoning effort",
                     "value": current_effort,
@@ -2769,21 +2994,43 @@ class SettingsModal(ModalScreen[None]):
         except ValueError as error:
             self.app_ref.add_status_message("[!]", str(error))
             return ""
+        selected_modalities = parse_extra_modalities_input(
+            extra_modalities, required=True
+        )
+        try:
+            extra_modalities_config = parse_extra_modalities_config(
+                {
+                    modality: draft.get(f"{modality}_limit")
+                    for modality in selected_modalities
+                }
+            )
+            multimodal_limit = (
+                parse_multimodal_limit(draft.get("multimodal_limit"))
+                if extra_modalities_config
+                else None
+            )
+        except ValueError as error:
+            self.app_ref.add_status_message("[!]", str(error))
+            return ""
         max_tokens = str(draft.get("max_tokens") or "").strip()
         context_tokens = str(draft.get("context_window_tokens") or "").strip()
         temperature = str(draft.get("temperature") or "").strip()
+        api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
         payload = {
             "provider": provider,
-            "api_type": str(draft.get("api_type") or API_TYPE_OLLAMA),
-            "base_url": str(draft.get("base_url") or ""),
+            "api_type": api_type,
             "model": str(draft.get("model") or ""),
             "api_key": str(draft.get("api_key") or ""),
             "temperature": temperature,
             "stream_mode": draft.get("stream_mode"),
             "thinking_mode": draft.get("thinking_mode"),
             "reasoning_effort": draft.get("reasoning_effort"),
-            "extra_modalities": extra_modalities,
+            "extra_modalities": extra_modalities_config,
         }
+        if api_type != API_TYPE_GLM:
+            payload["base_url"] = str(draft.get("base_url") or "")
+        if extra_modalities_config:
+            payload["multimodal_limit"] = multimodal_limit
         if max_tokens and max_tokens != "0":
             payload["max_tokens"] = max_tokens
         if context_tokens and context_tokens != "0":
