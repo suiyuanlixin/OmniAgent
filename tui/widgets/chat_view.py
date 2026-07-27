@@ -811,6 +811,7 @@ class ChatView(Widget):
         self._thought_stream_target: ThoughtBlock | None = None
         self._thought_stream_content = ""
         self._thought_stream_transcript_index: int | None = None
+        self._overflow_replay_checkpoint: tuple[int, int, int] | None = None
         self._explored_block: ExploredBlock | None = None
         self._edited_block: EditedBlock | None = None
         self._write_block: WrittenBlock | None = None
@@ -930,6 +931,84 @@ class ChatView(Widget):
         )
         self.call_after_refresh(self._scroll_end)
 
+    def begin_overflow_replay_scope(self) -> None:
+        log = self.query_one("#chat-log", VerticalScroll)
+        self._overflow_replay_checkpoint = (
+            len(log.children),
+            len(self._transcript),
+            len(self.messages),
+        )
+
+    def commit_overflow_replay_scope(self) -> None:
+        self._overflow_replay_checkpoint = None
+
+    def rollback_overflow_replay_scope(self) -> None:
+        checkpoint = self._overflow_replay_checkpoint
+        self._overflow_replay_checkpoint = None
+        if checkpoint is None:
+            return
+
+        child_count, transcript_count, message_count = checkpoint
+        log = self.query_one("#chat-log", VerticalScroll)
+        children = list(log.children)
+        remaining_children = children[:child_count]
+        for child in children[child_count:]:
+            child.remove()
+        del self._transcript[transcript_count:]
+        del self.messages[message_count:]
+
+        self._stream_target = None
+        self._stream_row = None
+        self._stream_role = None
+        self._stream_content = ""
+        self._stream_transcript_index = None
+        self._thought_stream_target = None
+        self._thought_stream_content = ""
+        self._thought_stream_transcript_index = None
+        self._active_output_kind = None
+
+        for attribute in (
+            "_explored_block",
+            "_edited_block",
+            "_write_block",
+            "_shell_block",
+            "_questions_block",
+        ):
+            block = getattr(self, attribute, None)
+            if block is not None and block not in remaining_children:
+                setattr(self, attribute, None)
+        self._compaction_blocks = {
+            key: block
+            for key, block in self._compaction_blocks.items()
+            if block in remaining_children
+        }
+        self._compaction_transcript_indices = {
+            key: index
+            for key, index in self._compaction_transcript_indices.items()
+            if key in self._compaction_blocks and index < transcript_count
+        }
+        self._subagent_blocks = {
+            key: block
+            for key, block in self._subagent_blocks.items()
+            if block in remaining_children
+        }
+        self._subagent_transcript_indices = {
+            key: index
+            for key, index in self._subagent_transcript_indices.items()
+            if key in self._subagent_blocks and index < transcript_count
+        }
+        self._team_blocks = {
+            key: block
+            for key, block in self._team_blocks.items()
+            if block in remaining_children
+        }
+        self._team_transcript_indices = {
+            key: index
+            for key, index in self._team_transcript_indices.items()
+            if key in self._team_blocks and index < transcript_count
+        }
+        self.call_after_refresh(self._scroll_end)
+
     def remove_last_messages(self, count: int = 1) -> None:
         count = max(1, int(count or 1))
         remove_count = count
@@ -963,6 +1042,7 @@ class ChatView(Widget):
         self._thought_stream_target = None
         self._thought_stream_content = ""
         self._thought_stream_transcript_index = None
+        self._overflow_replay_checkpoint = None
         self._explored_block = None
         self._edited_block = None
         self._write_block = None
@@ -1702,8 +1782,10 @@ class CompactionBlock(Vertical):
     LABELS = {
         ("auto", "running"): "Auto context compaction",
         ("auto", "done"): "Context compact complete",
+        ("auto", "failed"): "Context compact failed",
         ("manual", "running"): "Manual context compaction",
         ("manual", "done"): "Context compact complete",
+        ("manual", "failed"): "Context compact failed",
     }
 
     def __init__(self, status: str = "running", mode: str = "auto", details: str = ""):
@@ -1727,7 +1809,7 @@ class CompactionBlock(Vertical):
         self._refresh()
 
     def on_click(self, event: events.Click) -> None:
-        if self.status != "done" or not self.details:
+        if self.status not in {"done", "failed"} or not self.details:
             return
         self.expanded = not self.expanded
         self._refresh()
@@ -1747,7 +1829,7 @@ class CompactionBlock(Vertical):
         self.status = str(status or "running")
         self.mode = str(mode or "auto")
         self.details = str(details or "")
-        if self.status != "done" or not self.details:
+        if self.status not in {"done", "failed"} or not self.details:
             self.expanded = False
         self._refresh()
 
@@ -1762,7 +1844,7 @@ class CompactionBlock(Vertical):
             return
         self._line_widget.update(self._line_markup())
         self._details_widget.update(self.details)
-        if self.expanded and self.status == "done" and self.details:
+        if self.expanded and self.status in {"done", "failed"} and self.details:
             self._details_widget.remove_class("hidden")
         else:
             self._details_widget.add_class("hidden")

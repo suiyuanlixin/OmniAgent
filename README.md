@@ -125,8 +125,6 @@ python main.py
   },
   "auto_compact": {
     "enable": true,
-    "trigger_ratio": 0.75,
-    "keep_recent_messages": 10,
     "compact_model": "auto"
   },
   "memory_system": {
@@ -161,7 +159,12 @@ python main.py
 - `agent_mode.agent_team.enable`：是否启用 Team 模式。
 - `skills.sources.app`：是否加载程序目录 `skills/`。
 - `skills.sources.workspace`：是否加载工作区 `.omniagent/skills/`。
-- `auto_compact.compact_model`：上下文压缩模型，使用同样的 Provider/Model 引用对象，`auto` 表示跟随当前模型。
+- 自动压缩的可用输入预算为 `context_window_tokens - max_tokens`；上下文占用达到该预算时触发清理或压缩，不再提供压缩比例配置。
+- 压缩时默认只考虑最近 `2` 个完整用户回合，并按可用输入预算的 `25%` 自动计算保留预算，最少 `2000`、最多 `8000` 个估算 token；超大回合会从回合内部切分保留最新尾部。
+- 自动压缩用尽可用输入预算后，会先尝试清理较旧的大型工具结果；若清理后仍超出可用输入预算，才调用压缩模型生成摘要。若服务端仍返回上下文溢出，普通聊天会自动重放当前用户回合一次；工具/Agent 模式只重放当前模型请求，不重复执行已完成的工具。
+- 上下文统计优先采用 API 返回的 `input`、`output`、`reasoning`、缓存和 `total` usage；API 未提供 usage 时才使用本地 token 估算。
+- 每个 Provider API 回合（主对话、工具/Agent、压缩、Memory 更新和标题生成）的 usage 会写入 session 的 `usage_history`；提供商未返回 usage 时保留该回合记录并标记 `usage_available: false`。
+- `auto_compact.compact_model`：上下文压缩模型，使用同样的 Provider/Model 引用对象，`auto` 表示跟随当前模型；压缩请求的 usage 会与主对话 usage 分开记录。
 - `memory_system.memory_model`：记忆写入模型，使用同样的 Provider/Model 引用对象，`auto` 表示跟随当前模型。
 - `web_search.provider`：当前仅支持 `tavily`。
 

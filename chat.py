@@ -11,9 +11,11 @@ from typing import Any, Dict, List, Optional
 from ui import (
     add_explored_entry,
     append_subagent_event,
+    begin_overflow_replay_scope,
     append_team_event,
     clean_and_print_stream_response,
     clean_display_text,
+    commit_overflow_replay_scope,
     finish_compaction_entry,
     finish_team_entry,
     finish_thinking_round,
@@ -24,6 +26,7 @@ from ui import (
     print_stream_response_continue,
     print_stream_response_start,
     print_warn,
+    rollback_overflow_replay_scope,
     set_todo_panel,
     set_context_usage,
     start_compaction_entry,
@@ -37,7 +40,6 @@ from config import (
     API_TYPE_OLLAMA,
     API_TYPE_OPENAI,
     AUTO_MODEL_SELECTION,
-    DEFAULT_COMPACTION_TRIGGER_RATIO,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     DEFAULT_MAX_AGENT_ROUNDS,
     DEFAULT_MAX_AGENT_TOOL_CALLS,
@@ -90,6 +92,14 @@ from team import (
 AGENT_CONTEXT_WARN_CHARS = 180000
 AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
 COMPACTION_MAX_TOKENS = 2048
+COMPACTION_TAIL_TURNS = 2
+COMPACTION_RECENT_TOKEN_MIN = 2000
+COMPACTION_RECENT_TOKEN_MAX = 8000
+COMPACTION_TOOL_PROTECT_TOKENS = 40000
+COMPACTION_TOOL_PRUNE_MIN_TOKENS = 20000
+COMPACTION_TOOL_RESULT_PLACEHOLDER = (
+    "[Old tool result pruned to reduce context usage. Re-run the tool if details are needed.]"
+)
 MEMORY_UPDATE_MAX_TOKENS = 4096
 COMPACTION_SUMMARY_PREFIX = "[Compressed conversation summary for continuity]"
 USER_PROMPT_FILE = "prompt.md"
@@ -269,8 +279,6 @@ class OmniAgent:
         skills_auto_catalog=True,
         skills_max_chars=12000,
         compaction_enable=True,
-        compaction_trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
-        compaction_keep_recent_messages=12,
         compaction_compact_model=AUTO_MODEL_SELECTION,
         memory_model=AUTO_MODEL_SELECTION,
         web_search_enabled=True,
@@ -283,11 +291,14 @@ class OmniAgent:
         agent_team_enable=False,
         current_model_name="",
         history_path=None,
+        usage_history_callback=None,
     ):
         _ensure_user_prompt_file()
         self.memory_store = MemoryStore(history_path=history_path)
         self.memory_lock = threading.Lock()
         self.session_memory_lock = threading.Lock()
+        self.usage_history_lock = threading.Lock()
+        self.usage_history_callback = usage_history_callback
         self._agent_tools_execution_lock = threading.RLock()
         self._team_tasks_lock = threading.RLock()
         self._team_tasks = {}
@@ -301,14 +312,19 @@ class OmniAgent:
         )
         self.extra_modalities = normalize_extra_modalities(extra_modalities)
         self.last_context_input_tokens = 0
+        self.last_context_output_tokens = 0
+        self.last_context_reasoning_tokens = 0
+        self.last_context_cache_read_tokens = 0
+        self.last_context_cache_write_tokens = 0
+        self.last_context_total_tokens = 0
         self.last_context_usage_source = ""
+        self.last_compaction_usage = {}
+        self.request_usage_history = []
         self.current_model_name = str(current_model_name or "").strip()
         self.set_context_window_tokens(context_window_tokens)
         self.set_compaction_config(
             compaction_enable,
-            compaction_keep_recent_messages,
             compaction_compact_model,
-            compaction_trigger_ratio,
         )
         self.set_memory_model(memory_model)
         self.agent_tools = AgentTools(
@@ -563,25 +579,14 @@ class OmniAgent:
     def set_compaction_config(
         self,
         enabled=None,
-        keep_recent_messages=None,
         compact_model=None,
-        trigger_ratio=None,
     ):
         if enabled is not None:
             self.compaction_enable = bool(enabled)
-        if keep_recent_messages is not None:
-            self.compaction_keep_recent_messages = max(1, int(keep_recent_messages))
         if compact_model is not None:
             self.compaction_compact_model = normalize_optional_model_selection(
                 compact_model
             )
-        if trigger_ratio is not None:
-            ratio = float(trigger_ratio)
-            if ratio <= 0 or ratio > 1:
-                raise ValueError(
-                    "Auto compact trigger ratio must be greater than 0 and at most 1."
-                )
-            self.compaction_trigger_ratio = ratio
 
     def set_memory_model(self, model):
         self.memory_model = normalize_optional_model_selection(model)
@@ -717,51 +722,62 @@ class OmniAgent:
         self._record_preference_signal(user_message)
         original_history = self._history_snapshot()
         self.agent_stop_requested = False
+        self._message_overflow_replayed = False
+        if self.agent_mode and not self.agent_tools.enabled:
+            self.agent_mode = False
+        managed_round_replay = self.agent_mode or self._normal_tools_available()
+        whole_turn_replay = not managed_round_replay
 
         try:
-            self._auto_compact_context()
-            self._sanitize_orphan_tool_results_in_history()
+            response = None
             user_message_index = len(self.conversation_history) - 1
+            attempts = 2 if whole_turn_replay else 1
+            for attempt in range(attempts):
+                self._auto_compact_context()
+                self._sanitize_orphan_tool_results_in_history()
+                user_message_index = len(self.conversation_history) - 1
+                request_history = self._history_snapshot()
+                if whole_turn_replay:
+                    begin_overflow_replay_scope()
 
-            if self.agent_mode and not self.agent_tools.enabled:
-                self.agent_mode = False
+                try:
+                    response = self._request_current_turn(
+                        stream_callback_thinking,
+                        stream_callback_response,
+                    )
+                except Exception as error:
+                    self._restore_history(request_history)
+                    if whole_turn_replay:
+                        rollback_overflow_replay_scope()
+                    if (
+                        whole_turn_replay
+                        and attempt == 0
+                        and _is_context_overflow_error(error)
+                    ):
+                        recovery = self._recover_context_overflow()
+                        if recovery.get("recovered"):
+                            self._message_overflow_replayed = True
+                            print_info(
+                                "Context overflow detected. Compacted context and "
+                                "replaying the current turn."
+                            )
+                            continue
+                    raise
+                else:
+                    if whole_turn_replay:
+                        if response is None:
+                            rollback_overflow_replay_scope()
+                        else:
+                            commit_overflow_replay_scope()
+                    break
 
-            if self.agent_mode:
-                response = self._agent_response()
-            elif self._normal_tools_available():
-                response = self._normal_web_search_response(
-                    stream_callback_thinking,
-                    stream_callback_response,
-                )
-            elif self.stream_mode:
-                response = self._stream_response(
-                    stream_callback_thinking, stream_callback_response, self.model
-                )
-            elif self.api_type == API_TYPE_ANTHROPIC:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    system=self._normal_system_prompt(),
-                    messages=self._anthropic_messages(),
-                    **self._anthropic_request_options(),
-                )
-                response = self._parse_anthropic_response(response)
-            elif self.api_type == API_TYPE_OLLAMA:
-                response = self.client.chat(
-                    **self._ollama_chat_kwargs(messages=self.conversation_history)
-                )
-                response = self._parse_ollama_response(response)
-            else:
-                response = self.client.chat.completions.create(
-                    **self._chat_completion_kwargs(messages=self.conversation_history)
-                )
-                response = self._parse_response(response)
-
+            if response and self._message_overflow_replayed:
+                response["overflow_replayed"] = True
             if response and not response.get("agent_stopped"):
                 self._record_hot_history(user_message_index)
             if response is None:
-                self._restore_history(original_history)
+                if whole_turn_replay:
+                    self._restore_history(original_history)
             elif response.get("agent_stopped"):
                 self._restore_history(original_history)
             elif self.agent_mode:
@@ -783,7 +799,8 @@ class OmniAgent:
                 }
             raise
         except Exception as error:
-            self._restore_history(original_history)
+            if whole_turn_replay:
+                self._restore_history(original_history)
             if self.agent_running:
                 self._separate_after_agent_thinking()
             print_error(f"Request error: {error}")
@@ -791,6 +808,90 @@ class OmniAgent:
         finally:
             self.agent_tools.clear_reference_files()
             self.agent_tools.clear_reference_folders()
+
+    def _request_current_turn(
+        self,
+        stream_callback_thinking=None,
+        stream_callback_response=None,
+    ):
+        if self.agent_mode and not self.agent_tools.enabled:
+            self.agent_mode = False
+
+        if self.agent_mode:
+            return self._agent_response()
+        if self._normal_tools_available():
+            return self._normal_web_search_response(
+                stream_callback_thinking,
+                stream_callback_response,
+            )
+        if self.stream_mode:
+            return self._stream_response(
+                stream_callback_thinking,
+                stream_callback_response,
+                self.model,
+            )
+        if self.api_type == API_TYPE_ANTHROPIC:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                system=self._normal_system_prompt(),
+                messages=self._anthropic_messages(),
+                **self._anthropic_request_options(),
+            )
+            return self._parse_anthropic_response(response)
+        if self.api_type == API_TYPE_OLLAMA:
+            response = self.client.chat(
+                **self._ollama_chat_kwargs(messages=self.conversation_history)
+            )
+            return self._parse_ollama_response(response)
+
+        response = self.client.chat.completions.create(
+            **self._chat_completion_kwargs(messages=self.conversation_history)
+        )
+        return self._parse_response(response)
+
+    def _run_model_turn_with_overflow_recovery(self, turn_callable):
+        for attempt in range(2):
+            round_history = self._history_snapshot()
+            begin_overflow_replay_scope()
+            try:
+                result = turn_callable()
+            except Exception as error:
+                self._restore_history(round_history)
+                rollback_overflow_replay_scope()
+                if attempt == 0 and _is_context_overflow_error(error):
+                    recovery = self._recover_context_overflow()
+                    if recovery.get("recovered"):
+                        self._message_overflow_replayed = True
+                        print_info(
+                            "Context overflow detected. Compacted context and "
+                            "replaying the current model round."
+                        )
+                        continue
+                raise
+            commit_overflow_replay_scope()
+            return result
+        raise RuntimeError("Model round replay exhausted.")
+
+    def _recover_context_overflow(self):
+        input_budget_tokens = self._compaction_input_budget()
+        before_tokens = self._estimate_current_context_tokens()
+        prune_result = self._soft_prune_old_tool_results(input_budget_tokens)
+        compact_result = self.compact_context(manual=False)
+
+        after_tokens = self._estimate_current_context_tokens()
+        recovered = bool(
+            prune_result.get("pruned_tool_results")
+            or compact_result.get("compacted")
+        ) and after_tokens < before_tokens
+        return {
+            "recovered": recovered,
+            "before_input_tokens": before_tokens,
+            "after_input_tokens": after_tokens,
+            **prune_result,
+            "compaction": compact_result,
+        }
 
     def _agent_response(self):
         self.agent_running = True
@@ -852,7 +953,9 @@ class OmniAgent:
                 return self._agent_stopped_response(full_thinking, final_response)
             self._print_agent_round(round_index)
             self._warn_agent_context_if_needed()
-            blocks, response_streamed = self._stream_anthropic_agent_turn()
+            blocks, response_streamed = self._run_model_turn_with_overflow_recovery(
+                self._stream_anthropic_agent_turn
+            )
             self.conversation_history.append({"role": "assistant", "content": blocks})
 
             thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
@@ -943,15 +1046,15 @@ class OmniAgent:
         raw_response = ""
         tool_call_parts = {}
         reasoning_detail_parts = {}
-        usage_input_tokens = None
+        usage_snapshot = None
         response_streamed = False
 
         for chunk in response:
             if self._agent_should_stop():
                 break
-            chunk_input_tokens = _response_input_tokens(chunk)
-            if chunk_input_tokens is not None:
-                usage_input_tokens = chunk_input_tokens
+            chunk_usage = _response_token_usage(chunk)
+            if chunk_usage is not None:
+                usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
             if not getattr(chunk, "choices", None):
                 continue
 
@@ -997,10 +1100,7 @@ class OmniAgent:
                 self._get_field(delta, "tool_calls", None) or [],
             )
 
-        if usage_input_tokens is not None:
-            self._set_context_input_tokens(usage_input_tokens, "api_usage")
-        else:
-            self._record_context_usage(None)
+        self._record_context_usage_snapshot(usage_snapshot)
 
         full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
         assistant_message = self._chat_stream_assistant_message(
@@ -1047,7 +1147,9 @@ class OmniAgent:
                 text,
                 tool_calls,
                 response_streamed,
-            ) = self._stream_chat_completion_agent_turn()
+            ) = self._run_model_turn_with_overflow_recovery(
+                self._stream_chat_completion_agent_turn
+            )
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             final_response += text
@@ -1142,10 +1244,12 @@ class OmniAgent:
         final_response = ""
 
         for _ in range(self._normal_web_search_tool_limit()):
-            response = self.client.chat.completions.create(
-                **self._chat_completion_kwargs(
-                    messages=self.conversation_history,
-                    tools=self._normal_web_search_tool_schemas(),
+            response = self._run_model_turn_with_overflow_recovery(
+                lambda: self.client.chat.completions.create(
+                    **self._chat_completion_kwargs(
+                        messages=self.conversation_history,
+                        tools=self._normal_web_search_tool_schemas(),
+                    )
                 )
             )
             self._record_context_usage(response)
@@ -1189,10 +1293,12 @@ class OmniAgent:
         final_response = ""
 
         for _ in range(self._normal_web_search_tool_limit()):
-            response = self.client.chat(
-                **self._ollama_chat_kwargs(
-                    messages=self.conversation_history,
-                    tools=self._normal_web_search_tool_schemas(),
+            response = self._run_model_turn_with_overflow_recovery(
+                lambda: self.client.chat(
+                    **self._ollama_chat_kwargs(
+                        messages=self.conversation_history,
+                        tools=self._normal_web_search_tool_schemas(),
+                    )
                 )
             )
             self._record_context_usage(response)
@@ -1236,14 +1342,16 @@ class OmniAgent:
         final_response = ""
 
         for _ in range(self._normal_web_search_tool_limit()):
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                system=self._normal_system_prompt(),
-                messages=self._anthropic_messages(),
-                tools=self._normal_web_search_tool_schemas(),
-                **self._anthropic_request_options(),
+            response = self._run_model_turn_with_overflow_recovery(
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    system=self._normal_system_prompt(),
+                    messages=self._anthropic_messages(),
+                    tools=self._normal_web_search_tool_schemas(),
+                    **self._anthropic_request_options(),
+                )
             )
             self._record_context_usage(response)
             blocks = self._anthropic_content_blocks(
@@ -1387,12 +1495,14 @@ class OmniAgent:
                     text,
                     tool_calls,
                     response_started,
-                ) = self._stream_chat_completion_normal_web_search_turn(
-                    full_thinking,
-                    response_started,
-                    tracked_callback_thinking,
-                    stream_callback_response,
-                    emit_response=True,
+                ) = self._run_model_turn_with_overflow_recovery(
+                    lambda: self._stream_chat_completion_normal_web_search_turn(
+                        full_thinking,
+                        response_started,
+                        tracked_callback_thinking,
+                        stream_callback_response,
+                        emit_response=True,
+                    )
                 )
                 full_thinking += thinking
                 if self._agent_should_stop():
@@ -1425,6 +1535,8 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
+            if _is_context_overflow_error(error):
+                raise
             print_error(_format_stream_error_message(error))
             return None
 
@@ -1457,14 +1569,14 @@ class OmniAgent:
         raw_response = ""
         tool_call_parts = {}
         reasoning_detail_parts = {}
-        usage_input_tokens = None
+        usage_snapshot = None
 
         for chunk in response:
             if self._agent_should_stop():
                 break
-            chunk_input_tokens = _response_input_tokens(chunk)
-            if chunk_input_tokens is not None:
-                usage_input_tokens = chunk_input_tokens
+            chunk_usage = _response_token_usage(chunk)
+            if chunk_usage is not None:
+                usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
             if not getattr(chunk, "choices", None):
                 continue
 
@@ -1516,10 +1628,7 @@ class OmniAgent:
                 self._get_field(delta, "tool_calls", None) or [],
             )
 
-        if usage_input_tokens is not None:
-            self._set_context_input_tokens(usage_input_tokens, "api_usage")
-        else:
-            self._record_context_usage(None)
+        self._record_context_usage_snapshot(usage_snapshot)
 
         full_thinking = _combine_reasoning_text(field_thinking, tagged_thinking)
         assistant_message = self._chat_stream_assistant_message(
@@ -1631,12 +1740,14 @@ class OmniAgent:
                     text,
                     tool_calls,
                     response_started,
-                ) = self._stream_ollama_normal_web_search_turn(
-                    full_thinking,
-                    response_started,
-                    tracked_callback_thinking,
-                    stream_callback_response,
-                    emit_response=True,
+                ) = self._run_model_turn_with_overflow_recovery(
+                    lambda: self._stream_ollama_normal_web_search_turn(
+                        full_thinking,
+                        response_started,
+                        tracked_callback_thinking,
+                        stream_callback_response,
+                        emit_response=True,
+                    )
                 )
                 full_thinking += thinking
                 if self._agent_should_stop():
@@ -1670,6 +1781,8 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
+            if _is_context_overflow_error(error):
+                raise
             print_error(_format_stream_error_message(error))
             return None
 
@@ -1694,14 +1807,14 @@ class OmniAgent:
         full_response = ""
         raw_response = ""
         tool_call_parts = {}
-        usage_input_tokens = None
+        usage_snapshot = None
 
         for chunk in response:
             if self._agent_should_stop():
                 break
-            chunk_input_tokens = _response_input_tokens(chunk)
-            if chunk_input_tokens is not None:
-                usage_input_tokens = chunk_input_tokens
+            chunk_usage = _response_token_usage(chunk)
+            if chunk_usage is not None:
+                usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
 
             message = self._get_field(chunk, "message", {})
             thinking = self._get_field(message, "thinking", "") or ""
@@ -1740,10 +1853,7 @@ class OmniAgent:
                 self._get_field(message, "tool_calls", None) or [],
             )
 
-        if usage_input_tokens is not None:
-            self._set_context_input_tokens(usage_input_tokens, "api_usage")
-        else:
-            self._record_context_usage(None)
+        self._record_context_usage_snapshot(usage_snapshot)
 
         assistant_tool_calls, tool_calls = self._ollama_stream_tool_calls(
             tool_call_parts
@@ -1845,12 +1955,14 @@ class OmniAgent:
                     text,
                     tool_uses,
                     response_started,
-                ) = self._stream_anthropic_normal_web_search_turn(
-                    full_thinking,
-                    response_started,
-                    tracked_callback_thinking,
-                    stream_callback_response,
-                    emit_response=True,
+                ) = self._run_model_turn_with_overflow_recovery(
+                    lambda: self._stream_anthropic_normal_web_search_turn(
+                        full_thinking,
+                        response_started,
+                        tracked_callback_thinking,
+                        stream_callback_response,
+                        emit_response=True,
+                    )
                 )
                 full_thinking += thinking
                 if self._agent_should_stop():
@@ -1908,6 +2020,8 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
+            if _is_context_overflow_error(error):
+                raise
             print_error(_format_stream_error_message(error))
             return None
 
@@ -1937,13 +2051,13 @@ class OmniAgent:
         tagged_thinking = ""
         full_response = ""
         raw_response = ""
-        usage_input_tokens = None
+        usage_snapshot = None
         for chunk in response:
             if self._agent_should_stop():
                 break
-            chunk_input_tokens = _response_input_tokens(chunk)
-            if chunk_input_tokens is not None:
-                usage_input_tokens = chunk_input_tokens
+            chunk_usage = _response_token_usage(chunk)
+            if chunk_usage is not None:
+                usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
             chunk_type = self._get_field(chunk, "type", "")
 
             if chunk_type == "content_block_start":
@@ -2096,10 +2210,7 @@ class OmniAgent:
 
         for block in blocks:
             block.pop("_input_json", None)
-        if usage_input_tokens is not None:
-            self._set_context_input_tokens(usage_input_tokens, "api_usage")
-        else:
-            self._record_context_usage(None)
+        self._record_context_usage_snapshot(usage_snapshot)
 
         thinking, text, tool_uses = self._parse_anthropic_blocks(blocks)
         thinking = _combine_reasoning_text(
@@ -2281,13 +2392,13 @@ class OmniAgent:
         field_thinking = ""
         full_response = ""
         tool_call_parts = {}
-        usage_input_tokens = None
+        usage_snapshot = None
         response_streamed = False
 
         for chunk in response:
-            chunk_input_tokens = _response_input_tokens(chunk)
-            if chunk_input_tokens is not None:
-                usage_input_tokens = chunk_input_tokens
+            chunk_usage = _response_token_usage(chunk)
+            if chunk_usage is not None:
+                usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
 
             message = self._get_field(chunk, "message", {})
             thinking = self._get_field(message, "thinking", "") or ""
@@ -2312,10 +2423,7 @@ class OmniAgent:
                 self._get_field(message, "tool_calls", None) or [],
             )
 
-        if usage_input_tokens is not None:
-            self._set_context_input_tokens(usage_input_tokens, "api_usage")
-        else:
-            self._record_context_usage(None)
+        self._record_context_usage_snapshot(usage_snapshot)
 
         assistant_tool_calls, tool_calls = self._ollama_stream_tool_calls(
             tool_call_parts
@@ -2349,7 +2457,9 @@ class OmniAgent:
                 text,
                 tool_calls,
                 response_streamed,
-            ) = self._stream_ollama_agent_turn()
+            ) = self._run_model_turn_with_overflow_recovery(
+                self._stream_ollama_agent_turn
+            )
             self.conversation_history.append(assistant_message)
             full_thinking += thinking_content
             final_response += text
@@ -2431,13 +2541,13 @@ class OmniAgent:
             **self._anthropic_request_options(),
         )
 
-        usage_input_tokens = None
+        usage_snapshot = None
         for chunk in response:
             if self._agent_should_stop():
                 break
-            chunk_input_tokens = _response_input_tokens(chunk)
-            if chunk_input_tokens is not None:
-                usage_input_tokens = chunk_input_tokens
+            chunk_usage = _response_token_usage(chunk)
+            if chunk_usage is not None:
+                usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
             chunk_type = self._get_field(chunk, "type", "")
 
             if chunk_type == "content_block_start":
@@ -2515,10 +2625,7 @@ class OmniAgent:
 
         for block in blocks:
             block.pop("_input_json", None)
-        if usage_input_tokens is not None:
-            self._set_context_input_tokens(usage_input_tokens, "api_usage")
-        else:
-            self._record_context_usage(None)
+        self._record_context_usage_snapshot(usage_snapshot)
         return blocks, response_streamed
 
     def _agent_should_stop(self):
@@ -2617,49 +2724,177 @@ class OmniAgent:
             return {"compacted": False, "reason": "Context compaction is disabled."}
 
         input_tokens, usage_source = self._context_tokens_for_compaction()
-        token_threshold = self._compaction_token_threshold()
+        input_budget_tokens = self._compaction_input_budget()
         estimated_chars = _estimate_history_chars(self.conversation_history)
-        if input_tokens < token_threshold:
+        if input_tokens < input_budget_tokens:
             return {
                 "compacted": False,
-                "reason": "Context is below the compaction token threshold.",
+                "reason": "Context is within the available input budget.",
                 "before_chars": estimated_chars,
                 "input_tokens": input_tokens,
                 "usage_source": usage_source,
-                "token_threshold": token_threshold,
+                "input_budget_tokens": input_budget_tokens,
+                "reserved_output_tokens": self._compaction_output_reserve(),
                 "context_window_tokens": self.context_window_tokens,
             }
 
+        prune_result = self._soft_prune_old_tool_results(input_budget_tokens)
+        if prune_result.get("pruned_tool_results"):
+            print_info(
+                "Pruned "
+                f"{prune_result['pruned_tool_results']} old tool result(s) "
+                "before full context compaction."
+            )
+            input_tokens, usage_source = self._context_tokens_for_compaction()
+            estimated_chars = _estimate_history_chars(self.conversation_history)
+            if input_tokens < input_budget_tokens:
+                return {
+                    "compacted": False,
+                    "reason": "Old tool results were pruned within the available input budget.",
+                    "before_chars": estimated_chars,
+                    "input_tokens": input_tokens,
+                    "usage_source": usage_source,
+                    "input_budget_tokens": input_budget_tokens,
+                    "reserved_output_tokens": self._compaction_output_reserve(),
+                    "context_window_tokens": self.context_window_tokens,
+                    **prune_result,
+                }
+
         result = self.compact_context(manual=False)
+        if prune_result.get("pruned_tool_results"):
+            result.update(prune_result)
         if result.get("error"):
             print_warn(result.get("reason", "Automatic context compaction failed."))
         return result
 
     def _context_tokens_for_compaction(self):
         estimated_tokens = self._estimate_current_context_tokens()
-        if self.last_context_input_tokens > 0:
-            if estimated_tokens > self.last_context_input_tokens:
+        api_tokens = max(
+            int(self.last_context_input_tokens or 0),
+            int(self.last_context_total_tokens or 0),
+        )
+        if api_tokens > 0:
+            if estimated_tokens > api_tokens:
                 return (
                     estimated_tokens,
                     f"{self.last_context_usage_source or 'api_usage'}+estimated",
                 )
-            return (
-                self.last_context_input_tokens,
-                self.last_context_usage_source or "api_usage",
-            )
+            return api_tokens, self.last_context_usage_source or "api_usage"
         return estimated_tokens, "estimated"
 
-    def _compaction_token_threshold(self):
-        return max(1, int(self.context_window_tokens * self.compaction_trigger_ratio))
+    def _compaction_output_reserve(self):
+        return min(
+            max(1, int(self.max_tokens or 1)),
+            max(1, self.context_window_tokens - 1),
+        )
+
+    def _compaction_input_budget(self):
+        return max(
+            1,
+            self.context_window_tokens - self._compaction_output_reserve(),
+        )
 
     def _record_context_usage(self, response=None, *, source="api_usage"):
-        input_tokens = _response_input_tokens(response)
-        if input_tokens is not None:
-            self._set_context_input_tokens(input_tokens, source)
+        self._record_context_usage_snapshot(
+            _response_token_usage(response),
+            source=source,
+        )
+
+    def _record_context_usage_snapshot(self, usage, *, source="api_usage"):
+        self._append_request_usage(usage, source=source)
+        if usage is not None and usage.get("input_tokens", 0) > 0:
+            self._set_context_token_usage(usage, source)
             return
         self._set_context_input_tokens(
             self._estimate_current_context_tokens(), "estimated"
         )
+
+    def _append_request_usage(
+        self,
+        usage,
+        *,
+        source="api_usage",
+        kind=None,
+        model=None,
+        notify=False,
+    ):
+        if usage is None:
+            usage = {}
+        if not isinstance(usage, dict):
+            return
+        token_keys = (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "total_tokens",
+        )
+        normalized = {
+            key: max(0, int(usage.get(key, 0) or 0))
+            for key in token_keys
+        }
+        usage_available = bool(any(normalized.values()))
+        if kind is None:
+            if self.agent_running or self.agent_mode:
+                kind = "agent"
+            elif self._normal_tools_available():
+                kind = "tool"
+            else:
+                kind = "chat"
+        entry = {
+            "id": f"usage-{uuid.uuid4().hex}",
+            "timestamp": _utc_timestamp(),
+            "kind": str(kind or "chat"),
+            "model": str(model or self.current_model_name or self.model or ""),
+            "api_type": str(self.api_type or ""),
+            **normalized,
+            "usage_available": usage_available,
+            "source": str(source or "api_usage"),
+        }
+        with self.usage_history_lock:
+            self.request_usage_history.append(entry)
+        if notify and self.usage_history_callback is not None:
+            try:
+                self.usage_history_callback(self, dict(entry))
+            except Exception as error:
+                print_warn(f"Failed to persist request usage: {error}")
+        return entry
+
+    def _record_auxiliary_usage(
+        self,
+        response,
+        *,
+        kind,
+        model,
+        source,
+    ):
+        return self._append_request_usage(
+            _response_token_usage(response),
+            kind=kind,
+            model=model,
+            source=source,
+            notify=True,
+        )
+
+    def _set_context_token_usage(self, usage, source):
+        self.last_context_input_tokens = max(0, int(usage.get("input_tokens", 0) or 0))
+        self.last_context_output_tokens = max(0, int(usage.get("output_tokens", 0) or 0))
+        self.last_context_reasoning_tokens = max(
+            0, int(usage.get("reasoning_tokens", 0) or 0)
+        )
+        self.last_context_cache_read_tokens = max(
+            0, int(usage.get("cache_read_tokens", 0) or 0)
+        )
+        self.last_context_cache_write_tokens = max(
+            0, int(usage.get("cache_write_tokens", 0) or 0)
+        )
+        self.last_context_total_tokens = max(
+            self.last_context_input_tokens,
+            int(usage.get("total_tokens", 0) or 0),
+        )
+        self.last_context_usage_source = str(source or "api_usage")
+        set_context_usage(self.last_context_input_tokens, self.context_window_tokens)
 
     def _set_context_input_tokens(self, input_tokens, source):
         try:
@@ -2668,28 +2903,261 @@ class OmniAgent:
             input_tokens = 0
         if input_tokens <= 0:
             return
-        self.last_context_input_tokens = input_tokens
-        self.last_context_usage_source = str(source or "api_usage")
-        set_context_usage(input_tokens, self.context_window_tokens)
+        self._set_context_token_usage(
+            {"input_tokens": input_tokens, "total_tokens": input_tokens}, source
+        )
+
+    def get_context_usage_status(self):
+        return {
+            "input_tokens": self.last_context_input_tokens,
+            "output_tokens": self.last_context_output_tokens,
+            "reasoning_tokens": self.last_context_reasoning_tokens,
+            "cache_read_tokens": self.last_context_cache_read_tokens,
+            "cache_write_tokens": self.last_context_cache_write_tokens,
+            "total_tokens": self.last_context_total_tokens,
+            "source": self.last_context_usage_source,
+            "context_window_tokens": self.context_window_tokens,
+            "reserved_output_tokens": self._compaction_output_reserve(),
+            "compaction_input_budget_tokens": self._compaction_input_budget(),
+            "last_compaction_usage": dict(self.last_compaction_usage),
+        }
 
     def _clear_context_usage(self):
         self.last_context_input_tokens = 0
+        self.last_context_output_tokens = 0
+        self.last_context_reasoning_tokens = 0
+        self.last_context_cache_read_tokens = 0
+        self.last_context_cache_write_tokens = 0
+        self.last_context_total_tokens = 0
         self.last_context_usage_source = ""
+        self.last_compaction_usage = {}
+
+    def _record_compaction_usage(self, response, model=None):
+        usage = _response_token_usage(response)
+        self.last_compaction_usage = dict(usage or {})
+        self._append_request_usage(
+            usage,
+            source="compaction_api_usage",
+            kind="compaction",
+            model=model,
+        )
 
     def _estimate_current_context_tokens(self):
         if self.agent_running or self.agent_mode:
             messages = [{"role": "system", "content": self._agent_system_prompt()}]
         else:
             messages = [{"role": "system", "content": self._normal_system_prompt()}]
-        messages += self._normalized_history_messages(self.conversation_history)
+        messages += self._effective_history_messages(self.conversation_history)
         return _estimate_history_tokens(messages)
+
+    def _estimate_effective_history_tokens(self, messages):
+        return _estimate_history_tokens(self._effective_history_messages(messages))
+
+    def _compaction_recent_token_budget(self, input_budget_tokens):
+        input_budget_tokens = max(1, int(input_budget_tokens or 1))
+        return min(
+            COMPACTION_RECENT_TOKEN_MAX,
+            max(
+                COMPACTION_RECENT_TOKEN_MIN,
+                input_budget_tokens // 4,
+            ),
+        )
+
+    def _is_conversation_turn_start(self, message):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        if self._message_has_tool_result(message):
+            return False
+        content = str(message.get("content", "") or "")
+        return not content.startswith(COMPACTION_SUMMARY_PREFIX)
+
+    def _compaction_turns(self, messages):
+        starts = [
+            index
+            for index, message in enumerate(messages)
+            if self._is_conversation_turn_start(message)
+        ]
+        return [
+            (start, starts[index + 1] if index + 1 < len(starts) else len(messages))
+            for index, start in enumerate(starts)
+        ]
+
+    def _split_compaction_turn(self, messages, turn, budget):
+        if budget <= 0:
+            return None
+        start, end = turn
+        if end - start <= 1:
+            return None
+        for candidate in range(start + 1, end):
+            if self._estimate_effective_history_tokens(messages[candidate:end]) <= budget:
+                return candidate
+        return None
+
+    def _compaction_message_windows(self, input_budget_tokens):
+        existing_summary, messages = self._split_existing_compaction_summary(
+            self.conversation_history
+        )
+        if not messages:
+            return existing_summary, [], [], 0, 0
+
+        recent_budget = self._compaction_recent_token_budget(input_budget_tokens)
+        turns = self._compaction_turns(messages)
+        if not turns:
+            return existing_summary, messages, [], recent_budget, 0
+
+        recent_turns = turns[-COMPACTION_TAIL_TURNS:]
+        turn_sizes = [
+            self._estimate_effective_history_tokens(messages[start:end])
+            for start, end in recent_turns
+        ]
+        total = 0
+        recent_start = None
+        for turn, turn_tokens in reversed(list(zip(recent_turns, turn_sizes))):
+            if total + turn_tokens <= recent_budget:
+                total += turn_tokens
+                recent_start = turn[0]
+                continue
+
+            split_start = self._split_compaction_turn(
+                messages,
+                turn,
+                recent_budget - total,
+            )
+            if split_start is not None:
+                recent_start = split_start
+            break
+
+        if recent_start is None or recent_start == 0:
+            source_messages = messages
+            recent_messages = []
+        else:
+            source_messages = messages[:recent_start]
+            recent_messages = messages[recent_start:]
+            source_messages, recent_messages = (
+                self._fold_leading_tool_results_into_source(
+                    source_messages,
+                    recent_messages,
+                )
+            )
+
+        recent_tokens = self._estimate_effective_history_tokens(recent_messages)
+        return (
+            existing_summary,
+            source_messages,
+            recent_messages,
+            recent_budget,
+            recent_tokens,
+        )
+
+    def _tool_result_pruned_message(self, message):
+        if not isinstance(message, dict):
+            return None, 0
+
+        if message.get("role") == "tool":
+            content = message.get("content", "")
+            if not content or isinstance(message.get("compacted"), dict):
+                return None, 0
+            replacement = dict(message)
+            replacement["compacted"] = self._compacted_metadata(content)
+            return replacement, 1
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None, 0
+
+        replacement_blocks = []
+        replaced = 0
+        for block in content:
+            if self._get_field(block, "type") != "tool_result":
+                replacement_blocks.append(block)
+                continue
+            plain_block = dict(self._plain_data(block) or {})
+            if isinstance(plain_block.get("compacted"), dict):
+                replacement_blocks.append(plain_block)
+                continue
+            block_content = plain_block.get("content", "")
+            if not block_content:
+                replacement_blocks.append(plain_block)
+                continue
+            plain_block["compacted"] = self._compacted_metadata(block_content)
+            replacement_blocks.append(plain_block)
+            replaced += 1
+
+        if not replaced:
+            return None, 0
+        replacement = dict(message)
+        replacement["content"] = replacement_blocks
+        return replacement, replaced
+
+    @staticmethod
+    def _compacted_metadata(content):
+        return {
+            "at": _utc_timestamp(),
+            "replacement": COMPACTION_TOOL_RESULT_PLACEHOLDER,
+            "estimated_tokens": _estimate_history_tokens([{"content": content}]),
+        }
+
+    def _soft_prune_old_tool_results(self, input_budget_tokens):
+        if not self.conversation_history:
+            return {
+                "pruned_tool_results": 0,
+                "pruned_tool_result_tokens": 0,
+            }
+
+        input_budget_tokens = max(1, int(input_budget_tokens or 1))
+        protect_tokens = min(
+            COMPACTION_TOOL_PROTECT_TOKENS,
+            max(1000, input_budget_tokens // 2),
+        )
+        prune_min_tokens = min(
+            COMPACTION_TOOL_PRUNE_MIN_TOKENS,
+            max(512, input_budget_tokens // 8),
+        )
+        protected = 0
+        candidates = []
+        saved_tokens = 0
+        result_count = 0
+
+        for index in range(len(self.conversation_history) - 1, -1, -1):
+            message = self.conversation_history[index]
+            message_tokens = self._estimate_effective_history_tokens([message])
+            if protected < protect_tokens:
+                protected += message_tokens
+                continue
+
+            replacement, replaced = self._tool_result_pruned_message(message)
+            if replacement is None:
+                continue
+            replacement_tokens = self._estimate_effective_history_tokens([replacement])
+            saved = max(0, message_tokens - replacement_tokens)
+            if not saved:
+                continue
+            candidates.append((index, replacement))
+            saved_tokens += saved
+            result_count += replaced
+
+        if saved_tokens < prune_min_tokens:
+            return {
+                "pruned_tool_results": 0,
+                "pruned_tool_result_tokens": 0,
+            }
+
+        for index, replacement in candidates:
+            self.conversation_history[index] = replacement
+        self._set_context_input_tokens(
+            self._estimate_current_context_tokens(),
+            "estimated_after_tool_prune",
+        )
+        return {
+            "pruned_tool_results": result_count,
+            "pruned_tool_result_tokens": saved_tokens,
+        }
 
     def compact_context(self, manual=False):
         before_messages = len(self.conversation_history)
         before_chars = _estimate_history_chars(self.conversation_history)
         before_input_tokens, usage_source = self._context_tokens_for_compaction()
-        token_threshold = self._compaction_token_threshold()
-        keep_recent = max(1, int(self.compaction_keep_recent_messages))
+        input_budget_tokens = self._compaction_input_budget()
         compact_model = (
             self.model
             if self.compaction_compact_model == AUTO_MODEL_SELECTION
@@ -2701,31 +3169,13 @@ class OmniAgent:
             else str(compact_model or "").strip()
         )
 
-        if before_messages <= keep_recent:
-            return {
-                "compacted": False,
-                "reason": (
-                    "Context compaction cancelled: "
-                    f"{before_messages} messages is not more than keep_recent_messages={keep_recent}."
-                ),
-                "before_messages": before_messages,
-                "before_chars": before_chars,
-                "before_input_tokens": before_input_tokens,
-                "usage_source": usage_source,
-                "token_threshold": token_threshold,
-                "context_window_tokens": self.context_window_tokens,
-                "model": compact_model_label,
-            }
-
-        recent_messages = self.conversation_history[-keep_recent:]
-        source_messages = self.conversation_history[:-keep_recent]
-        existing_summary, source_messages = self._split_existing_compaction_summary(
-            source_messages
-        )
-        source_messages, recent_messages = self._fold_leading_tool_results_into_source(
+        (
+            existing_summary,
             source_messages,
             recent_messages,
-        )
+            recent_token_budget,
+            recent_tokens,
+        ) = self._compaction_message_windows(input_budget_tokens)
         if not source_messages and not existing_summary:
             return {
                 "compacted": False,
@@ -2734,7 +3184,7 @@ class OmniAgent:
                 "before_chars": before_chars,
                 "before_input_tokens": before_input_tokens,
                 "usage_source": usage_source,
-                "token_threshold": token_threshold,
+                "input_budget_tokens": input_budget_tokens,
                 "context_window_tokens": self.context_window_tokens,
                 "model": compact_model_label,
             }
@@ -2750,7 +3200,7 @@ class OmniAgent:
                 "before_chars": before_chars,
                 "before_input_tokens": before_input_tokens,
                 "usage_source": usage_source,
-                "token_threshold": token_threshold,
+                "input_budget_tokens": input_budget_tokens,
                 "context_window_tokens": self.context_window_tokens,
                 "model": compact_model_label,
             }
@@ -2766,30 +3216,44 @@ class OmniAgent:
                 compact_model,
             )
         except Exception as error:
+            reason = f"Context compaction failed: {error}"
+            finish_compaction_entry(
+                compaction_entry_id,
+                "failed",
+                compaction_mode,
+                reason,
+            )
             return {
                 "compacted": False,
                 "error": True,
-                "reason": f"Context compaction failed: {error}",
+                "reason": reason,
                 "before_messages": before_messages,
                 "before_chars": before_chars,
                 "before_input_tokens": before_input_tokens,
                 "usage_source": usage_source,
-                "token_threshold": token_threshold,
+                "input_budget_tokens": input_budget_tokens,
                 "context_window_tokens": self.context_window_tokens,
                 "model": compact_model_label,
             }
 
-        summary = summary.strip()
+        summary = str(summary or "").strip()
         if not summary:
+            reason = "Context compaction failed: compact model returned an empty summary."
+            finish_compaction_entry(
+                compaction_entry_id,
+                "failed",
+                compaction_mode,
+                reason,
+            )
             return {
                 "compacted": False,
                 "error": True,
-                "reason": "Context compaction failed: compact model returned an empty summary.",
+                "reason": reason,
                 "before_messages": before_messages,
                 "before_chars": before_chars,
                 "before_input_tokens": before_input_tokens,
                 "usage_source": usage_source,
-                "token_threshold": token_threshold,
+                "input_budget_tokens": input_budget_tokens,
                 "context_window_tokens": self.context_window_tokens,
                 "model": compact_model_label,
             }
@@ -2818,8 +3282,11 @@ class OmniAgent:
                 after_chars=after_chars,
                 before_input_tokens=before_input_tokens,
                 after_input_tokens=after_input_tokens,
-                token_threshold=token_threshold,
+                input_budget_tokens=input_budget_tokens,
+                reserved_output_tokens=self._compaction_output_reserve(),
                 usage_source=usage_source,
+                recent_token_budget=recent_token_budget,
+                recent_tokens=recent_tokens,
                 compact_model=compact_model_label,
                 removed_tool_results=removed_tool_results,
                 memory_update=memory_update,
@@ -2835,10 +3302,14 @@ class OmniAgent:
             "before_input_tokens": before_input_tokens,
             "after_input_tokens": after_input_tokens,
             "usage_source": usage_source,
-            "token_threshold": token_threshold,
+            "input_budget_tokens": input_budget_tokens,
+            "reserved_output_tokens": self._compaction_output_reserve(),
             "context_window_tokens": self.context_window_tokens,
+            "recent_token_budget": recent_token_budget,
+            "recent_tokens": recent_tokens,
             "model": compact_model_label,
             "removed_orphan_tool_results": removed_tool_results,
+            "compaction_usage": dict(self.last_compaction_usage),
             "memory_update": memory_update,
         }
 
@@ -2851,15 +3322,22 @@ class OmniAgent:
         after_chars,
         before_input_tokens,
         after_input_tokens,
-        token_threshold,
+        input_budget_tokens,
+        reserved_output_tokens,
         usage_source,
+        recent_token_budget,
+        recent_tokens,
         compact_model,
         removed_tool_results,
         memory_update,
     ):
         lines = [
             f"Message: {before_messages} -> {after_messages}",
+            f"Tokens: {before_input_tokens} -> {after_input_tokens}",
             f"Chars: {before_chars} -> {after_chars}",
+            f"Input budget: {input_budget_tokens} (output reserve {reserved_output_tokens})",
+            f"Recent: {recent_tokens}/{recent_token_budget} estimated tokens",
+            f"Usage source: {usage_source}",
         ]
         compact_model = str(compact_model or "").strip()
         if compact_model:
@@ -2888,6 +3366,7 @@ class OmniAgent:
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
             )
+            self._record_compaction_usage(response, compact_model)
             return self._anthropic_response_text(response)
 
         if self.api_type == API_TYPE_OLLAMA:
@@ -2900,6 +3379,7 @@ class OmniAgent:
                     include_reasoning=False,
                 )
             )
+            self._record_compaction_usage(response, compact_model)
             message = self._get_field(response, "message", {})
             return str(self._get_field(message, "content", "") or "")
 
@@ -2912,6 +3392,7 @@ class OmniAgent:
                 include_reasoning=False,
             )
         )
+        self._record_compaction_usage(response, compact_model)
         message = response.choices[0].message
         return _clean_content_text(self._get_field(message, "content", "") or "")
 
@@ -3098,6 +3579,12 @@ class OmniAgent:
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
             )
+            self._record_auxiliary_usage(
+                response,
+                kind="memory",
+                model=memory_model,
+                source="memory_api_usage",
+            )
             return self._anthropic_response_text(response)
 
         if self.api_type == API_TYPE_OLLAMA:
@@ -3110,6 +3597,12 @@ class OmniAgent:
                     include_reasoning=False,
                 )
             )
+            self._record_auxiliary_usage(
+                response,
+                kind="memory",
+                model=memory_model,
+                source="memory_api_usage",
+            )
             message = self._get_field(response, "message", {})
             return str(self._get_field(message, "content", "") or "")
 
@@ -3121,6 +3614,12 @@ class OmniAgent:
                 max_tokens=MEMORY_UPDATE_MAX_TOKENS,
                 include_reasoning=False,
             )
+        )
+        self._record_auxiliary_usage(
+            response,
+            kind="memory",
+            model=memory_model,
+            source="memory_api_usage",
         )
         message = response.choices[0].message
         return _clean_content_text(self._get_field(message, "content", "") or "")
@@ -3163,6 +3662,12 @@ class OmniAgent:
                 system=SESSION_TITLE_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
+            self._record_auxiliary_usage(
+                response,
+                kind="session_title",
+                model=memory_model,
+                source="session_title_api_usage",
+            )
             return self._anthropic_response_text(response)
 
         if self.api_type == API_TYPE_OLLAMA:
@@ -3175,6 +3680,12 @@ class OmniAgent:
                     include_reasoning=False,
                 )
             )
+            self._record_auxiliary_usage(
+                response,
+                kind="session_title",
+                model=memory_model,
+                source="session_title_api_usage",
+            )
             message = self._get_field(response, "message", {})
             return str(self._get_field(message, "content", "") or "")
 
@@ -3186,6 +3697,12 @@ class OmniAgent:
                 max_tokens=SESSION_TITLE_MAX_TOKENS,
                 include_reasoning=False,
             )
+        )
+        self._record_auxiliary_usage(
+            response,
+            kind="session_title",
+            model=memory_model,
+            source="session_title_api_usage",
         )
         message = response.choices[0].message
         return _clean_content_text(self._get_field(message, "content", "") or "")
@@ -3269,6 +3786,7 @@ class OmniAgent:
     def _message_content_for_compaction(self, message):
         if not isinstance(message, dict):
             return "(empty)"
+        message = self._effective_history_message(message)
         parts = []
         content = message.get("content", "")
         if content:
@@ -4250,14 +4768,14 @@ class OmniAgent:
             raw_response = ""
             thinking_ended = False
             reasoning_detail_parts = {}
-            usage_input_tokens = None
+            usage_snapshot = None
 
             for chunk in response:
                 if self._agent_should_stop():
                     break
-                chunk_input_tokens = _response_input_tokens(chunk)
-                if chunk_input_tokens is not None:
-                    usage_input_tokens = chunk_input_tokens
+                chunk_usage = _response_token_usage(chunk)
+                if chunk_usage is not None:
+                    usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
                 if not getattr(chunk, "choices", None):
                     continue
                 delta = chunk.choices[0].delta
@@ -4313,16 +4831,15 @@ class OmniAgent:
                     ),
                 )
             )
-            if usage_input_tokens is not None:
-                self._set_context_input_tokens(usage_input_tokens, "api_usage")
-            else:
-                self._record_context_usage(None)
+            self._record_context_usage_snapshot(usage_snapshot)
             return {
                 "thinking": _combine_reasoning_text(field_thinking, tagged_thinking),
                 "response": full_response,
             }
 
         except Exception as error:
+            if _is_context_overflow_error(error):
+                raise
             print_error(_format_stream_error_message(error))
             return None
 
@@ -4349,14 +4866,14 @@ class OmniAgent:
             full_response = ""
             raw_response = ""
             response_started = False
-            usage_input_tokens = _no_usage_input_tokens()
+            usage_snapshot = None
 
             for chunk in response:
                 if self._agent_should_stop():
                     break
-                chunk_input_tokens = _response_input_tokens(chunk)
-                if chunk_input_tokens is not None:
-                    usage_input_tokens = chunk_input_tokens
+                chunk_usage = _response_token_usage(chunk)
+                if chunk_usage is not None:
+                    usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
                 message = self._get_field(chunk, "message", {})
                 thinking = self._get_field(message, "thinking", "") or ""
                 if thinking:
@@ -4404,16 +4921,15 @@ class OmniAgent:
                     full_thinking,
                 )
             )
-            if usage_input_tokens is not None:
-                self._set_context_input_tokens(usage_input_tokens, "api_usage")
-            else:
-                self._record_context_usage(None)
+            self._record_context_usage_snapshot(usage_snapshot)
             return {
                 "thinking": _clean_reasoning_text(full_thinking),
                 "response": full_response,
             }
 
         except Exception as error:
+            if _is_context_overflow_error(error):
+                raise
             print_error(_format_stream_error_message(error))
             return None
 
@@ -4445,14 +4961,14 @@ class OmniAgent:
             response_started = False
             blocks = _empty_anthropic_blocks()
             active_block_index = _no_active_block_index()
-            usage_input_tokens = _no_usage_input_tokens()
+            usage_snapshot = None
 
             for chunk in response:
                 if self._agent_should_stop():
                     break
-                chunk_input_tokens = _response_input_tokens(chunk)
-                if chunk_input_tokens is not None:
-                    usage_input_tokens = chunk_input_tokens
+                chunk_usage = _response_token_usage(chunk)
+                if chunk_usage is not None:
+                    usage_snapshot = _merge_token_usage(usage_snapshot, chunk_usage)
                 chunk_type = self._get_field(chunk, "type", "")
 
                 if chunk_type == "content_block_start":
@@ -4597,16 +5113,15 @@ class OmniAgent:
                 "role": "assistant",
                 "content": history_content,
             })
-            if usage_input_tokens is not None:
-                self._set_context_input_tokens(usage_input_tokens, "api_usage")
-            else:
-                self._record_context_usage(None)
+            self._record_context_usage_snapshot(usage_snapshot)
             return {
                 "thinking": _combine_reasoning_text(field_thinking, tagged_thinking),
                 "response": full_response,
             }
 
         except Exception as error:
+            if _is_context_overflow_error(error):
+                raise
             print_error(_format_stream_error_message(error))
             return None
 
@@ -4925,7 +5440,7 @@ class OmniAgent:
 
     def _anthropic_messages(self):
         messages = []
-        for message in self.conversation_history:
+        for message in self._effective_history_messages(self.conversation_history):
             role = message.get("role")
             if role not in {"user", "assistant"}:
                 continue
@@ -4937,7 +5452,8 @@ class OmniAgent:
         source_messages = (
             messages if messages is not None else self.conversation_history
         )
-        for message in source_messages:
+        for source_message in source_messages:
+            message = self._effective_history_message(source_message)
             role = message.get("role")
             if role not in {"system", "user", "assistant", "tool"}:
                 continue
@@ -4967,13 +5483,13 @@ class OmniAgent:
     def _chat_agent_messages(self):
         return [
             {"role": "system", "content": self._agent_system_prompt()}
-        ] + self.conversation_history
+        ] + self._effective_history_messages(self.conversation_history)
 
     def _chat_messages(self, messages=None):
         source_messages = (
             messages if messages is not None else self.conversation_history
         )
-        source_messages = self._normalized_history_messages(source_messages)
+        source_messages = self._effective_history_messages(source_messages)
         if source_messages and source_messages[0].get("role") == "system":
             return source_messages
         return [
@@ -4990,7 +5506,7 @@ class OmniAgent:
         source_messages = (
             messages if messages is not None else self.conversation_history
         )
-        source_messages = self._normalized_history_messages(source_messages)
+        source_messages = self._effective_history_messages(source_messages)
         if source_messages and source_messages[0].get("role") == "system":
             return self._ollama_messages(source_messages)
         return self._ollama_messages(
@@ -5861,6 +6377,8 @@ class OmniAgent:
 
     def clear_history(self):
         self.conversation_history = []
+        with self.usage_history_lock:
+            self.request_usage_history = []
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
         self.clear_todos()
@@ -5874,6 +6392,45 @@ class OmniAgent:
             if isinstance(message, dict)
         ]
 
+    def _effective_history_messages(self, history):
+        return [
+            self._effective_history_message(message)
+            for message in list(history or [])
+            if isinstance(message, dict)
+        ]
+
+    def _effective_history_message(self, message):
+        plain = self._plain_data(message)
+        if not isinstance(plain, dict):
+            return {}
+        effective = dict(plain)
+        compacted = effective.pop("compacted", None)
+        if effective.get("role") == "tool" and isinstance(compacted, dict):
+            effective["content"] = str(
+                compacted.get("replacement") or COMPACTION_TOOL_RESULT_PLACEHOLDER
+            )
+
+        content = effective.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                if not isinstance(block, dict):
+                    blocks.append(block)
+                    continue
+                effective_block = dict(block)
+                block_compacted = effective_block.pop("compacted", None)
+                if (
+                    effective_block.get("type") == "tool_result"
+                    and isinstance(block_compacted, dict)
+                ):
+                    effective_block["content"] = str(
+                        block_compacted.get("replacement")
+                        or COMPACTION_TOOL_RESULT_PLACEHOLDER
+                    )
+                blocks.append(effective_block)
+            effective["content"] = blocks
+        return effective
+
     def set_history(self, history):
         self.conversation_history = self._normalized_history_messages(history)
         self.session_episodic_heading = ""
@@ -5886,6 +6443,40 @@ class OmniAgent:
 
     def get_history(self):
         return self.conversation_history
+
+    def set_usage_history(self, usage_history):
+        with self.usage_history_lock:
+            self.request_usage_history = [
+                dict(item)
+                for item in list(usage_history or [])
+                if isinstance(item, dict)
+            ]
+
+    def append_usage_history(self, usage_history):
+        entries = [
+            dict(item)
+            for item in list(usage_history or [])
+            if isinstance(item, dict)
+        ]
+        if not entries:
+            return
+        with self.usage_history_lock:
+            existing_ids = {
+                str(item.get("id") or "")
+                for item in self.request_usage_history
+                if isinstance(item, dict)
+            }
+            for entry in entries:
+                entry_id = str(entry.get("id") or "")
+                if entry_id and entry_id in existing_ids:
+                    continue
+                self.request_usage_history.append(entry)
+                if entry_id:
+                    existing_ids.add(entry_id)
+
+    def get_usage_history(self):
+        with self.usage_history_lock:
+            return [dict(item) for item in self.request_usage_history]
 
 
 def _summarize_tool_input(tool_input):
@@ -5974,16 +6565,58 @@ def _format_explored_entry(name, tool_input):
     return ""
 
 
-def _response_input_tokens(response):
+def _response_token_usage(response):
     usage = _usage_field(response, "usage")
-    usage_tokens = _usage_input_tokens(usage)
-    if usage_tokens is not None:
-        return usage_tokens
+    if usage is None:
+        usage = _usage_field(_usage_field(response, "message"), "usage")
+    breakdown = _usage_token_breakdown(usage) if usage is not None else None
 
-    direct_tokens = _usage_int(response, "prompt_eval_count")
-    if direct_tokens:
-        return direct_tokens
-    return None
+    if breakdown is None:
+        input_tokens = _usage_int(response, "prompt_eval_count")
+        output_tokens = _usage_int(response, "eval_count")
+        total_tokens = input_tokens + output_tokens
+        if total_tokens > 0:
+            breakdown = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": total_tokens,
+            }
+
+    return breakdown
+
+
+def _merge_token_usage(current, incoming):
+    if incoming is None:
+        return current
+    if current is None:
+        return dict(incoming)
+
+    merged = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ):
+        merged[key] = max(
+            int(current.get(key, 0) or 0),
+            int(incoming.get(key, 0) or 0),
+        )
+    reported_total = max(
+        int(current.get("total_tokens", 0) or 0),
+        int(incoming.get("total_tokens", 0) or 0),
+    )
+    calculated_total = (
+        merged["input_tokens"]
+        + merged["output_tokens"]
+        + merged["reasoning_tokens"]
+    )
+    merged["total_tokens"] = max(reported_total, calculated_total)
+    return merged
 
 
 def _empty_anthropic_blocks() -> List[Dict[str, Any]]:
@@ -5991,10 +6624,6 @@ def _empty_anthropic_blocks() -> List[Dict[str, Any]]:
 
 
 def _no_active_block_index() -> Optional[int]:
-    return None
-
-
-def _no_usage_input_tokens() -> Optional[int]:
     return None
 
 
@@ -6006,32 +6635,71 @@ def _assistant_history_content(content) -> Any:
     return content
 
 
-def _usage_input_tokens(usage):
+def _usage_token_breakdown(usage):
     if usage is None:
         return None
 
     prompt_tokens = _usage_int(usage, "prompt_tokens")
-    if prompt_tokens:
-        return prompt_tokens
-
-    input_tokens = (
+    raw_input_tokens = (
         _usage_int(usage, "input_tokens")
         or _usage_int(usage, "input")
         or _usage_int(usage, "inputTokens")
     )
-    cache_read = (
+
+    explicit_cache_read = (
         _usage_int(usage, "cache_read_input_tokens")
         or _usage_int(usage, "cache_read")
-        or _usage_int(usage, "cached_tokens")
     )
-    cache_create = (
+    explicit_cache_write = (
         _usage_int(usage, "cache_creation_input_tokens")
         or _usage_int(usage, "cache_creation_tokens")
         or _usage_int(usage, "cache_create")
     )
+    prompt_details = (
+        _usage_field(usage, "prompt_tokens_details")
+        or _usage_field(usage, "input_tokens_details")
+    )
+    detail_cache_read = _usage_int(prompt_details, "cached_tokens")
+    cache_read = explicit_cache_read or detail_cache_read
+    cache_write = explicit_cache_write
 
-    total = input_tokens + cache_read + cache_create
-    return total if total > 0 else None
+    if prompt_tokens > 0:
+        input_tokens = prompt_tokens
+    else:
+        input_tokens = raw_input_tokens + explicit_cache_read + explicit_cache_write
+
+    raw_output_tokens = (
+        _usage_int(usage, "completion_tokens")
+        or _usage_int(usage, "output_tokens")
+        or _usage_int(usage, "output")
+        or _usage_int(usage, "outputTokens")
+    )
+    output_details = (
+        _usage_field(usage, "completion_tokens_details")
+        or _usage_field(usage, "output_tokens_details")
+    )
+    reasoning_tokens = (
+        _usage_int(output_details, "reasoning_tokens")
+        or _usage_int(usage, "reasoning_tokens")
+    )
+    output_tokens = max(0, raw_output_tokens - reasoning_tokens)
+
+    total_tokens = (
+        _usage_int(usage, "total_tokens")
+        or _usage_int(usage, "totalTokens")
+        or input_tokens + raw_output_tokens
+    )
+    if max(input_tokens, raw_output_tokens, total_tokens) <= 0:
+        return None
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "total_tokens": total_tokens,
+    }
 
 
 def _usage_field(value, key, default=None):
@@ -6060,6 +6728,60 @@ def _usage_int(value, key):
         return int(_usage_field(value, key, 0) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _utc_timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _is_context_overflow_error(error):
+    if error is None:
+        return False
+    values = []
+    current = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        values.extend([
+            str(current),
+            str(getattr(current, "code", "") or ""),
+            str(getattr(current, "type", "") or ""),
+            str(getattr(current, "body", "") or ""),
+        ])
+        response = getattr(current, "response", None)
+        if response is not None:
+            values.extend([
+                str(getattr(response, "text", "") or ""),
+                str(getattr(response, "content", "") or ""),
+            ])
+        current = getattr(current, "__cause__", None) or getattr(
+            current, "__context__", None
+        )
+    text = " ".join(values).lower()
+    patterns = (
+        "context_length_exceeded",
+        "maximum context length",
+        "context window exceeded",
+        "context window is exceeded",
+        "exceeds the context window",
+        "exceeded the context window",
+        "exceeds the context length",
+        "exceeded the context length",
+        "context length exceeded",
+        "context limit exceeded",
+        "exceeds context limit",
+        "exceeded context limit",
+        "maximum number of tokens allowed",
+        "input token count exceeds",
+        "prompt is too long",
+        "prompt too long",
+        "input is too long",
+        "input too long",
+        "too many tokens",
+        "token limit exceeded",
+        "context token limit",
+    )
+    return any(pattern in text for pattern in patterns)
 
 
 def _stream_usage_unsupported(error):

@@ -1006,6 +1006,27 @@ class AgentTUIApp(App):
         if self._suppress_stream_output:
             return
 
+    def begin_overflow_replay_scope(self) -> None:
+        self._call_ui(self._begin_overflow_replay_scope)
+
+    def _begin_overflow_replay_scope(self) -> None:
+        self.query_one("#messages-view", ChatView).begin_overflow_replay_scope()
+
+    def commit_overflow_replay_scope(self) -> None:
+        self._call_ui(self._commit_overflow_replay_scope)
+
+    def _commit_overflow_replay_scope(self) -> None:
+        self.query_one("#messages-view", ChatView).commit_overflow_replay_scope()
+
+    def rollback_overflow_replay_scope(self) -> None:
+        self._call_ui(self._rollback_overflow_replay_scope)
+
+    def _rollback_overflow_replay_scope(self) -> None:
+        self._pause_thinking_elapsed_timer()
+        self._thinking_started_at = None
+        self._stream_kind = None
+        self.query_one("#messages-view", ChatView).rollback_overflow_replay_scope()
+
     def start_thinking_timer(self) -> None:
         if self._suppress_stream_output:
             return
@@ -3068,20 +3089,6 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_compact_changed(v),
             },
             {
-                "name": "Trigger ratio",
-                "value": str(self.config.compaction_trigger_ratio),
-                "keywords": "trigger_ratio",
-                "edit_type": "input",
-                "on_change": lambda v: self._on_setting_compact_ratio_changed(v),
-            },
-            {
-                "name": "Keep recent messages",
-                "value": str(self.config.compaction_keep_recent_messages),
-                "keywords": "keep_recent_messages",
-                "edit_type": "input",
-                "on_change": lambda v: self._on_setting_compact_keep_recent_changed(v),
-            },
-            {
                 "name": "Compact model",
                 "value": self._valid_optional_model_selection(
                     self.config.compaction_compact_model
@@ -3983,24 +3990,6 @@ class AgentTUIApp(App):
         self._reload_config()
         self._apply_config_to_controls()
 
-    def _on_setting_compact_ratio_changed(self, value: str) -> None:
-        try:
-            ratio = max(0.1, min(0.95, float(value)))
-        except (TypeError, ValueError):
-            return
-        save_config_field("compaction_trigger_ratio", ratio)
-        self._reload_config()
-        self._apply_config_to_controls()
-
-    def _on_setting_compact_keep_recent_changed(self, value: str) -> None:
-        try:
-            keep_recent = max(1, int(value))
-        except (TypeError, ValueError):
-            return
-        save_config_field("compaction_keep_recent_messages", keep_recent)
-        self._reload_config()
-        self._apply_config_to_controls()
-
     def _on_setting_compact_model_changed(self, value: str) -> None:
         save_config_field(
             "compaction_compact_model",
@@ -4130,8 +4119,6 @@ class AgentTUIApp(App):
             skills_auto_catalog=self.config.skills_auto_catalog,
             skills_max_chars=self.config.skills_max_chars,
             compaction_enable=self.config.compaction_enable,
-            compaction_trigger_ratio=self.config.compaction_trigger_ratio,
-            compaction_keep_recent_messages=self.config.compaction_keep_recent_messages,
             compaction_compact_model=(
                 AUTO_MODEL_SELECTION
                 if self.config.compaction_compact_model == AUTO_MODEL_SELECTION
@@ -4154,7 +4141,17 @@ class AgentTUIApp(App):
             agent_team_enable=self.config.agent_team_enable,
             current_model_name=self.config.active_model_label,
             history_path=session_record.get("history_path"),
+            usage_history_callback=(
+                lambda source_chat, entry, session_path=session_record.get(
+                    "session_path"
+                ): self._on_chat_usage_entry(
+                    session_path,
+                    source_chat,
+                    entry,
+                )
+            ),
         )
+        chat.set_usage_history(session_record.get("usage_history") or [])
         return chat
 
     def _process_user_message(self, user_text: str) -> None:
@@ -4357,6 +4354,56 @@ class AgentTUIApp(App):
         if self._thinking_elapsed_timer is not None:
             self._thinking_elapsed_timer.pause()
 
+    def _on_chat_usage_entry(
+        self,
+        session_path,
+        source_chat: OmniAgent,
+        entry: dict,
+    ) -> None:
+        self._call_ui(
+            self._persist_chat_usage_entry,
+            str(session_path or ""),
+            source_chat,
+            dict(entry or {}),
+        )
+
+    def _persist_chat_usage_entry(
+        self,
+        session_path: str,
+        source_chat: OmniAgent,
+        entry: dict,
+    ) -> None:
+        session_path = str(session_path or "").strip()
+        if not session_path or not isinstance(entry, dict):
+            return
+        current_path = ""
+        if self.current_session_record is not None:
+            current_path = str(
+                self.current_session_record.get("session_path") or ""
+            ).strip()
+        if current_path == session_path and self.chat is not None:
+            if source_chat is not self.chat:
+                self.chat.append_usage_history([entry])
+            self._persist_current_session(refresh_sidebar=False)
+            return
+
+        record = load_session(session_path)
+        if not record:
+            return
+        usage_history = [
+            dict(item)
+            for item in list(record.get("usage_history") or [])
+            if isinstance(item, dict)
+        ]
+        entry_id = str(entry.get("id") or "")
+        if entry_id and any(
+            str(item.get("id") or "") == entry_id for item in usage_history
+        ):
+            return
+        usage_history.append(dict(entry))
+        record["usage_history"] = usage_history
+        save_session_record(record)
+
     def _persist_current_session(self, refresh_sidebar: bool = True) -> None:
         if self.current_session_record is None or self.chat is None:
             return
@@ -4364,6 +4411,7 @@ class AgentTUIApp(App):
         record = dict(self.current_session_record)
         view = self.query_one("#messages-view", ChatView)
         record["conversation"] = history
+        record["usage_history"] = self.chat.get_usage_history()
         record["ui_transcript"] = view.get_transcript()
         record["model_name"] = self.config.current_model
         project = self._selected_project()

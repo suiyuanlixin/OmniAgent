@@ -62,8 +62,6 @@ DEFAULT_SKILLS_AUTO_CATALOG = True
 DEFAULT_SKILLS_MAX_CHARS = 12000
 DEFAULT_COMPACTION_ENABLE = True
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
-DEFAULT_COMPACTION_TRIGGER_RATIO = 0.75
-DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES = 12
 AUTO_MODEL_SELECTION = "auto"
 DEFAULT_COMPACTION_COMPACT_MODEL = AUTO_MODEL_SELECTION
 DEFAULT_MEMORY_MODEL = AUTO_MODEL_SELECTION
@@ -116,8 +114,6 @@ GLOBAL_FIELD_KEYS = {
     "skills_auto_catalog",
     "skills_max_chars",
     "compaction_enable",
-    "compaction_trigger_ratio",
-    "compaction_keep_recent_messages",
     "compaction_compact_model",
     "memory_model",
     "render_markdown",
@@ -184,8 +180,6 @@ class AppConfig:
     skills_auto_catalog: bool = DEFAULT_SKILLS_AUTO_CATALOG
     skills_max_chars: int = DEFAULT_SKILLS_MAX_CHARS
     compaction_enable: bool = DEFAULT_COMPACTION_ENABLE
-    compaction_trigger_ratio: float = DEFAULT_COMPACTION_TRIGGER_RATIO
-    compaction_keep_recent_messages: int = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
     memory_model: str = DEFAULT_MEMORY_MODEL
     render_markdown: bool = DEFAULT_RENDER_MARKDOWN
@@ -311,8 +305,6 @@ class AppConfig:
             },
             "auto_compact": {
                 "enable": self.compaction_enable,
-                "trigger_ratio": self.compaction_trigger_ratio,
-                "keep_recent_messages": self.compaction_keep_recent_messages,
                 "compact_model": _optional_model_reference(
                     self.compaction_compact_model, self.model_list
                 ),
@@ -347,8 +339,6 @@ class AppConfig:
             "skills_auto_catalog": self.skills_auto_catalog,
             "skills_max_chars": self.skills_max_chars,
             "compaction_enable": self.compaction_enable,
-            "compaction_trigger_ratio": self.compaction_trigger_ratio,
-            "compaction_keep_recent_messages": self.compaction_keep_recent_messages,
             "compaction_compact_model": self.compaction_compact_model,
             "memory_model": self.memory_model,
             "render_markdown": self.render_markdown,
@@ -603,22 +593,6 @@ def parse_agent_tool_calls(value):
     return _parse_positive_integer(value, "Agent max tool calls")
 
 
-def parse_compaction_trigger_ratio(value):
-    try:
-        parsed = float(str(value).strip())
-    except (TypeError, ValueError) as error:
-        raise ValueError("Auto compact trigger ratio must be a number.") from error
-    if parsed <= 0 or parsed > 1:
-        raise ValueError(
-            "Auto compact trigger ratio must be greater than 0 and at most 1."
-        )
-    return parsed
-
-
-def parse_compaction_keep_recent_messages(value):
-    return _parse_positive_integer(value, "Auto compact keep recent messages")
-
-
 def parse_web_search_max_results(value):
     parsed = _parse_positive_integer(value, "Web search max results")
     if parsed > 20:
@@ -685,8 +659,8 @@ def parse_temperature(value):
         temperature = float(str(value).strip())
     except (TypeError, ValueError) as error:
         raise ValueError("Temperature must be a number.") from error
-    if temperature < 0 or temperature > 1:
-        raise ValueError("Temperature must be between 0 and 1.")
+    if temperature < 0 or temperature > 2:
+        raise ValueError("Temperature must be between 0 and 2.")
     return temperature
 
 
@@ -882,20 +856,6 @@ def _sanitize_config(data):
     except ValueError:
         skills_max_chars = DEFAULT_SKILLS_MAX_CHARS
     try:
-        compaction_trigger_ratio = parse_compaction_trigger_ratio(
-            compaction_config.get("trigger_ratio", DEFAULT_COMPACTION_TRIGGER_RATIO)
-        )
-    except ValueError:
-        compaction_trigger_ratio = DEFAULT_COMPACTION_TRIGGER_RATIO
-    try:
-        compaction_keep_recent_messages = parse_compaction_keep_recent_messages(
-            compaction_config.get(
-                "keep_recent_messages", DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
-            )
-        )
-    except ValueError:
-        compaction_keep_recent_messages = DEFAULT_COMPACTION_KEEP_RECENT_MESSAGES
-    try:
         web_search_provider = parse_web_search_provider(
             web_search.get("provider", DEFAULT_WEB_SEARCH_PROVIDER)
         )
@@ -947,8 +907,6 @@ def _sanitize_config(data):
         compaction_enable=_parse_bool(
             compaction_config.get("enable"), DEFAULT_COMPACTION_ENABLE
         ),
-        compaction_trigger_ratio=compaction_trigger_ratio,
-        compaction_keep_recent_messages=compaction_keep_recent_messages,
         compaction_compact_model=_config_optional_model_key(
             compaction_config.get("compact_model"),
             model_list,
@@ -1141,7 +1099,7 @@ def save_config_fields(fields, model_name=None):
             continue
 
         if key not in GLOBAL_FIELD_KEYS:
-            raise ValueError(f"Unknown config key: {key}")
+            continue
 
         if key == "current_model":
             model_key = _runtime_model_key(value, config.model_list)
@@ -1174,12 +1132,6 @@ def save_config_fields(fields, model_name=None):
             config.skills_max_chars = parse_skill_max_chars(value)
         elif key == "compaction_enable":
             config.compaction_enable = _parse_bool(value, config.compaction_enable)
-        elif key == "compaction_trigger_ratio":
-            config.compaction_trigger_ratio = parse_compaction_trigger_ratio(value)
-        elif key == "compaction_keep_recent_messages":
-            config.compaction_keep_recent_messages = (
-                parse_compaction_keep_recent_messages(value)
-            )
         elif key == "compaction_compact_model":
             normalized = normalize_optional_model_selection(value)
             config.compaction_compact_model = (

@@ -137,6 +137,24 @@ def start_thinking_timer():
         bridge.start_thinking_timer()
 
 
+def begin_overflow_replay_scope():
+    bridge = get_bridge()
+    if bridge is not None and hasattr(bridge, "begin_overflow_replay_scope"):
+        bridge.begin_overflow_replay_scope()
+
+
+def commit_overflow_replay_scope():
+    bridge = get_bridge()
+    if bridge is not None and hasattr(bridge, "commit_overflow_replay_scope"):
+        bridge.commit_overflow_replay_scope()
+
+
+def rollback_overflow_replay_scope():
+    bridge = get_bridge()
+    if bridge is not None and hasattr(bridge, "rollback_overflow_replay_scope"):
+        bridge.rollback_overflow_replay_scope()
+
+
 def print_stream_thinking_continue(content):
     while "\n\n" in content:
         content = content.replace("\n\n", "\n")
