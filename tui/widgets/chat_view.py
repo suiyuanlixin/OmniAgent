@@ -2245,6 +2245,42 @@ class SelectableMessageStatic(Static, can_focus=True):
         return lines or [(0, 0)]
 
 
+class _LeadingBlankTrimmedMarkdown:
+    def __init__(self, source: str):
+        self.source = str(source or "")
+
+    def __rich_console__(self, console, options):
+        lines = console.render_lines(
+            RichMarkdown(self.source),
+            options.update(height=None),
+            pad=False,
+        )
+        while lines and self._is_unstyled_blank_line(lines[0]):
+            lines.pop(0)
+        for line_index, line in enumerate(lines):
+            yield from line
+            if line_index < len(lines) - 1:
+                yield Segment.line()
+
+    @staticmethod
+    def _is_unstyled_blank_line(line) -> bool:
+        for segment in line:
+            if segment.text.strip():
+                return False
+            style = segment.style
+            if style is None:
+                continue
+            if getattr(style, "bgcolor", None) is not None:
+                return False
+            link_style = getattr(style, "_link_style", None)
+            if (
+                link_style is not None
+                and getattr(link_style, "bgcolor", None) is not None
+            ):
+                return False
+        return True
+
+
 class MarkdownMessageStatic(Static, can_focus=True):
     BINDINGS = [
         Binding("ctrl+c", "copy_markdown", show=False, priority=True),
@@ -2334,7 +2370,7 @@ class MarkdownMessageStatic(Static, can_focus=True):
             self.refresh()
 
     def _markdown_renderable(self):
-        return RichMarkdown(self._markdown_source)
+        return _LeadingBlankTrimmedMarkdown(self._markdown_source)
 
     def _plain_content(self) -> str:
         self._rendered_markdown_text()
