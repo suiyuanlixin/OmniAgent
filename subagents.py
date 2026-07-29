@@ -16,7 +16,17 @@ FORBIDDEN_SUBAGENT_TOOL_NAMES = {
     "ask_user",
 }
 DEFAULT_SUBAGENT_TOOL_CALL_FACTOR = 4
-MAX_PARALLEL_SUBAGENTS = 8
+
+TOOL_OUTPUT_ARTIFACT_PROMPT = (
+    "\n\nTool output artifacts:\n"
+    "- When a tool reports `preview limited` and returns an `artifact://tool_...` URI, "
+    "the complete output is preserved behind that read-only handle.\n"
+    "- Inspect the exact URI with read_file pagination or grep when those tools are "
+    "available. Do not treat it as a filesystem path or pass it to shell, git, write, "
+    "or edit tools."
+)
+MAX_SUBAGENT_TASKS_PER_BATCH = 8
+MAX_SUBAGENT_WORKERS = 8
 SUBAGENT_WRITE_TOOL_NAMES = frozenset({
     "write_file",
     "edit_file",
@@ -205,12 +215,6 @@ _BUILTIN_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
-_ALIASES = {
-    "general": "builder",
-    "investigator": "researcher",
-}
-
-
 class SubagentRegistry:
     def __init__(
         self,
@@ -283,33 +287,20 @@ class SubagentRegistry:
         content = content.strip()
         return content or fallback
 
-    def resolve_name(self, name: str) -> str:
-        key = str(name or "").strip().lower()
-        return _ALIASES.get(key, key)
-
     def get(self, name: str) -> SubagentSpec | None:
-        spec = self._specs.get(self.resolve_name(name))
+        key = str(name or "").strip().lower()
+        spec = self._specs.get(key)
         if spec is None:
             return None
         return self._with_skills_summary(spec)
 
-    def names(self, *, include_aliases: bool = False) -> list[str]:
-        names = set(self._specs.keys())
-        if include_aliases:
-            names.update(_ALIASES.keys())
-        return sorted(names)
-
-    def aliases(self) -> dict[str, str]:
-        return dict(_ALIASES)
+    def names(self) -> list[str]:
+        return sorted(self._specs)
 
     def describe(self) -> str:
-        lines = [f"- {spec.name}: {spec.description}" for spec in self._specs.values()]
-        if _ALIASES:
-            aliases = ", ".join(
-                f"{alias} -> {target}" for alias, target in sorted(_ALIASES.items())
-            )
-            lines.append(f"- aliases: {aliases}")
-        return "\n".join(lines)
+        return "\n".join(
+            f"- {spec.name}: {spec.description}" for spec in self._specs.values()
+        )
 
     def _with_skills_summary(self, spec: SubagentSpec) -> SubagentSpec:
         if not self._skills_summary_provider:
@@ -373,7 +364,6 @@ class SubagentRunner:
         spec: SubagentSpec,
         tool_schemas: list[dict[str, Any]],
         execute_tool: Callable[[str, dict[str, Any]], str],
-        compact_tool_result: Callable[[str], str] | None = None,
         max_tool_calls: int | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
         worker_label: str = "Subagent",
@@ -385,7 +375,6 @@ class SubagentRunner:
         self.spec = spec
         self.tool_schemas = tool_schemas
         self.execute_tool = execute_tool
-        self.compact_tool_result = compact_tool_result or (lambda value: value)
         self.max_tool_calls = max(
             1,
             int(max_tool_calls or spec.max_turns * DEFAULT_SUBAGENT_TOOL_CALL_FACTOR),
@@ -419,7 +408,7 @@ class SubagentRunner:
 
     def run(self, task: str) -> str:
         history: list[dict[str, Any]] = [{"role": "user", "content": task}]
-        final_response = ""
+        visible_response = ""
         self.transcript = []
         self._record_event({"kind": "message", "role": "user", "content": task})
 
@@ -497,14 +486,14 @@ class SubagentRunner:
                     "name": str(tool_call.get("name") or ""),
                     "arguments": tool_call.get("input", tool_call.get("arguments", {})),
                 })
-            final_response += text
+            visible_response += text
 
             if not tool_calls:
                 if self._append_incoming_messages(history):
                     continue
-                summary = final_response.strip()
-                if summary:
-                    return summary
+                result = visible_response.strip()
+                if result:
+                    return result
                 message = (
                     f"ERROR: {self.worker_label} returned an empty response "
                     "without text or tool calls."
@@ -880,7 +869,6 @@ class SubagentRunner:
             if callable(consume_display):
                 display = consume_display()
         full_result = str(result or "")
-        compact_result = self.compact_tool_result(full_result)
         self._record_event({
             "kind": "tool_result",
             "name": str(name or ""),
@@ -888,10 +876,11 @@ class SubagentRunner:
             "is_error": full_result.startswith("ERROR:"),
             "display": display,
         })
-        return compact_result
+        return full_result
 
     def _messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [{"role": "system", "content": self.spec.system_prompt}, *history]
+        system_prompt = self.spec.system_prompt + TOOL_OUTPUT_ARTIFACT_PROMPT
+        return [{"role": "system", "content": system_prompt}, *history]
 
     @staticmethod
     def _anthropic_messages(history: list[dict[str, Any]]) -> list[dict[str, Any]]:

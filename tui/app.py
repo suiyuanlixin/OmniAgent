@@ -2594,13 +2594,6 @@ class AgentTUIApp(App):
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_skills_auto_catalog_changed(v),
             },
-            {
-                "name": "Max skill chars",
-                "value": str(self.config.skills_max_chars),
-                "keywords": "max_skill_chars",
-                "edit_type": "input",
-                "on_change": lambda v: self._on_setting_skills_max_changed(v),
-            },
         ]
         return rows
 
@@ -2613,7 +2606,6 @@ class AgentTUIApp(App):
             workspace_enabled=bool(workspace_dir),
             workspace_dir=workspace_dir,
             auto_catalog=self.config.skills_auto_catalog,
-            max_chars=self.config.skills_max_chars,
         )
 
     def _skill_records_for_page(self) -> list[dict]:
@@ -2966,7 +2958,6 @@ class AgentTUIApp(App):
             app_enabled=self.config.skills_source_app,
             workspace_enabled=self.config.skills_source_workspace,
             auto_catalog=self.config.skills_auto_catalog,
-            max_chars=self.config.skills_max_chars,
         )
 
     def _install_skill_from_draft(self) -> str:
@@ -3925,17 +3916,6 @@ class AgentTUIApp(App):
             self.chat.set_skills_config(auto_catalog=enabled)
         self._apply_config_to_controls()
 
-    def _on_setting_skills_max_changed(self, value: str) -> None:
-        try:
-            chars = max(1000, int(value))
-        except (TypeError, ValueError):
-            return
-        save_config_field("skills_max_chars", chars)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_skills_config(max_chars=chars)
-        self._apply_config_to_controls()
-
     def _on_setting_search_changed(self, value: str) -> None:
         enabled = value.lower() in ("on", "true", "yes")
         save_config_field("web_search_enable", enabled)
@@ -4117,7 +4097,6 @@ class AgentTUIApp(App):
             skills_source_app=self.config.skills_source_app,
             skills_source_workspace=self.config.skills_source_workspace,
             skills_auto_catalog=self.config.skills_auto_catalog,
-            skills_max_chars=self.config.skills_max_chars,
             compaction_enable=self.config.compaction_enable,
             compaction_compact_model=(
                 AUTO_MODEL_SELECTION

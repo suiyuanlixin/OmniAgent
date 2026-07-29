@@ -2852,9 +2852,9 @@ class TeamActionBlock(Vertical):
         if self.action == "shutdown_teammate":
             return False
         if self.action == "list_teammates":
-            return bool(self.metadata.get("roster"))
+            return bool(self.metadata.get("roster") or self.details)
         if self.action == "read_inbox":
-            return bool(self.metadata.get("messages"))
+            return bool(self.metadata.get("messages") or self.details)
         return bool(self.metadata.get("message") or self.details)
 
     def _marker(self) -> str:
@@ -2888,9 +2888,13 @@ class TeamActionBlock(Vertical):
 
     def _content_children(self) -> list[Widget]:
         if self.action == "list_teammates":
-            return self._roster_children()
+            if self.metadata.get("roster"):
+                return self._roster_children()
+            return self._details_children()
         if self.action == "read_inbox":
-            return self._inbox_children()
+            if self.metadata.get("messages"):
+                return self._inbox_children()
+            return self._details_children()
         if self.action in {"send_message", "broadcast", "report_to_lead"}:
             message = str(self.metadata.get("message") or self.details or "").strip()
             return (
@@ -2898,6 +2902,9 @@ class TeamActionBlock(Vertical):
                 if message
                 else []
             )
+        return self._details_children()
+
+    def _details_children(self) -> list[Widget]:
         if self.details and self.can_expand:
             return [Static(self.details, classes="team-message-bubble", markup=False)]
         return []
@@ -3268,12 +3275,12 @@ def _subagent_explored_description(name: str, arguments) -> str:
         file_path = _escape_markup(arguments.get("file_path") or "")
         if file_path:
             parts.append(f"[gray]{file_path}[/gray]")
-        start_line = arguments.get("start_line")
-        end_line = arguments.get("end_line")
-        if start_line is not None and end_line is not None:
-            parts.append(f"[gray]offset={start_line} limit={end_line}[/gray]")
-        elif start_line is not None:
-            parts.append(f"[gray]offset={start_line}[/gray]")
+        offset = arguments.get("offset")
+        limit = arguments.get("limit")
+        if offset is not None:
+            parts.append(f"[gray]offset={offset}[/gray]")
+        if limit is not None:
+            parts.append(f"[gray]limit={limit}[/gray]")
         return " ".join(parts)
     if name == "read_program_docs":
         return "[white]Read program docs[/white]"

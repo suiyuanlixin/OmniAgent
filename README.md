@@ -120,8 +120,7 @@ python main.py
       "app": true,
       "workspace": false
     },
-    "auto_catalog": true,
-    "max_skill_chars": 64000
+    "auto_catalog": true
   },
   "auto_compact": {
     "enable": true,
@@ -277,10 +276,23 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 - 协作：`update_todo`、`ask_user`
 - 外部能力：`web_search`、`list_skills`、`read_skill`
 
+大输出处理采用固定上限的 Artifact 协议：
+
+- `read_file` 只接受 `file_path`、可选 `reference`、1-based `offset` 和 `limit`；旧参数会被拒绝。单次最多读取 `2000` 行或 `50 KiB`，普通页面只扫描到当前页和一个 lookahead；只有到达 EOF 时才返回精确总行数。当前页遇到超长单行时会生成完整分页 view，因此该步骤需要流式扫描源文件一次。
+- `list_dir` 使用相同的 `offset` / `limit` 连续分页，单页最多 `2000` 个排序后的条目；分页只保留到当前页所需的有界排序候选，不再把整个目录树同时留在内存中。
+- 普通工具输出使用内部固定预览上限：最多 `2000` 行和 `50 KiB`。两项都未超过时逐字符完整返回；超过任一项时保存原文，模型收到约 75% 头部和 25% 尾部组成的确定性预览。该上限不通过 `config.json`、Settings 或工具参数开放。
+- 模型看到的是 `artifact://tool_...` 虚拟 URI，不会暴露本机用户目录或真实缓存路径。模型可把该 URI 传给 `read_file` 或 `grep`；存在超过 `2000` 字符的物理行时，还会提供按最多 `1800` 字符分段的 `.view.txt` Artifact，每段保留原始行号、段号、字符区间和换行类型。
+- Artifact 存放在当前用户的私有缓存目录，POSIX 下目录和文件分别使用 owner-only 权限；普通文本采用临时文件加原子替换。原文和 view 默认保留约 `7` 天，OmniAgent 工具层只允许 `read_file` 和 `grep` 读取这些 URI，不会放宽工作区写入、Shell cwd 或普通绝对路径权限。
+- Artifact 另有不可配置的磁盘安全策略：单文件最多 `256 MiB`、缓存总量最多 `1 GiB`，并保留至少 `256 MiB` 可用磁盘空间。达到安全限制时会停止生产者并明确标记 Artifact 不完整，不会把部分内容伪装为完整原文。
+- `bash` 流式合并 stdout/stderr，内存只维护有界预览窗口；超时、用户取消或磁盘安全停止都会执行有界进程树终止、有限时间 wait、必要时 force-kill，并明确区分终止成功、强制终止和无法确认。
+- `grep` 优先使用带进程超时的 Ripgrep，最多返回 `100` 条匹配，并给出实际匹配列号和围绕匹配位置的上下文；无 Ripgrep 时使用兼容回退实现。`glob` 最多返回 `100` 个文件，并使用有界候选集合而不是一次收集全部匹配。
+- Web Search 保留 Tavily 返回的 answer、content 和 raw content 空白格式，搜索结果块直接以结构记录交给 Artifact 管线，不再从格式化纯文本中猜测记录边界。Program Docs、Skill、Team Inbox 和 Shell 等流式生产者会在生成过程中直接写入 Artifact Writer。
+- Artifact 预览之后仍有统一上下文预算作为最后防线：只有 history 达到 `context_window_tokens - max_tokens` 时，才清理旧工具结果或调用压缩模型。
+
 安全限制：
 
 - 必须先在界面中选择工作区后，才能启用本地 Agent。
-- 所有工作区工具只允许访问工作区及其子目录。
+- 除 `read_file` / `grep` 对应用管理工具输出临时目录的只读访问外，工作区工具仍只允许访问工作区及其子目录。
 - 普通聊天不会获得工作区任意文件读写权限。
 - 高风险命令仍需要审批。
 
@@ -288,7 +300,7 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 
 主 Agent 提供两种委派方式：
 
-- **Subagent**：适合短期、同步、一次性的阅读、调研、审计或小范围实现；任务结束后只返回一份精简结果。
+- **Subagent**：适合短期、同步、一次性的阅读、调研、审计或小范围实现；任务结束后返回该 Subagent 各轮可见文本组成的最终结果。
 - **Agent Team**：适合后台、长时间运行、需要状态跟踪、后续消息或持续文件所有权的任务。
 
 同一任务范围不应同时交给 Subagent 和 teammate。Agent Team 仅在 Build mode 可用；Plan mode 只提供只读 Subagent。
@@ -298,13 +310,17 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 Build mode 支持以下子智能体：
 
 - `reader`：快速阅读和总结代码。
-- `researcher`：资料搜索与方案调研，别名 `investigator`。
+- `researcher`：资料搜索与方案调研。
 - `auditor`：审计、风险检查与验证。
-- `builder`：小范围实现任务，别名 `general`。
+- `builder`：小范围实现任务。
 
-Plan mode 只暴露并允许 `reader`、`researcher` 及指向它们的别名；`auditor`、`builder`、`general` 会被拒绝。子智能体不能继续派发子智能体、管理 Team、维护主 Agent 的 todo 或直接向用户提问。
+Plan mode 只暴露并允许 `reader`、`researcher`；`auditor`、`builder` 会被拒绝。子智能体不能继续派发子智能体、管理 Team、维护主 Agent 的 todo 或直接向用户提问。
 
-`dispatch_subagent` 只接受 `tasks` 数组，不再兼容顶层 `agent_type`、`task` 等旧单任务格式。一次可提交最多 8 个独立任务：只读 Subagent 会并行运行；拥有文件写入工具的多个 `builder` 按 `tasks` 数组顺序排队，同一时间只运行一个，但可以与相互独立的只读任务并行。主 Agent 等全部任务返回后，仍按原始数组顺序汇总结果。需要依赖前序结果或检查 Builder 最终修改的任务不应放在同一批次，而应在前一批完成后再下发。
+`dispatch_subagent` 只接受 `tasks` 数组，不再兼容顶层 `agent_type`、`task` 等旧单任务格式，一次最多提交 8 个任务。每个任务可设置正整数 `priority`：数字越小越先运行，省略时默认为 `1`；当前优先级的全部任务结束后，才会启动下一个优先级。相同优先级内仍遵循原有并行规则：只读 Subagent 并行运行；拥有文件写入工具的多个 `builder` 按 `tasks` 数组顺序排队，同一时间只运行一个，但可以与同优先级、相互独立的只读任务并行。priority 是执行顺序屏障，不是成功依赖：前一组即使有任务失败，后一组仍会继续；如果后一任务必须依赖前一任务的成功结果，应在前一批返回并检查成功后再单独下发。主 Agent 等全部优先级结束后，仍按原始数组顺序汇总最终回复。后续优先级可以检查前序 Builder 已完成的工作区修改，但不会自动收到前序 Subagent 的最终回复。
+
+Subagent 完成后不会再调用另一个模型生成摘要。`SubagentRunner.run()` 会把该 Subagent 各轮产生的可见文本拼接为最终结果：单任务直接返回这段文本，多任务则按原始 `tasks` 顺序汇总。思考内容、完整消息和工具调用保留在 Subagent 的 TUI 卡片与会话 transcript 中；超大工具结果只保留受限预览和 Artifact URI，不会把完整大文本直接塞入该 Subagent 的模型上下文。
+
+多个 Subagent 的最终回复合并后不按单项工具 Artifact 上限截断或落盘。下一次主模型回合前会按照 `context_window_tokens - max_tokens` 的统一输入预算检查完整 history：未超预算时保留全部合并结果；超出预算时才进入现有的旧工具结果清理与上下文压缩流程。主 Agent、Subagent 和 teammate 的普通工具调用均使用相同的固定无损输出协议。
 
 工作区中可通过模板覆盖内置 prompt：
 

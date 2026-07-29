@@ -1,3 +1,4 @@
+import os
 import json
 import re
 from dataclasses import dataclass
@@ -6,7 +7,6 @@ from pathlib import Path
 
 APP_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 WORKSPACE_SKILLS_RELATIVE_DIR = Path(".omniagent") / "skills"
-MAX_SKILL_CHARS = 12000
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SKILL_SOURCES = {"app", "workspace"}
 
@@ -29,7 +29,6 @@ class SkillRegistry:
         workspace_enabled=False,
         workspace_dir=None,
         auto_catalog=True,
-        max_chars=MAX_SKILL_CHARS,
         app_skills_dir=None,
     ):
         self.enabled = bool(enabled)
@@ -38,7 +37,6 @@ class SkillRegistry:
         self.auto_catalog = bool(auto_catalog)
         self.app_skills_dir = Path(app_skills_dir or APP_SKILLS_DIR).resolve()
         self.workspace_dir = Path(workspace_dir).resolve() if workspace_dir else None
-        self.max_chars = max(1000, int(max_chars or MAX_SKILL_CHARS))
         self._skills = None
         self._ensure_enabled_workspace_skills_dir()
 
@@ -55,7 +53,6 @@ class SkillRegistry:
         workspace_enabled=None,
         workspace_dir=None,
         auto_catalog=None,
-        max_chars=None,
     ):
         if enabled is not None:
             self.enabled = bool(enabled)
@@ -69,9 +66,7 @@ class SkillRegistry:
             )
         if auto_catalog is not None:
             self.auto_catalog = bool(auto_catalog)
-        if max_chars is not None:
-            self.max_chars = max(1000, int(max_chars or MAX_SKILL_CHARS))
-        self._ensure_enabled_workspace_skills_dir()
+            self._ensure_enabled_workspace_skills_dir()
         self.reload()
 
     def reload(self):
@@ -140,42 +135,71 @@ class SkillRegistry:
         )
 
     def read_skill(self, name, files=None):
+        chunks = []
+
+        class Sink:
+            @staticmethod
+            def write(value):
+                chunks.append(str(value or ""))
+
+        self.write_skill(name, files, Sink())
+        return "".join(chunks)
+
+    def write_skill(self, name, files, writer):
         if not self.enabled:
-            return "ERROR: Skills are disabled."
+            writer.write("ERROR: Skills are disabled.")
+            return
         skill_key = _normalize_skill_key(name)
         skill = self._resolve_skill(skill_key)
         if skill is None:
-            return f"ERROR: Unknown skill: {skill_key}"
+            writer.write(f"ERROR: Unknown skill: {skill_key}")
+            return
         if isinstance(skill, list):
             choices = ", ".join(item.key for item in skill)
-            return f"ERROR: Ambiguous skill name: {skill_key}. Use one of: {choices}"
-
-        sections = []
-        budget = self.max_chars
-        skill_path = skill.path / "SKILL.md"
-        text, budget = self._read_limited_file(skill_path, budget)
-        sections.append(f"--- SKILL.md ({skill.key}) ---\n{text}")
-
-        available_files = self._skill_files(skill.path)
-        if available_files:
-            sections.append(
-                "Available skill files:\n"
-                + "\n".join(f"- {path}" for path in available_files)
+            writer.write(
+                f"ERROR: Ambiguous skill name: {skill_key}. Use one of: {choices}"
             )
+            return
+
+        def write_file(path):
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as source:
+                    while True:
+                        chunk = source.read(8192)
+                        if not chunk:
+                            break
+                        if writer.write(chunk) is False:
+                            return False
+                return True
+            except OSError as error:
+                writer.write(f"ERROR: Failed to read {path.name}: {error}")
+                return True
+
+        skill_path = skill.path / "SKILL.md"
+        if writer.write(f"--- SKILL.md ({skill.key}) ---\n") is False:
+            return
+        if write_file(skill_path) is False:
+            return
+
+        available_started = False
+        for rel_path in self._iter_skill_files(skill.path):
+            if not available_started:
+                if writer.write("\n\nAvailable skill files:\n") is False:
+                    return
+                available_started = True
+            if writer.write(f"- {rel_path}\n") is False:
+                return
 
         for rel_path in _normalize_file_list(files):
-            if budget <= 0:
-                sections.append("[skill read truncated: max_skill_chars reached]")
-                break
+            if writer.write(f"\n\n--- {rel_path} ---\n") is False:
+                return
             try:
                 file_path = self._resolve_skill_file(skill.path, rel_path)
             except ValueError as error:
-                sections.append(f"ERROR: {error}")
+                writer.write(f"ERROR: {error}")
                 continue
-            text, budget = self._read_limited_file(file_path, budget)
-            sections.append(f"--- {rel_path} ---\n{text}")
-
-        return "\n\n".join(sections)
+            if write_file(file_path) is False:
+                return
 
     def status(self):
         skills = self.list_skills()
@@ -190,7 +214,6 @@ class SkillRegistry:
                 "workspace": self.workspace_enabled,
             },
             "auto_catalog": self.auto_catalog,
-            "max_skill_chars": self.max_chars,
             "count": len(skills),
             "counts": by_source,
             "directories": {
@@ -304,18 +327,22 @@ class SkillRegistry:
             )
         return skills
 
+    def _iter_skill_files(self, skill_dir):
+        for current_root, dirnames, filenames in os.walk(skill_dir):
+            current_path = Path(current_root)
+            relative_root = current_path.relative_to(skill_dir)
+            dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+            for filename in sorted(filenames):
+                if filename == "SKILL.md" or filename.startswith("."):
+                    continue
+                path = current_path / filename
+                relative = path.relative_to(skill_dir)
+                if any(part.startswith(".") for part in relative.parts):
+                    continue
+                yield relative.as_posix()
+
     def _skill_files(self, skill_dir):
-        files = []
-        for path in sorted(skill_dir.rglob("*"), key=lambda value: str(value).lower()):
-            if not path.is_file() or path.name == "SKILL.md":
-                continue
-            if any(part.startswith(".") for part in path.relative_to(skill_dir).parts):
-                continue
-            files.append(path.relative_to(skill_dir).as_posix())
-            if len(files) >= 100:
-                files.append("[more files omitted]")
-                break
-        return files
+        return list(self._iter_skill_files(skill_dir))
 
     def _resolve_skill_file(self, skill_dir, rel_path):
         value = str(rel_path or "").strip().replace("\\", "/")
@@ -332,19 +359,11 @@ class SkillRegistry:
             raise ValueError(f"Skill file does not exist: {rel_path}")
         return candidate
 
-    def _read_limited_file(self, path, budget):
+    def _read_file(self, path):
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            return path.read_text(encoding="utf-8", errors="replace")
         except OSError as error:
-            return f"ERROR: Failed to read {path.name}: {error}", budget
-        if len(text) <= budget:
-            return text, budget - len(text)
-        omitted = len(text) - budget
-        return (
-            text[:budget]
-            + f"\n\n[skill content truncated: {omitted} characters omitted]",
-            0,
-        )
+            return f"ERROR: Failed to read {path.name}: {error}"
 
     def _build_skill_record(self, skill):
         skill_md_path = skill.path / "SKILL.md"

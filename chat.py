@@ -68,7 +68,8 @@ from tools import (
 from subagents import (
     DISPATCH_SUBAGENT_TOOL_NAME,
     FORBIDDEN_SUBAGENT_TOOL_NAMES,
-    MAX_PARALLEL_SUBAGENTS,
+    MAX_SUBAGENT_TASKS_PER_BATCH,
+    MAX_SUBAGENT_WORKERS,
     SubagentSpec,
     SubagentRunner,
     compose_subagent_task,
@@ -90,7 +91,6 @@ from team import (
 
 
 AGENT_CONTEXT_WARN_CHARS = 180000
-AGENT_TOOL_RESULT_CONTEXT_CHARS = 12000
 COMPACTION_MAX_TOKENS = 2048
 COMPACTION_TAIL_TURNS = 2
 COMPACTION_RECENT_TOKEN_MIN = 2000
@@ -140,7 +140,8 @@ Rules:
 - Work only inside the configured workspace and use tools for local file facts.
 - Explore before editing: list directories, search, and read relevant line ranges first.
 - Prefer small, targeted changes. Do not rewrite unrelated code.
-- Use read_file with line ranges and line numbers when a file is long.
+- Use read_file with offset/limit pagination when a file is long. Follow the returned next offset instead of requesting the whole file.
+- When a tool reports `preview limited` and returns an `artifact://tool_...` URI, the complete output is preserved behind that read-only handle. Inspect it with read_file pagination or grep; do not treat the URI as a filesystem path or pass it to shell, git, write, or edit tools.
 - Prefer apply_unified_patch for contextual edits, apply_patch for simple line-range edits, and edit_file for exact small replacements.
 - Use git_status and git_diff to understand existing and resulting workspace changes.
 - After editing, run a lightweight verification command when it is safe and relevant.
@@ -277,7 +278,6 @@ class OmniAgent:
         skills_source_app=True,
         skills_source_workspace=False,
         skills_auto_catalog=True,
-        skills_max_chars=12000,
         compaction_enable=True,
         compaction_compact_model=AUTO_MODEL_SELECTION,
         memory_model=AUTO_MODEL_SELECTION,
@@ -343,7 +343,7 @@ class OmniAgent:
             skills_app_enabled=skills_source_app,
             skills_workspace_enabled=skills_source_workspace,
             skills_auto_catalog=skills_auto_catalog,
-            skills_max_chars=skills_max_chars,
+            stop_requested_callback=lambda: self.agent_stop_requested,
             plan_mode=agent_plan_enabled,
         )
         self.agent_mode = bool(agent_mode and self.agent_tools.enabled)
@@ -533,14 +533,12 @@ class OmniAgent:
         app_enabled=None,
         workspace_enabled=None,
         auto_catalog=None,
-        max_chars=None,
     ):
         self.agent_tools.set_skills_config(
             enabled=enabled,
             app_enabled=app_enabled,
             workspace_enabled=workspace_enabled,
             auto_catalog=auto_catalog,
-            max_chars=max_chars,
         )
 
     def set_web_search_config(
@@ -951,8 +949,7 @@ class OmniAgent:
         for round_index in range(1, self.max_agent_rounds + 1):
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
-            self._print_agent_round(round_index)
-            self._warn_agent_context_if_needed()
+            self._prepare_agent_model_round(round_index)
             blocks, response_streamed = self._run_model_turn_with_overflow_recovery(
                 self._stream_anthropic_agent_turn
             )
@@ -1139,8 +1136,7 @@ class OmniAgent:
         for round_index in range(1, self.max_agent_rounds + 1):
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
-            self._print_agent_round(round_index)
-            self._warn_agent_context_if_needed()
+            self._prepare_agent_model_round(round_index)
             (
                 assistant_message,
                 thinking_content,
@@ -2449,8 +2445,7 @@ class OmniAgent:
         for round_index in range(1, self.max_agent_rounds + 1):
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
-            self._print_agent_round(round_index)
-            self._warn_agent_context_if_needed()
+            self._prepare_agent_model_round(round_index)
             (
                 assistant_message,
                 thinking_content,
@@ -2702,6 +2697,12 @@ class OmniAgent:
         finish_thinking_round()
         self._separate_after_agent_thinking()
 
+    def _prepare_agent_model_round(self, round_index):
+        if round_index > 1:
+            self._auto_compact_context()
+        self._print_agent_round(round_index)
+        self._warn_agent_context_if_needed()
+
     def _warn_agent_context_if_needed(self):
         if self.agent_context_warning_sent:
             return
@@ -2712,7 +2713,7 @@ class OmniAgent:
         self.agent_context_warning_sent = True
         warning = (
             "Agent context budget warning: the current conversation and tool results are large. "
-            "Use narrower searches, read smaller line ranges, and avoid repeating bulky outputs."
+            "Use narrower searches, continue large files with offset/limit, and avoid repeating bulky outputs."
         )
         self._separate_after_agent_thinking()
         print_warn(warning)
@@ -3940,8 +3941,11 @@ class OmniAgent:
         run_summary = self.agent_tools.session_summary()
         history_text = assistant_text
         if run_summary:
+            visible_run_summary = self.agent_tools.finalize_internal_output(
+                "session_summary", run_summary
+            )
             history_text = (
-                f"{assistant_text}\n\n[Agent run summary]\n{run_summary}".strip()
+                f"{assistant_text}\n\n[Agent run summary]\n{visible_run_summary}".strip()
             )
 
         self.conversation_history = self.conversation_history[:history_start] + [
@@ -3992,6 +3996,9 @@ class OmniAgent:
             verification_passed,
             check_result,
         )
+        visible_check_result = self.agent_tools.finalize_internal_output(
+            "final_check", check_result
+        )
 
         if verification_passed:
             verification_instruction = (
@@ -4008,7 +4015,7 @@ class OmniAgent:
             "role": "user",
             "content": (
                 "Automatic final verification for this local agent run:\n\n"
-                f"{check_result}\n\n"
+                f"{visible_check_result}\n\n"
                 f"{verification_instruction}"
                 "If the verification output shows a problem, continue using tools to fix it. "
                 "Do not attribute pre-existing workspace changes to this run unless they are listed "
@@ -4104,8 +4111,9 @@ class OmniAgent:
                     self.agent_final_check_done = False
                 self._last_tool_display = self.agent_tools.consume_display_payload()
         self._track_explored_tool(name, tool_input)
-        context_result = _compact_tool_result_for_context(tool_result)
-        return context_result
+        # Tool-specific OpenCode-style output limits are applied by AgentTools.
+        # The shared context budget remains the final history-level compaction layer.
+        return str(tool_result or "")
 
     def _consume_last_tool_display(self):
         display = self._last_tool_display
@@ -4144,9 +4152,9 @@ class OmniAgent:
     def _dispatch_subagent(self, *, tasks):
         if not isinstance(tasks, list) or not tasks:
             return _error_text("dispatch_subagent requires at least one task.")
-        if len(tasks) > MAX_PARALLEL_SUBAGENTS:
+        if len(tasks) > MAX_SUBAGENT_TASKS_PER_BATCH:
             return _error_text(
-                f"dispatch_subagent accepts at most {MAX_PARALLEL_SUBAGENTS} tasks per batch."
+                f"dispatch_subagent accepts at most {MAX_SUBAGENT_TASKS_PER_BATCH} tasks per batch."
             )
 
         prepared = []
@@ -4155,23 +4163,29 @@ class OmniAgent:
                 return _error_text(f"Subagent task {index} must be an object.")
             item_agent_type = str(item.get("agent_type") or "").strip()
             item_task = str(item.get("task") or "").strip()
-            spec = self.agent_tools.subagent_registry.get(item_agent_type)
+            item_priority = item.get("priority", 1)
             if (
-                self.agent_tools.plan_mode
-                and self.agent_tools.subagent_registry.resolve_name(item_agent_type)
-                not in PLAN_SUBAGENT_TYPES
+                isinstance(item_priority, bool)
+                or not isinstance(item_priority, int)
+                or item_priority < 1
             ):
                 return _error_text(
-                    "Plan mode only allows reader and researcher subagents. "
-                    f"Requested: {item_agent_type!r}."
+                    f"Subagent task {index} priority must be a positive integer."
                 )
+            spec = self.agent_tools.subagent_registry.get(item_agent_type)
             if spec is None:
                 return _error_text(
                     "Unknown subagent "
                     f"{item_agent_type!r}. Available: "
-                    + ", ".join(
-                        self.agent_tools.subagent_registry.names(include_aliases=True)
-                    )
+                    + ", ".join(self.agent_tools.subagent_registry.names())
+                )
+            if (
+                self.agent_tools.plan_mode
+                and spec.name not in PLAN_SUBAGENT_TYPES
+            ):
+                return _error_text(
+                    "Plan mode only allows reader and researcher subagents. "
+                    f"Requested: {item_agent_type!r}."
                 )
             if not item_task:
                 return _error_text(f"Subagent task {index} is empty.")
@@ -4190,71 +4204,45 @@ class OmniAgent:
                 "subagent_task": subagent_task,
                 "purpose": item_purpose,
                 "label": _single_line(item_purpose or item_task, 120),
+                "priority": item_priority,
                 "entry_id": uuid.uuid4().hex,
             })
 
-        read_only_items = [
-            item
-            for item in prepared
-            if not subagent_has_write_tools(item["spec"])
-        ]
-        write_items = [
-            item
-            for item in prepared
-            if subagent_has_write_tools(item["spec"])
-        ]
+        priority_groups = {}
+        for item in prepared:
+            priority_groups.setdefault(item["priority"], []).append(item)
 
         self._before_agent_visible_output()
         for item in prepared:
             start_subagent_entry(item["entry_id"], item["spec"].name)
-        if len(write_items) > 1:
-            for queue_position, item in enumerate(write_items[1:], start=2):
+
+        ordered_priorities = sorted(priority_groups)
+        for priority in ordered_priorities[1:]:
+            for item in priority_groups[priority]:
                 append_subagent_event(item["entry_id"], {
                     "kind": "message",
                     "role": "status",
                     "content": (
-                        "Queued for serialized file editing "
-                        f"({queue_position}/{len(write_items)})."
+                        f"Waiting for priority group {priority}; "
+                        "earlier priority groups run first."
                     ),
                 })
 
-        if len(prepared) == 1:
-            completed = [self._run_subagent_dispatch(prepared[0])]
-        else:
-            completed_by_index = {}
-            worker_count = len(read_only_items) + (1 if write_items else 0)
-            with ThreadPoolExecutor(
-                max_workers=min(worker_count, MAX_PARALLEL_SUBAGENTS),
-                thread_name_prefix="omni-subagent",
-            ) as executor:
-                futures = {
-                    executor.submit(self._run_subagent_dispatch, item): ("single", [item])
-                    for item in read_only_items
-                }
-                if write_items:
-                    futures[
-                        executor.submit(self._run_subagent_write_queue, write_items)
-                    ] = ("writers", write_items)
-
-                for future in as_completed(futures):
-                    future_kind, future_items = futures[future]
-                    try:
-                        future_result = future.result()
-                        if future_kind == "writers":
-                            for item in future_result:
-                                completed_by_index[item["index"]] = item
-                        else:
-                            completed_by_index[future_items[0]["index"]] = future_result
-                    except Exception as error:
-                        for item in future_items:
-                            completed_by_index[item["index"]] = {
-                                **item,
-                                "result": _error_text(
-                                    f"Subagent '{item['spec'].name}' failed: {error}"
-                                ),
-                                "transcript": [],
-                            }
-            completed = [completed_by_index[item["index"]] for item in prepared]
+        completed_by_index = {}
+        for group_position, priority in enumerate(ordered_priorities):
+            if group_position > 0:
+                for item in priority_groups[priority]:
+                    append_subagent_event(item["entry_id"], {
+                        "kind": "message",
+                        "role": "status",
+                        "content": f"Priority group {priority} started.",
+                    })
+            group_results = self._run_subagent_priority_group(
+                priority_groups[priority]
+            )
+            for item in group_results:
+                completed_by_index[item["index"]] = item
+        completed = [completed_by_index[item["index"]] for item in prepared]
 
         displays = [
             {
@@ -4276,9 +4264,10 @@ class OmniAgent:
         failure_count = sum(
             str(item["result"] or "").startswith("ERROR:") for item in completed
         )
+        group_count = len(priority_groups)
         status = (
-            f"Completed {len(completed)} subagent tasks with parallel reads "
-            "and serialized writes"
+            f"Completed {len(completed)} subagent tasks across {group_count} priority "
+            f"group{'s' if group_count != 1 else ''} with parallel reads and serialized writes"
             + (f" with {failure_count} failure(s)." if failure_count else ".")
         )
         sections = [status]
@@ -4288,6 +4277,63 @@ class OmniAgent:
                 f"{item['result']}"
             )
         return "\n\n".join(sections)
+
+    def _run_subagent_priority_group(self, items):
+        read_only_items = [
+            item for item in items if not subagent_has_write_tools(item["spec"])
+        ]
+        write_items = [
+            item for item in items if subagent_has_write_tools(item["spec"])
+        ]
+
+        if len(write_items) > 1:
+            for queue_position, item in enumerate(write_items[1:], start=2):
+                append_subagent_event(item["entry_id"], {
+                    "kind": "message",
+                    "role": "status",
+                    "content": (
+                        "Queued for serialized file editing "
+                        f"({queue_position}/{len(write_items)})."
+                    ),
+                })
+
+        if len(items) == 1:
+            return [self._run_subagent_dispatch(items[0])]
+
+        completed_by_index = {}
+        worker_count = len(read_only_items) + (1 if write_items else 0)
+        with ThreadPoolExecutor(
+            max_workers=min(worker_count, MAX_SUBAGENT_WORKERS),
+            thread_name_prefix="omni-subagent",
+        ) as executor:
+            futures = {
+                executor.submit(self._run_subagent_dispatch, item): ("single", [item])
+                for item in read_only_items
+            }
+            if write_items:
+                futures[
+                    executor.submit(self._run_subagent_write_queue, write_items)
+                ] = ("writers", write_items)
+
+            for future in as_completed(futures):
+                future_kind, future_items = futures[future]
+                try:
+                    future_result = future.result()
+                    if future_kind == "writers":
+                        for item in future_result:
+                            completed_by_index[item["index"]] = item
+                    else:
+                        completed_by_index[future_items[0]["index"]] = future_result
+                except Exception as error:
+                    for item in future_items:
+                        completed_by_index[item["index"]] = {
+                            **item,
+                            "result": _error_text(
+                                f"Subagent '{item['spec'].name}' failed: {error}"
+                            ),
+                            "transcript": [],
+                        }
+        return [completed_by_index[item["index"]] for item in items]
 
     def _run_subagent_write_queue(self, items):
         completed = []
@@ -4314,7 +4360,6 @@ class OmniAgent:
             execute_tool=lambda name, args: self._execute_subagent_tool(
                 spec, name, args
             ),
-            compact_tool_result=_compact_tool_result_for_context,
             event_callback=lambda event: append_subagent_event(item["entry_id"], event),
         )
         try:
@@ -4334,12 +4379,17 @@ class OmniAgent:
             actor={"kind": "subagent", "name": spec.name},
         )
 
-    def _execute_delegated_tool(self, name, tool_input, actor=None):
+    def _execute_delegated_tool(
+        self, name, tool_input, actor=None, stop_requested_callback=None
+    ):
         with self._agent_tools_execution_lock:
             previous = self.agent_tools.suppress_visible_output
             previous_todos_enabled = self.agent_tools.todos_enabled
+            previous_stop_requested = self.agent_tools.stop_requested_callback
             self.agent_tools.suppress_visible_output = True
             self.agent_tools.todos_enabled = False
+            if stop_requested_callback is not None:
+                self.agent_tools.set_stop_requested_callback(stop_requested_callback)
             try:
                 self.agent_tools.consume_display_payload()
                 scope_error = self._write_scope_violation(
@@ -4347,11 +4397,14 @@ class OmniAgent:
                 )
                 if scope_error:
                     return _error_text(scope_error), None
-                result = self.agent_tools.execute(name, tool_input)
+                result = self.agent_tools.execute(
+                    name, tool_input, allow_subagent_hint=False
+                )
                 display = self.agent_tools.consume_display_payload()
                 self.agent_tools.consume_output_separator()
                 return result, display
             finally:
+                self.agent_tools.set_stop_requested_callback(previous_stop_requested)
                 self.agent_tools.todos_enabled = previous_todos_enabled
                 self.agent_tools.suppress_visible_output = previous
 
@@ -4524,8 +4577,7 @@ class OmniAgent:
                 execute_tool=lambda name, args: self._execute_teammate_tool(
                     record, spec, name, args
                 ),
-                compact_tool_result=_compact_tool_result_for_context,
-                team_store=self.team_store,
+                    team_store=self.team_store,
                 api_type=self.api_type,
                 event_callback=on_event,
                 stop_event=record.get("stop_event"),
@@ -4596,6 +4648,9 @@ class OmniAgent:
                 "task_id": str(record.get("task_id") or ""),
                 "write_scope": tuple(record.get("write_scope") or ()),
             },
+            stop_requested_callback=lambda: bool(
+                record.get("stop_event") and record.get("stop_event").is_set()
+            ),
         )
 
     def _report_teammate_to_lead(self, record, spec, tool_input):
@@ -5531,6 +5586,11 @@ class OmniAgent:
         prompt += (
             "\nUse web_fetch when the user provides a specific public webpage URL "
             "and asks you to read or summarize that page."
+            "\nWhen a tool reports `preview limited` and returns an "
+            "`artifact://tool_...` URI, the complete output is preserved behind that "
+            "read-only handle. If read_file or grep is available, pass the exact URI "
+            "to that tool; never treat it as a normal absolute path or pass it to "
+            "shell, git, write, or edit tools."
         )
         reference_files = getattr(self.agent_tools, "reference_files", {})
         reference_folders = getattr(self.agent_tools, "reference_folders", {})
@@ -5590,34 +5650,42 @@ class OmniAgent:
             if self.agent_tools.plan_mode:
                 prompt += (
                     "\n- In Plan mode, use dispatch_subagent only for bounded read-only repository "
-                    "inspection or external research. Choose reader or researcher (including "
-                    "their read-role aliases); do not delegate implementation or mutation."
-                    "\n- Batch independent read-only tasks in one dispatch_subagent call so they "
-                    "run concurrently; the call returns after every task finishes."
-                    "\n- Each subagent has its own history and restricted tools; only final "
-                    "summaries return. Keep ownership of planning decisions and the final plan."
+                    "inspection or external research. Choose reader or researcher; do not "
+                    "delegate implementation or mutation."
+                    "\n- Use each task's positive integer priority to control execution order. "
+                    "Lower numbers run first, omitted priorities default to 1, and tasks with "
+                    "the same priority run concurrently; the call returns after every task finishes."
+                    " Priority is an execution barrier, not a success dependency: later groups "
+                    "still run after failures. If a later task needs an earlier task's returned "
+                    "text or confirmed success, dispatch it separately after checking the result."
+                    "\n- Each subagent has its own history and restricted tools; only its final "
+                    "reply returns. Keep ownership of planning decisions and the final plan."
                 )
             else:
                 prompt += (
                     "\n- Use dispatch_subagent for short, synchronous, one-shot work such as "
                     "repository exploration, external research, auditing, verification, or a "
-                    "scoped implementation whose final summary is sufficient. Dispatch it early "
+                    "scoped implementation whose final reply is sufficient. Dispatch it early "
                     "when that shape fits so detailed tool output stays out of the main context."
-                    "\n- If two or more parts are independent, place them together in one "
-                    "dispatch_subagent tasks batch so they run concurrently. Choose the narrowest "
-                    "matching role and provide a concrete task, expected output, evidence requirement, "
-                    "and scope for each item."
-                    "\n- Read-only tasks run concurrently. Write-capable builders are serialized "
-                    "in tasks-array order and may run alongside independent read-only tasks."
-                    "\n- Do not batch dependent work. If a task needs another subagent's result "
-                    "or must inspect a builder's finished changes, dispatch it only after the "
-                    "earlier call returns."
+                    "\n- Put related tasks in one dispatch_subagent batch and assign each a positive "
+                    "integer priority. Lower numbers run first, omitted priorities default to 1, "
+                    "and the next priority group waits for the current group to finish. Choose the "
+                    "narrowest matching role and provide a concrete task, expected output, evidence "
+                    "requirement, and scope for each item."
+                    "\n- Within one priority group, independent read-only tasks run concurrently. "
+                    "Write-capable builders are serialized in tasks-array order and may run alongside "
+                    "independent read-only tasks in that same group."
+                    "\n- Use a later priority when a task must wait for an earlier builder's finished "
+                    "workspace changes. Priority is an execution barrier, not a success dependency: "
+                    "later groups still run after failures and are not automatically given earlier final "
+                    "replies. Dispatch a separate call after checking success when the dependency is on "
+                    "returned text or a successful result rather than observable workspace state."
                     "\n- Handle work directly only when it is a simple one-step task, tightly "
                     "coupled to the main reasoning, requires immediate user clarification, or no "
                     "available subagent has a useful tool set. Do not delegate merely to repeat "
                     "work already completed in the main context."
                     "\n- The subagent has its own history and restricted tools; only its final "
-                    "summary returns. Keep ownership of user-facing decisions, integration, final "
+                    "reply returns. Keep ownership of user-facing decisions, integration, final "
                     "verification, and the final answer."
                 )
         if self.agent_tools.team_available and not self.agent_tools.plan_mode:
@@ -5657,7 +5725,7 @@ class OmniAgent:
             prompt += (
                 "\n- When both subagents and Agent Team are available, use them for distinct "
                 "scopes. Use a Subagent for short, synchronous, one-shot investigation, "
-                "verification, or implementation whose final summary is sufficient. Use a "
+                "verification, or implementation whose final reply is sufficient. Use a "
                 "teammate for background or long-running work that needs status tracking, "
                 "follow-up messages, or continuing ownership. Never assign the same task scope "
                 "to both a Subagent and a teammate."
@@ -6496,23 +6564,6 @@ def _summarize_tool_result(tool_result):
     return _single_line(str(tool_result).splitlines()[0], 220)
 
 
-def _compact_tool_result_for_context(tool_result):
-    text = str(tool_result or "")
-    if len(text) <= AGENT_TOOL_RESULT_CONTEXT_CHARS:
-        return text
-
-    head_chars = AGENT_TOOL_RESULT_CONTEXT_CHARS * 2 // 3
-    tail_chars = AGENT_TOOL_RESULT_CONTEXT_CHARS - head_chars - 300
-    omitted = len(text) - head_chars - tail_chars
-    if tail_chars < 0:
-        tail_chars = 0
-    return (
-        text[:head_chars]
-        + f"\n\n[tool result compacted by client: {omitted} characters omitted]\n\n"
-        + (text[-tail_chars:] if tail_chars else "")
-    )
-
-
 def _escape_rich_markup(text: str) -> str:
     return str(text or "").replace("[", r"\[")
 
@@ -6524,12 +6575,12 @@ def _format_explored_entry(name, tool_input):
         parts = ["[white]Read[/white]"]
         file_path = _escape_rich_markup(tool_input.get("file_path") or "")
         parts.append(f"[gray]{file_path}[/gray]")
-        start_line = tool_input.get("start_line")
-        end_line = tool_input.get("end_line")
-        if start_line is not None and end_line is not None:
-            parts.append(f"[gray]offset={start_line} limit={end_line}[/gray]")
-        elif start_line is not None:
-            parts.append(f"[gray]offset={start_line}[/gray]")
+        offset = tool_input.get("offset")
+        limit = tool_input.get("limit")
+        if offset is not None:
+            parts.append(f"[gray]offset={offset}[/gray]")
+        if limit is not None:
+            parts.append(f"[gray]limit={limit}[/gray]")
         return " ".join(parts)
     if name == "read_program_docs":
         return "[white]Read program docs[/white]"

@@ -1,19 +1,41 @@
 import fnmatch
+import heapq
 import difflib
 import ipaddress
 import json
+import queue
 import os
 import re
+import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict, deque
 from html.parser import HTMLParser
 from pathlib import Path
 
+from output import (
+    TOOL_OUTPUT_LONG_LINE_CHARS,
+    TOOL_OUTPUT_MAX_BYTES,
+    TOOL_OUTPUT_MAX_LINES,
+    ToolOutputStorageError,
+    ToolOutputValue,
+    ToolOutputWriter,
+    artifact_uri,
+    cleanup_tool_outputs,
+    ensure_cleanup_thread,
+    ensure_wrapped_view,
+    finalize_tool_output,
+    fits_tool_output,
+    is_tool_output_path,
+    resolve_artifact_uri,
+)
 from todo import TodoStore
 from skills import SkillRegistry
 from ui import (
@@ -45,7 +67,7 @@ from search import (
 )
 from subagents import (
     DISPATCH_SUBAGENT_TOOL_NAME,
-    MAX_PARALLEL_SUBAGENTS,
+    MAX_SUBAGENT_TASKS_PER_BATCH,
     SubagentRegistry,
 )
 from team import (
@@ -61,11 +83,19 @@ from team import (
 )
 
 
-MAX_READ_CHARS = 60000
-MAX_TOOL_OUTPUT_CHARS = 20000
-MAX_GREP_MATCHES = 200
-MAX_GLOB_MATCHES = 500
-MAX_LIST_ENTRIES = 300
+DEFAULT_READ_LIMIT = TOOL_OUTPUT_MAX_LINES
+MAX_READ_LINE_CHARS = TOOL_OUTPUT_LONG_LINE_CHARS
+MAX_READ_BYTES = TOOL_OUTPUT_MAX_BYTES
+MAX_GREP_MATCHES = 100
+MAX_GLOB_MATCHES = 100
+GENERIC_OUTPUT_EXEMPT_TOOLS = frozenset({
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "bash",
+    DISPATCH_SUBAGENT_TOOL_NAME,
+})
 COMMAND_TIMEOUT_SECONDS = 60
 GIT_TIMEOUT_SECONDS = 30
 AGENT_APPROVAL_CONFIRM = "confirm"
@@ -73,9 +103,6 @@ AGENT_APPROVAL_APPROVE = "approve"
 AGENT_APPROVAL_FULL = "full"
 PLAN_SUBAGENT_TYPES = frozenset({"reader", "researcher"})
 PROGRAM_DOC_FILENAMES = ("README.md",)
-PROGRAM_DOC_DEFAULT_MAX_CHARS = 30000
-WEB_FETCH_DEFAULT_MAX_CHARS = 8000
-WEB_FETCH_MAX_CHARS = 60000
 WEB_FETCH_MAX_RESPONSE_BYTES = 1000000
 WEB_FETCH_MAX_REDIRECTS = 5
 NO_WORKSPACE_TOOLS = {
@@ -131,15 +158,8 @@ PROGRAM_DOCS_TOOL_DEFINITION = {
     ),
     "input_schema": {
         "type": "object",
-        "properties": {
-            "max_chars": {
-                "type": "integer",
-                "description": (
-                    "Optional maximum documentation characters to return. "
-                    "Defaults to 30000."
-                ),
-            },
-        },
+        "properties": {},
+        "additionalProperties": False,
     },
 }
 
@@ -163,12 +183,9 @@ WEB_FETCH_TOOL_DEFINITION = {
                 "enum": ["text", "raw"],
                 "description": "text extracts readable page text; raw returns raw HTML/text. Defaults to text.",
             },
-            "max_chars": {
-                "type": "integer",
-                "description": "Maximum characters to return. Defaults to 8000.",
-            },
         },
         "required": ["url"],
+        "additionalProperties": False,
     },
 }
 
@@ -404,32 +421,32 @@ TOOL_DEFINITIONS = [
     ASK_USER_TOOL_DEFINITION,
     {
         "name": "read_file",
-        "description": "Read a UTF-8 text file from the configured workspace.",
+        "description": "Read a UTF-8 text file from the workspace, a referenced file/folder, or an artifact:// tool-output URI using offset/limit pagination.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path or workspace-relative path to the file.",
+                    "description": "Workspace-relative/absolute file path, referenced path, or artifact:// tool-output URI.",
                 },
                 "reference": {
                     "type": "string",
                     "description": "Optional referenced folder label. Paths are relative to that read-only folder.",
                 },
-                "start_line": {
+                "offset": {
                     "type": "integer",
-                    "description": "Optional 1-based first line to read.",
+                    "minimum": 1,
+                    "description": "Optional 1-based first line to read. Defaults to 1.",
                 },
-                "end_line": {
+                "limit": {
                     "type": "integer",
-                    "description": "Optional 1-based final line to read.",
-                },
-                "line_numbers": {
-                    "type": "boolean",
-                    "description": "Whether to prefix returned lines with line numbers. Defaults to true.",
+                    "minimum": 1,
+                    "maximum": 2000,
+                    "description": "Optional maximum number of lines to read. Defaults to 2000 and cannot exceed 2000.",
                 },
             },
             "required": ["file_path"],
+            "additionalProperties": False,
         },
     },
     PROGRAM_DOCS_TOOL_DEFINITION,
@@ -456,7 +473,19 @@ TOOL_DEFINITIONS = [
                     "type": "integer",
                     "description": "Maximum recursive directory depth. Defaults to 2.",
                 },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional 1-based first entry to return. Defaults to 1.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 2000,
+                    "description": "Optional maximum number of entries to return. Defaults to 2000 and cannot exceed 2000.",
+                },
             },
+            "additionalProperties": False,
         },
     },
     {
@@ -631,7 +660,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "grep",
-        "description": "Search workspace files with a regular expression.",
+        "description": "Search workspace, referenced, or saved tool-output files with a regular expression. Returns at most 100 matches; narrow the path or pattern when results are limited.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -657,11 +686,12 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["pattern"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "glob",
-        "description": "Find files in the workspace by glob pattern.",
+        "description": "Find files in the workspace by glob pattern. Returns at most 100 files; use a more specific pattern when results are limited.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -675,6 +705,7 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["pattern"],
+            "additionalProperties": False,
         },
     },
 ]
@@ -929,7 +960,7 @@ class AgentTools:
         skills_app_enabled=True,
         skills_workspace_enabled=False,
         skills_auto_catalog=True,
-        skills_max_chars=12000,
+        stop_requested_callback=None,
         plan_mode=False,
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
@@ -937,6 +968,11 @@ class AgentTools:
         self.todo_approval_output_callback = todo_approval_output_callback
         self.todos_enabled = True
         self.plan_mode = bool(plan_mode)
+        self.stop_requested_callback = stop_requested_callback
+        self._tool_output_view_cache = OrderedDict()
+        self._display_deferred = False
+        cleanup_tool_outputs()
+        ensure_cleanup_thread()
         self.todo_store = TodoStore(
             on_change=todo_update_callback if self.todos_enabled else None,
             todo_dir=_todo_dir_for_workspace(self.workspace_dir),
@@ -950,7 +986,6 @@ class AgentTools:
             workspace_enabled=skills_workspace_enabled,
             workspace_dir=self.workspace_dir,
             auto_catalog=skills_auto_catalog,
-            max_chars=skills_max_chars,
         )
         self.subagent_registry = SubagentRegistry(
             workspace_dir=self.workspace_dir,
@@ -1004,6 +1039,9 @@ class AgentTools:
             mode = AGENT_APPROVAL_CONFIRM
         self.approval_mode = mode
 
+    def set_stop_requested_callback(self, callback):
+        self.stop_requested_callback = callback
+
     def set_visible_output_callback(self, callback):
         self.visible_output_callback = callback
 
@@ -1033,7 +1071,6 @@ class AgentTools:
         app_enabled=None,
         workspace_enabled=None,
         auto_catalog=None,
-        max_chars=None,
     ):
         self.skill_registry.configure(
             enabled=enabled,
@@ -1041,7 +1078,6 @@ class AgentTools:
             workspace_enabled=workspace_enabled,
             workspace_dir=self.workspace_dir,
             auto_catalog=auto_catalog,
-            max_chars=max_chars,
         )
 
     @property
@@ -1068,14 +1104,10 @@ class AgentTools:
         return self.enabled and self.subagent_executor is not None
 
     def _available_subagent_names(self):
-        names = self.subagent_registry.names(include_aliases=True)
+        names = self.subagent_registry.names()
         if not self.plan_mode:
             return names
-        return [
-            name
-            for name in names
-            if self.subagent_registry.resolve_name(name) in PLAN_SUBAGENT_TYPES
-        ]
+        return [name for name in names if name in PLAN_SUBAGENT_TYPES]
 
     def _available_subagent_description(self):
         if not self.plan_mode:
@@ -1085,13 +1117,6 @@ class AgentTools:
             spec = self.subagent_registry.get(name)
             if spec is not None:
                 lines.append(f"- {spec.name}: {spec.description}")
-        aliases = [
-            f"{alias} -> {target}"
-            for alias, target in sorted(self.subagent_registry.aliases().items())
-            if target in PLAN_SUBAGENT_TYPES
-        ]
-        if aliases:
-            lines.append("- aliases: " + ", ".join(aliases))
         return "\n".join(lines)
 
     def subagent_tool_definitions(self):
@@ -1141,7 +1166,7 @@ class AgentTools:
                 "type": "string",
                 "description": (
                     "The delegated task. Include enough local context, target files, "
-                    "and the desired summary shape."
+                    "and the desired final-reply shape."
                 ),
             },
             "purpose": {
@@ -1166,15 +1191,27 @@ class AgentTools:
                     "the subagent must not touch."
                 ),
             },
+            "priority": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Optional execution priority group. Lower numbers run first; tasks "
+                    "with the same priority run concurrently when allowed. This is an order "
+                    "barrier, not a success dependency; later groups still run after failures. "
+                    "Defaults to 1."
+                ),
+            },
         }
         return {
             "name": DISPATCH_SUBAGENT_TOOL_NAME,
             "description": (
                 "Dispatch one or more focused subagents with independent histories and "
-                "restricted tool whitelists. Read-only tasks run concurrently. Write-capable "
-                "subagents run one at a time in tasks-array order and may overlap independent "
-                "read-only work. The call returns after every subagent finishes. Each subagent "
-                "returns one concise summary, which is "
+                "restricted tool whitelists. Lower priority numbers run first, and the next "
+                "priority group waits for the current group to finish, even if that group has "
+                "failures. Within one priority "
+                "group, read-only tasks run concurrently; write-capable subagents run one at a "
+                "time in tasks-array order and may overlap independent read-only work. The call "
+                "returns after every subagent finishes. Each subagent's final reply is "
                 "added back to the main context. "
                 f"{usage} For non-trivial tasks, actively look for independent bounded parts "
                 "that can be delegated together early instead of doing all exploration in "
@@ -1188,15 +1225,16 @@ class AgentTools:
                     "tasks": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": MAX_PARALLEL_SUBAGENTS,
+                        "maxItems": MAX_SUBAGENT_TASKS_PER_BATCH,
                         "description": (
-                            "Independent subagent tasks. Read-only roles run concurrently; "
-                            "write-capable roles are queued in array order."
+                            "Subagent tasks grouped by priority. Lower numbers run first; tasks "
+                            "at the same priority follow the read/write concurrency rules."
                         ),
                         "items": {
                             "type": "object",
                             "properties": task_properties,
                             "required": ["agent_type", "task"],
+                            "additionalProperties": False,
                         },
                     },
                 },
@@ -1555,7 +1593,7 @@ class AgentTools:
             parts.append(
                 "Mutating commands: "
                 + "; ".join(
-                    _truncate(command, 180)
+                    command
                     for command in self.session_mutating_commands
                 )
             )
@@ -1601,7 +1639,7 @@ class AgentTools:
             sections.append(
                 "Agent mutating commands:\n"
                 + "\n".join(
-                    f"- {_truncate(command, 220)}"
+                    f"- {command}"
                     for command in self.session_mutating_commands
                 )
             )
@@ -1627,28 +1665,161 @@ class AgentTools:
     def final_check_passed(self, check_result):
         return _final_check_passed(check_result)
 
-    def execute(self, name, tool_input):
-        if not self.enabled and name not in NO_WORKSPACE_TOOLS:
-            return _error_result("No workspace directory")
-        if (
-            not self.enabled
-            and name in REFERENCE_ONLY_TOOLS
-            and not self.has_reference_access()
-        ):
-            return _error_result(
-                "Tool is unavailable unless the user explicitly referenced a file or folder in this request."
+    def finalize_internal_output(self, name, text):
+        return self._finalize_tool_output(name, text, allow_subagent_hint=True)
+
+    def _is_tool_output_path(self, path):
+        return is_tool_output_path(path)
+
+    def _ensure_wrapped_view(self, path, has_long_line=None):
+        return ensure_wrapped_view(
+            path,
+            cache=self._tool_output_view_cache,
+            has_long_line=has_long_line,
+        )
+
+    def _requests_tool_output_path(self, name, tool_input):
+        if name not in {"read_file", "grep"} or not isinstance(tool_input, dict):
+            return False
+        key = "file_path" if name == "read_file" else "path"
+        path_text = str(tool_input.get(key) or "").strip()
+        if not path_text:
+            return False
+        artifact_path = resolve_artifact_uri(path_text)
+        if artifact_path is not None:
+            return self._is_tool_output_path(artifact_path)
+        if not _looks_absolute(path_text):
+            return False
+        return self._is_tool_output_path(Path(path_text))
+
+    def _finalize_tool_output(self, name, text, allow_subagent_hint=True):
+        record_mode = ""
+        if name == "git_diff":
+            record_mode = "diff"
+        elif name == "web_search":
+            record_mode = "search"
+        return finalize_tool_output(
+            text,
+            strategy="head_tail",
+            record_mode=record_mode,
+            allow_subagent_hint=(
+                bool(allow_subagent_hint) and self.subagents_available
+            ),
+            view_cache=self._tool_output_view_cache,
+        )
+
+    def _sync_display_payload_result(self, name, result):
+        if not isinstance(self._display_payload, dict):
+            return
+        visible_result = str(result or "")
+        kind = self._display_payload.get("kind")
+        if kind == "shell":
+            self._display_payload["output"] = visible_result
+            return
+        if kind != "team_action":
+            return
+        artifact_result = visible_result.startswith("[Tool output")
+        if self._display_payload.get("status") == "error":
+            self._display_payload["details"] = visible_result
+            if artifact_result:
+                metadata = dict(self._display_payload.get("metadata") or {})
+                metadata.pop("error", None)
+                self._display_payload["metadata"] = metadata
+            return
+        if artifact_result and name in {LIST_TEAMMATES_TOOL_NAME, READ_INBOX_TOOL_NAME}:
+            self._display_payload["details"] = visible_result
+            metadata = dict(self._display_payload.get("metadata") or {})
+            metadata.pop("roster", None)
+            metadata.pop("messages", None)
+            self._display_payload["metadata"] = metadata
+
+    def _emit_deferred_display(self):
+        if not self._display_deferred:
+            return
+        self._display_deferred = False
+        if self.suppress_visible_output or not isinstance(self._display_payload, dict):
+            return
+        payload = self._display_payload
+        kind = payload.get("kind")
+        self._before_visible_output()
+        if kind == "shell":
+            add_shell_entry(
+                str(payload.get("command") or ""),
+                str(payload.get("output") or ""),
+            )
+        elif kind == "team_action":
+            add_team_action_entry(
+                str(payload.get("action") or "team"),
+                str(payload.get("summary") or ""),
+                str(payload.get("details") or ""),
+                str(payload.get("status") or "success"),
+                dict(payload.get("metadata") or {}),
             )
 
+    def _finish_tool_result(self, name, result, allow_subagent_hint=True):
+        try:
+            if name not in GENERIC_OUTPUT_EXEMPT_TOOLS:
+                result = self._finalize_tool_output(
+                    name, result, allow_subagent_hint=allow_subagent_hint
+                )
+        except ToolOutputStorageError as error:
+            result = _error_result(
+                "Tool output could not be preserved by the Artifact store: " + str(error)
+            )
+        self._sync_display_payload_result(name, result)
+        self._emit_deferred_display()
+        return result
+
+    def _finish_tool_error(self, name, result, allow_subagent_hint=True):
+        try:
+            if name != DISPATCH_SUBAGENT_TOOL_NAME:
+                result = self._finalize_tool_output(
+                    name, result, allow_subagent_hint=allow_subagent_hint
+                )
+        except ToolOutputStorageError as error:
+            result = _error_result(
+                "Tool error output could not be preserved by the Artifact store: "
+                + str(error)
+            )
+        self._sync_display_payload_result(name, result)
+        self._emit_deferred_display()
+        return result
+
+    def execute(self, name, tool_input, allow_subagent_hint=True):
         try:
             self._display_payload = None
+            self._display_deferred = False
             if isinstance(tool_input, str):
                 tool_input = json.loads(tool_input or "{}")
             if not isinstance(tool_input, dict):
                 raise AgentToolError("Tool input must be an object.")
+            if not self.enabled and name not in NO_WORKSPACE_TOOLS:
+                return self._finish_tool_error(
+                    name,
+                    _error_result("No workspace directory"),
+                    allow_subagent_hint=allow_subagent_hint,
+                )
+            if (
+                not self.enabled
+                and name in REFERENCE_ONLY_TOOLS
+                and not self.has_reference_access()
+                and not self._requests_tool_output_path(name, tool_input)
+            ):
+                return self._finish_tool_error(
+                    name,
+                    _error_result(
+                        "Tool is unavailable unless the user explicitly referenced a file or folder in this request."
+                    ),
+                    allow_subagent_hint=allow_subagent_hint,
+                )
             if self.plan_mode and name not in PLAN_MODE_ALLOWED_TOOLS:
-                return _error_result(
-                    f"Tool '{name}' is not available in Plan mode (read-only). "
-                    "Switch to Build mode to use modification tools."
+                return self._finish_tool_error(
+                    name,
+                    _error_result(
+                        f"Tool '{name}' is not available in Plan mode (read-only). "
+                        "Switch to Build mode to use modification tools."
+                    ),
+                    allow_subagent_hint=allow_subagent_hint,
                 )
             handlers = {
                 "update_todo": self._update_todo,
@@ -1683,8 +1854,15 @@ class AgentTools:
                 raise AgentToolError(f"Unknown tool: {name}")
             plan_gate_result = self._todo_action_gate(name, tool_input)
             if plan_gate_result is not None:
-                return plan_gate_result
-            return handler(tool_input)
+                return self._finish_tool_result(
+                    name,
+                    plan_gate_result,
+                    allow_subagent_hint=allow_subagent_hint,
+                )
+            result = handler(tool_input)
+            return self._finish_tool_result(
+                name, result, allow_subagent_hint=allow_subagent_hint
+            )
         except Exception as error:
             result = _error_result(str(error))
             if name in TEAM_TOOL_NAMES:
@@ -1698,7 +1876,9 @@ class AgentTools:
                     )
                 except Exception:
                     self._display_payload = None
-            return result
+            return self._finish_tool_error(
+                name, result, allow_subagent_hint=allow_subagent_hint
+            )
 
     def consume_display_payload(self):
         payload = self._display_payload
@@ -1818,92 +1998,202 @@ class AgentTools:
         return "User answers:\n" + "\n".join(response_lines)
 
     def _read_file(self, tool_input):
+        allowed = {"file_path", "reference", "offset", "limit"}
+        unknown = sorted(set(tool_input) - allowed)
+        if unknown:
+            raise AgentToolError(
+                "Unsupported read_file parameter(s): " + ", ".join(unknown)
+            )
         file_path = self._resolve_read_path(
-            _required_string(tool_input, "file_path"), tool_input.get("reference")
+            _required_string(tool_input, "file_path"),
+            tool_input.get("reference"),
+            allow_tool_output=True,
         )
         if not file_path.is_file():
             raise AgentToolError(
                 f"File does not exist: {self._display_path(file_path)}"
             )
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
-        lines = content.splitlines()
-        total_lines = len(lines)
-        if total_lines == 0:
-            return f"File: {self._display_path(file_path)}\nLines: 0\n\n(empty file)"
-
-        start_line = _optional_positive_int(tool_input, "start_line") or 1
-        end_line = _optional_positive_int(tool_input, "end_line") or total_lines
-        if start_line > total_lines:
+        offset = _optional_positive_int(tool_input, "offset") or 1
+        requested_limit = _optional_positive_int(tool_input, "limit") or DEFAULT_READ_LIMIT
+        if requested_limit > DEFAULT_READ_LIMIT:
             raise AgentToolError(
-                f"start_line exceeds file length ({total_lines} lines)."
+                f"limit cannot exceed {DEFAULT_READ_LIMIT}."
             )
-        if end_line < start_line:
-            raise AgentToolError(
-                "end_line must be greater than or equal to start_line."
-            )
-        end_line = min(end_line, total_lines)
 
-        line_numbers = _optional_bool(tool_input, "line_numbers", True)
-        selected_lines = lines[start_line - 1 : end_line]
-        body = _format_lines(selected_lines, start_line, line_numbers)
-        truncated = _truncate(body, MAX_READ_CHARS)
-        suffix = "" if len(body) <= MAX_READ_CHARS else "\n\n[truncated]"
-        return (
-            f"File: {self._display_path(file_path)}\n"
-            f"Lines: {start_line}-{end_line} of {total_lines}\n\n"
-            f"{truncated}{suffix}"
+        def read_line_preview(source):
+            fragment = source.readline(MAX_READ_LINE_CHARS + 2)
+            if fragment == "":
+                return None
+            preview_parts = []
+            total_chars = 0
+            ended = fragment.endswith("\n")
+            content = fragment[:-1] if ended else fragment
+            if content.endswith("\r"):
+                content = content[:-1]
+            total_chars += len(content)
+            preview_parts.append(content[:MAX_READ_LINE_CHARS])
+            while not ended:
+                fragment = source.readline(8192)
+                if fragment == "":
+                    break
+                ended = fragment.endswith("\n")
+                content = fragment[:-1] if ended else fragment
+                if content.endswith("\r"):
+                    content = content[:-1]
+                total_chars += len(content)
+                preview_chars = sum(len(part) for part in preview_parts)
+                if preview_chars < MAX_READ_LINE_CHARS:
+                    preview_parts.append(
+                        content[: MAX_READ_LINE_CHARS - preview_chars]
+                    )
+            preview = "".join(preview_parts)[:MAX_READ_LINE_CHARS]
+            return preview, total_chars > MAX_READ_LINE_CHARS
+
+        page = []
+        used_bytes = 0
+        line_number = 0
+        eof = False
+        has_more = False
+        next_offset = None
+        long_line_seen = False
+        with file_path.open(
+            "r", encoding="utf-8", errors="replace", newline=None
+        ) as source:
+            while line_number < offset - 1:
+                item = read_line_preview(source)
+                if item is None:
+                    eof = True
+                    break
+                line_number += 1
+            if not eof:
+                while len(page) < requested_limit:
+                    item = read_line_preview(source)
+                    if item is None:
+                        eof = True
+                        break
+                    line_number += 1
+                    preview, is_long = item
+                    long_line_seen = long_line_seen or is_long
+                    if is_long:
+                        preview += "... [line continues in the wrapped view]"
+                    rendered = f"{line_number}: {preview}"
+                    size = len(rendered.encode("utf-8")) + (1 if page else 0)
+                    if used_bytes + size > MAX_READ_BYTES:
+                        has_more = True
+                        next_offset = line_number
+                        break
+                    page.append((line_number, preview))
+                    used_bytes += size
+                if not eof and not has_more and len(page) >= requested_limit:
+                    lookahead = read_line_preview(source)
+                    if lookahead is None:
+                        eof = True
+                    else:
+                        has_more = True
+                        next_offset = page[-1][0] + 1
+                        long_line_seen = long_line_seen or lookahead[1]
+
+        if not page:
+            if offset == 1 and line_number == 0 and eof:
+                display_path = self._display_path(file_path)
+                return (
+                    f"File: {display_path}\nLines: 0\n\n(empty file)\n\n"
+                    "(End of file - total 0 lines)"
+                )
+            if eof and line_number < offset:
+                raise AgentToolError(
+                    f"Offset {offset} is out of range for this file ({line_number} lines)."
+                )
+
+        display_path = self._display_path(file_path)
+        view_path = self._ensure_wrapped_view(file_path, has_long_line=True) if long_line_seen else None
+        view_notice = (
+            f"\nReadable wrapped view for long lines: {self._display_path(view_path)}"
+            if view_path is not None
+            else ""
         )
+        while page:
+            body = "\n".join(f"{number}: {line}" for number, line in page)
+            first_line = page[0][0]
+            last_line = page[-1][0]
+            if has_more:
+                next_offset = next_offset or last_line + 1
+                status = (
+                    f"Showing lines {first_line}-{last_line}. "
+                    f"Use offset={next_offset} to continue."
+                )
+                line_summary = f"Lines: {first_line}-{last_line}"
+            else:
+                total_lines = line_number
+                status = f"End of file - total {total_lines} lines"
+                line_summary = f"Lines: {first_line}-{last_line} of {total_lines}"
+            result = (
+                f"File: {display_path}\n"
+                f"{line_summary}{view_notice}\n\n"
+                f"{body}\n\n({status})"
+            )
+            if fits_tool_output(result):
+                return result
+            if len(page) == 1:
+                return finalize_tool_output(
+                    result,
+                    strategy="head_tail",
+                    allow_subagent_hint=False,
+                    view_cache=self._tool_output_view_cache,
+                )
+            removed_line = page.pop()[0]
+            has_more = True
+            next_offset = removed_line
 
     def _read_program_docs(self, tool_input):
-        max_chars = _bounded_int(
-            tool_input.get("max_chars"),
-            PROGRAM_DOC_DEFAULT_MAX_CHARS,
-            1000,
-            MAX_READ_CHARS,
-            "max_chars",
-        )
+        unknown = sorted(set(tool_input))
+        if unknown:
+            raise AgentToolError(
+                "Unsupported read_program_docs parameter(s): " + ", ".join(unknown)
+            )
         paths = _program_doc_paths()
         if not paths:
             raise AgentToolError("Program documentation is not available.")
 
-        sections = []
-        remaining = max_chars
-        truncated = False
-        for path in paths:
+        writer = ToolOutputWriter()
+        writer.write("Program documentation:\n\n")
+        for index, path in enumerate(paths):
+            if index:
+                writer.write("\n\n")
             try:
-                content = path.read_text(encoding="utf-8", errors="replace")
+                size = path.stat().st_size
+                writer.write(f"File: {path.name}\nBytes: {size}\n\n")
+                with path.open("r", encoding="utf-8", errors="replace") as source:
+                    while True:
+                        chunk = source.read(8192)
+                        if not chunk:
+                            break
+                        if writer.write(chunk) is False:
+                            break
+                    if writer.storage_limited:
+                        break
             except OSError as error:
                 raise AgentToolError(
                     f"Failed to read program documentation: {path.name}"
                 ) from error
-
-            if remaining <= 0:
-                truncated = True
-                break
-            selected = _truncate(content, remaining)
-            if len(content) > remaining:
-                truncated = True
-            remaining -= len(selected)
-            sections.append(
-                f"File: {path.name}\nCharacters: {len(content)}\n\n{selected}"
-            )
-
-        suffix = "\n\n[program documentation truncated]" if truncated else ""
-        return "Program documentation:\n\n" + "\n\n".join(sections) + suffix
+        return writer.finalize(
+            strategy="head_tail",
+            allow_subagent_hint=self.subagents_available,
+            view_cache=self._tool_output_view_cache,
+        )
 
     def _web_fetch(self, tool_input):
+        allowed = {"url", "extract_mode"}
+        unknown = sorted(set(tool_input) - allowed)
+        if unknown:
+            raise AgentToolError(
+                "Unsupported web_fetch parameter(s): " + ", ".join(unknown)
+            )
         url = _required_string(tool_input, "url")
         extract_mode = str(tool_input.get("extract_mode") or "text").strip().lower()
         if extract_mode not in {"text", "raw"}:
             raise AgentToolError("extract_mode must be text or raw.")
-        max_chars = _bounded_int(
-            tool_input.get("max_chars"),
-            WEB_FETCH_DEFAULT_MAX_CHARS,
-            1,
-            WEB_FETCH_MAX_CHARS,
-            "max_chars",
-        )
         self._before_visible_output()
         if not self.suppress_visible_output:
             add_web_fetch_entry(url)
@@ -1912,7 +2202,7 @@ class AgentTools:
             "url": url,
         }
         try:
-            result = _fetch_public_webpage(url, extract_mode, max_chars)
+            result = _fetch_public_webpage(url, extract_mode)
         except Exception as error:
             self._display_payload = {
                 "kind": "web_fetch",
@@ -1923,6 +2213,12 @@ class AgentTools:
         return result
 
     def _list_dir(self, tool_input):
+        allowed = {"path", "reference", "recursive", "max_depth", "offset", "limit"}
+        unknown = sorted(set(tool_input) - allowed)
+        if unknown:
+            raise AgentToolError(
+                "Unsupported list_dir parameter(s): " + ", ".join(unknown)
+            )
         root = self._resolve_read_path(
             str(tool_input.get("path") or "."), tool_input.get("reference")
         )
@@ -1933,47 +2229,75 @@ class AgentTools:
 
         recursive = _optional_bool(tool_input, "recursive", False)
         max_depth = _optional_positive_int(tool_input, "max_depth") or 2
-        entries = []
+        offset = _optional_positive_int(tool_input, "offset") or 1
+        requested_limit = _optional_positive_int(tool_input, "limit") or DEFAULT_READ_LIMIT
+        if requested_limit > DEFAULT_READ_LIMIT:
+            raise AgentToolError(f"limit cannot exceed {DEFAULT_READ_LIMIT}.")
 
-        if recursive:
-            for current_root, dirnames, filenames in os.walk(root):
-                current_path = Path(current_root)
-                depth = len(current_path.relative_to(root).parts)
-                dirnames[:] = [
-                    name
-                    for name in sorted(dirnames)
-                    if name not in SKIP_DIRS and depth < max_depth
-                ]
-                for dirname in dirnames:
-                    entries.append(f"{self._display_path(current_path / dirname)}/")
-                    if len(entries) >= MAX_LIST_ENTRIES:
-                        break
-                if len(entries) >= MAX_LIST_ENTRIES:
-                    break
-                for filename in sorted(filenames):
-                    entries.append(self._display_path(current_path / filename))
-                    if len(entries) >= MAX_LIST_ENTRIES:
-                        break
-                if len(entries) >= MAX_LIST_ENTRIES:
-                    break
-        else:
-            children = sorted(
-                root.iterdir(), key=lambda path: (path.is_file(), path.name.lower())
-            )
-            for child in children:
+        def iter_entries():
+            if recursive:
+                for current_root, dirnames, filenames in os.walk(root):
+                    current_path = Path(current_root)
+                    depth = len(current_path.relative_to(root).parts)
+                    dirnames[:] = [
+                        name
+                        for name in sorted(dirnames)
+                        if name not in SKIP_DIRS and depth < max_depth
+                    ]
+                    for dirname in dirnames:
+                        yield f"{self._display_path(current_path / dirname)}/"
+                    for filename in sorted(filenames):
+                        yield self._display_path(current_path / filename)
+                return
+            for child in root.iterdir():
                 if child.name in SKIP_DIRS:
                     continue
-                suffix = "/" if child.is_dir() else ""
-                entries.append(f"{self._display_path(child)}{suffix}")
-                if len(entries) >= MAX_LIST_ENTRIES:
-                    break
+                yield self._display_path(child) + ("/" if child.is_dir() else "")
 
-        if not entries:
-            return f"Directory: {self._display_path(root)}\n(empty directory)"
-        suffix = "\n[truncated]" if len(entries) >= MAX_LIST_ENTRIES else ""
-        return (
-            f"Directory: {self._display_path(root)}\n\n" + "\n".join(entries) + suffix
-        )
+        total_entries = 0
+
+        def counted_entries():
+            nonlocal total_entries
+            for entry in iter_entries():
+                total_entries += 1
+                yield entry
+
+        page_end = offset - 1 + requested_limit
+        selected = heapq.nsmallest(page_end, counted_entries(), key=str.lower)
+        if offset > total_entries and not (total_entries == 0 and offset == 1):
+            raise AgentToolError(
+                f"Offset {offset} is out of range for this directory ({total_entries} entries)."
+            )
+        page = selected[offset - 1 : page_end]
+        display_path = self._display_path(root)
+        if not page:
+            return f"Directory: {display_path}\nEntries: 0\n\n(empty directory)"
+
+        while page:
+            last_entry = offset + len(page) - 1
+            if last_entry < total_entries:
+                status = (
+                    f"Showing entries {offset}-{last_entry} of {total_entries}. "
+                    f"Use offset={last_entry + 1} to continue."
+                )
+            else:
+                status = f"End of directory - total {total_entries} entries"
+            result = (
+                f"Directory: {display_path}\n"
+                f"Entries: {offset}-{last_entry} of {total_entries}\n\n"
+                + "\n".join(page)
+                + f"\n\n({status})"
+            )
+            if fits_tool_output(result):
+                return result
+            if len(page) == 1:
+                return finalize_tool_output(
+                    result,
+                    strategy="head_tail",
+                    allow_subagent_hint=False,
+                    view_cache=self._tool_output_view_cache,
+                )
+            page.pop()
 
     def _write_file(self, tool_input):
         file_path = self._resolve_path(_required_string(tool_input, "file_path"))
@@ -2229,6 +2553,156 @@ class AgentTools:
             add_edit_entry(self._display_path(file_path), additions, deletions, diff)
         return f"Applied unified patch to {self._display_path(file_path)}."
 
+    def _run_shell_stream(self, command, timeout_seconds):
+        popen_options = {
+            "cwd": str(self.workspace_dir),
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+        if os.name == "nt":
+            popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_options["start_new_session"] = True
+        process = subprocess.Popen(command, **popen_options)
+        writer = ToolOutputWriter()
+        reader_error = []
+        reader_done = threading.Event()
+        storage_stop = threading.Event()
+        saw_output = False
+
+        def read_output():
+            nonlocal saw_output
+            try:
+                if process.stdout is None:
+                    return
+                while True:
+                    chunk = process.stdout.read(4096)
+                    if not chunk:
+                        break
+                    saw_output = True
+                    if not writer.write(chunk):
+                        storage_stop.set()
+                        break
+            except Exception as error:
+                reader_error.append(error)
+            finally:
+                reader_done.set()
+
+        reader = threading.Thread(
+            target=read_output,
+            name="omni-shell-output",
+            daemon=True,
+        )
+        reader.start()
+        timed_out = False
+        aborted = False
+        storage_limited = False
+        termination_status = "not-needed"
+        termination_detail = ""
+        deadline = time.monotonic() + timeout_seconds
+        return_code = None
+
+        def kill_process_tree():
+            if process.poll() is not None:
+                return True, "process already exited"
+            if os.name == "nt":
+                try:
+                    completed = subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=5,
+                    )
+                    if completed.returncode == 0 or process.poll() is not None:
+                        return True, "taskkill completed"
+                    return False, f"taskkill exited with code {completed.returncode}"
+                except Exception as error:
+                    return False, f"taskkill failed: {error}"
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                return True, "process group kill requested"
+            except ProcessLookupError:
+                return True, "process already exited"
+            except Exception as error:
+                return False, f"process group kill failed: {error}"
+
+        def terminate_bounded():
+            tree_ok, detail = kill_process_tree()
+            forced = False
+            try:
+                code = process.wait(timeout=3)
+                return code, ("terminated" if tree_ok else "terminated-after-tree-error"), detail
+            except subprocess.TimeoutExpired:
+                forced = True
+            except Exception as error:
+                detail = f"{detail}; wait failed: {error}"
+                forced = True
+            if forced:
+                try:
+                    process.kill()
+                except Exception as error:
+                    detail = f"{detail}; force-kill failed: {error}"
+                try:
+                    code = process.wait(timeout=3)
+                    return code, "force-killed", detail
+                except Exception as error:
+                    detail = f"{detail}; exit could not be confirmed: {error}"
+                    return process.poll(), "unconfirmed", detail
+
+        try:
+            while True:
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+                if callable(self.stop_requested_callback) and self.stop_requested_callback():
+                    aborted = True
+                    return_code, termination_status, termination_detail = terminate_bounded()
+                    break
+                if storage_stop.is_set():
+                    storage_limited = True
+                    return_code, termination_status, termination_detail = terminate_bounded()
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    return_code, termination_status, termination_detail = terminate_bounded()
+                    break
+                time.sleep(0.05)
+        finally:
+            reader.join(timeout=5)
+            reader_stuck = reader.is_alive()
+            if reader_stuck and process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+                reader.join(timeout=1)
+                reader_stuck = reader.is_alive()
+            if process.poll() is None:
+                fallback_code, fallback_status, fallback_detail = terminate_bounded()
+                return_code = fallback_code
+                if termination_status == "not-needed":
+                    termination_status = fallback_status
+                    termination_detail = fallback_detail
+
+        return {
+            "return_code": return_code,
+            "writer": writer,
+            "saw_output": saw_output,
+            "timed_out": timed_out,
+            "aborted": aborted,
+            "storage_limited": storage_limited or writer.storage_limited,
+            "termination_status": termination_status,
+            "termination_detail": termination_detail,
+            "reader_stuck": reader_stuck,
+            "capture_error": str(reader_error[0]) if reader_error else "",
+        }
+
     def _bash(self, tool_input):
         command = _required_string(tool_input, "command")
         self._validate_command_scope(command)
@@ -2254,64 +2728,67 @@ class AgentTools:
                 "command": command,
                 "output": "Rejected by user.",
             }
-            self._before_visible_output()
-            if not self.suppress_visible_output:
-                add_shell_entry(command, "Rejected by user.")
+            self._display_deferred = True
             return _error_result("User rejected bash command.")
 
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(self.workspace_dir),
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=COMMAND_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as error:
-            if (
-                risk_level == "confirm"
-                and risk_reason != "script or shell execution detected"
-            ):
-                self._record_mutating_command(command)
-            result = _timeout_result(command, error, COMMAND_TIMEOUT_SECONDS)
-            self._display_payload = {
-                "kind": "shell",
-                "command": command,
-                "output": result,
-            }
-            self._before_visible_output()
-            if not self.suppress_visible_output:
-                add_shell_entry(command, result)
-            return result
+        shell_result = self._run_shell_stream(command, COMMAND_TIMEOUT_SECONDS)
         if (
             risk_level == "confirm"
             and risk_reason != "script or shell execution detected"
         ):
             self._record_mutating_command(command)
-        output = completed.stdout or ""
-        error_output = completed.stderr or ""
-        combined = output
-        if error_output:
-            combined = (
-                f"{combined}\n[stderr]\n{error_output}"
-                if combined
-                else f"[stderr]\n{error_output}"
+        writer = shell_result["writer"]
+        if not shell_result["saw_output"]:
+            writer.write("(no output)")
+        shell_metadata = [f"Exit code: {shell_result['return_code']}"]
+        if shell_result["timed_out"]:
+            shell_metadata.append(
+                f"Command timed out after {COMMAND_TIMEOUT_SECONDS} seconds."
             )
-        if not combined:
-            combined = "(no output)"
-        combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
-        result = f"Exit code: {completed.returncode}\n{combined}"
+        if shell_result["aborted"]:
+            shell_metadata.append("User aborted the command.")
+        if shell_result["storage_limited"]:
+            shell_metadata.append(
+                "Command stopped because output reached the internal artifact storage safety limit."
+            )
+        termination_status = shell_result.get("termination_status") or "not-needed"
+        if termination_status == "terminated":
+            shell_metadata.append("Process tree termination confirmed.")
+        elif termination_status == "terminated-after-tree-error":
+            shell_metadata.append(
+                "Process exited, but the process-tree termination command reported an error."
+            )
+        elif termination_status == "force-killed":
+            shell_metadata.append("Process required force-kill after bounded termination wait.")
+        elif termination_status == "unconfirmed":
+            shell_metadata.append("Process termination could not be confirmed.")
+        if shell_result.get("termination_detail") and termination_status != "not-needed":
+            shell_metadata.append(
+                "Termination detail: " + str(shell_result["termination_detail"])
+            )
+        if shell_result.get("reader_stuck"):
+            shell_metadata.append("Shell output reader did not exit cleanly.")
+        if shell_result["capture_error"] and not shell_result["storage_limited"]:
+            shell_metadata.append(
+                "Failed to capture shell output: " + shell_result["capture_error"]
+            )
+        suffix = (
+            "\n\n<shell_metadata>\n"
+            + "\n".join(shell_metadata)
+            + "\n</shell_metadata>"
+        )
+        result = writer.finalize(
+            strategy="tail",
+            allow_subagent_hint=False,
+            view_cache=self._tool_output_view_cache,
+            suffix=suffix,
+        )
         self._display_payload = {
             "kind": "shell",
             "command": command,
             "output": result,
         }
-        self._before_visible_output()
-        if not self.suppress_visible_output:
-            add_shell_entry(command, result)
+        self._display_deferred = True
         return result
 
     def _local_http_check(self, tool_input):
@@ -2385,9 +2862,7 @@ class AgentTools:
                 "command": cmd_str,
                 "output": result,
             }
-            self._before_visible_output()
-            if not self.suppress_visible_output:
-                add_shell_entry(cmd_str, result)
+            self._display_deferred = True
             return result
         finally:
             _terminate_process(process)
@@ -2401,9 +2876,7 @@ class AgentTools:
             "command": cmd_str,
             "output": result,
         }
-        self._before_visible_output()
-        if not self.suppress_visible_output:
-            add_shell_entry(cmd_str, result)
+        self._display_deferred = True
         return result
 
     def _git_diff(self, tool_input):
@@ -2430,22 +2903,232 @@ class AgentTools:
             resolved = self._resolve_path(file_path)
             args.extend(["--", str(resolved.relative_to(self.workspace_dir))])
 
-        result = self._run_git_command(args, empty_message)
+        result = self._run_git_command(
+            args,
+            empty_message,
+            record_mode="diff" if not stat and not check else "",
+        )
         cmd_str = "git " + " ".join(args)
         self._display_payload = {
             "kind": "shell",
             "command": cmd_str,
             "output": result,
         }
-        self._before_visible_output()
-        if not self.suppress_visible_output:
-            add_shell_entry(cmd_str, result)
-        return result
+        self._display_deferred = True
+        records = _git_diff_records(result) if not stat and not check else ()
+        return ToolOutputValue(text=result, records=records, record_mode="diff")
 
     def _grep(self, tool_input):
+        ripgrep = shutil.which("rg")
+        if ripgrep:
+            return self._grep_ripgrep(tool_input, ripgrep)
+        return self._grep_python(tool_input)
+
+    def _grep_ripgrep(self, tool_input, ripgrep):
+        allowed = {"pattern", "path", "reference", "include", "case_sensitive"}
+        unknown = sorted(set(tool_input) - allowed)
+        if unknown:
+            raise AgentToolError(
+                "Unsupported grep parameter(s): " + ", ".join(unknown)
+            )
         pattern = _required_string(tool_input, "pattern")
         search_path = self._resolve_read_path(
-            str(tool_input.get("path") or "."), tool_input.get("reference")
+            str(tool_input.get("path") or "."),
+            tool_input.get("reference"),
+            allow_tool_output=True,
+        )
+        include = str(tool_input.get("include") or "*")
+        case_sensitive = _optional_bool(tool_input, "case_sensitive", False)
+        command = [
+            ripgrep,
+            "--json",
+            "--no-config",
+            "--color=never",
+            "--glob",
+            include,
+        ]
+        for skipped in sorted(SKIP_DIRS):
+            command.extend(["--glob", f"!{skipped}/**"])
+        if not case_sensitive:
+            command.append("--ignore-case")
+        command.extend(["--", pattern, str(search_path)])
+
+        process = subprocess.Popen(
+            command,
+            cwd=str(self.workspace_dir or search_path.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        output_queue = queue.Queue(maxsize=64)
+        reader_done = threading.Event()
+        reader_stop = threading.Event()
+
+        def enqueue_output(line):
+            while not reader_stop.is_set():
+                try:
+                    output_queue.put(line, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def read_events():
+            try:
+                if process.stdout is None:
+                    return
+                for line in process.stdout:
+                    if not enqueue_output(line):
+                        break
+            finally:
+                reader_done.set()
+
+        reader = threading.Thread(
+            target=read_events,
+            name="omni-ripgrep-output",
+            daemon=True,
+        )
+        reader.start()
+        matches = []
+        diagnostics = deque(maxlen=20)
+        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        limited = False
+        try:
+            while True:
+                if len(matches) > MAX_GREP_MATCHES:
+                    limited = True
+                    reader_stop.set()
+                    process.terminate()
+                    break
+                if time.monotonic() >= deadline:
+                    reader_stop.set()
+                    process.kill()
+                    raise AgentToolError(
+                        f"grep timed out after {GIT_TIMEOUT_SECONDS} seconds."
+                    )
+                try:
+                    raw_event = output_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if reader_done.is_set() and output_queue.empty():
+                        break
+                    continue
+                try:
+                    event = json.loads(raw_event)
+                except ValueError:
+                    detail = raw_event.strip()
+                    if detail:
+                        diagnostics.append(detail)
+                    continue
+                if event.get("type") != "match":
+                    continue
+                data = event.get("data") or {}
+                path_text = str((data.get("path") or {}).get("text") or "")
+                line_text = str((data.get("lines") or {}).get("text") or "")
+                line = line_text.rstrip("\r\n")
+                line_number = int(data.get("line_number") or 0)
+                submatches = data.get("submatches") or []
+                first = submatches[0] if submatches else {}
+                byte_start = int(first.get("start") or 0)
+                byte_end = int(first.get("end") or byte_start)
+                encoded = line.encode("utf-8")
+                char_start = len(encoded[:byte_start].decode("utf-8", errors="ignore"))
+                char_end = len(encoded[:byte_end].decode("utf-8", errors="ignore"))
+                context_before = 220
+                context_after = 280
+                excerpt_start = max(0, char_start - context_before)
+                excerpt_end = min(len(line), char_end + context_after)
+                excerpt = line[excerpt_start:excerpt_end]
+                if excerpt_start > 0:
+                    excerpt = "..." + excerpt
+                if excerpt_end < len(line):
+                    excerpt += "..."
+                candidate = Path(path_text)
+                if not candidate.is_absolute():
+                    candidate = (self.workspace_dir or search_path.parent) / candidate
+                candidate = candidate.resolve(strict=False)
+                view_path = None
+                if len(line) > MAX_READ_LINE_CHARS:
+                    view_path = self._ensure_wrapped_view(
+                        candidate, has_long_line=True
+                    )
+                matches.append({
+                    "text": (
+                        f"{self._display_path(candidate)}:{line_number}:{char_start + 1}: "
+                        f"{excerpt}"
+                    ),
+                    "source_path": candidate,
+                    "view_path": view_path,
+                })
+        finally:
+            reader_stop.set()
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    try:
+                        process.kill()
+                        process.wait(timeout=2)
+                    except Exception:
+                        pass
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+            reader.join(timeout=2)
+
+        if not matches:
+            if diagnostics and process.returncode not in {0, 1, None}:
+                raise AgentToolError("ripgrep failed: " + " ".join(diagnostics))
+            return "No matches found."
+        results_limited = limited or len(matches) > MAX_GREP_MATCHES
+        visible_matches = matches[:MAX_GREP_MATCHES]
+        return self._format_grep_matches(visible_matches, results_limited)
+
+    def _format_grep_matches(self, visible_matches, results_limited):
+        while visible_matches:
+            sections = ["\n".join(item["text"] for item in visible_matches)]
+            wrapped_views = {}
+            for item in visible_matches:
+                view_path = item.get("view_path")
+                if view_path is not None:
+                    wrapped_views[str(item["source_path"])] = view_path
+            if wrapped_views:
+                sections.append(
+                    "Readable wrapped views for long matching lines:\n"
+                    + "\n".join(
+                        f"- {self._display_path(Path(source_path))}: "
+                        f"{self._display_path(view_path)}"
+                        for source_path, view_path in wrapped_views.items()
+                    )
+                )
+            if results_limited:
+                sections.append(
+                    "Results limited. Use a more specific path, include glob, or pattern."
+                )
+            result = "\n\n".join(sections)
+            if fits_tool_output(result):
+                return result
+            results_limited = True
+            visible_matches.pop()
+        return "Results limited. Use a more specific path, include glob, or pattern."
+
+    def _grep_python(self, tool_input):
+        allowed = {"pattern", "path", "reference", "include", "case_sensitive"}
+        unknown = sorted(set(tool_input) - allowed)
+        if unknown:
+            raise AgentToolError(
+                "Unsupported grep parameter(s): " + ", ".join(unknown)
+            )
+        pattern = _required_string(tool_input, "pattern")
+        search_path = self._resolve_read_path(
+            str(tool_input.get("path") or "."),
+            tool_input.get("reference"),
+            allow_tool_output=True,
         )
         include = str(tool_input.get("include") or "*")
         case_sensitive = _optional_bool(tool_input, "case_sensitive", False)
@@ -2461,30 +3144,62 @@ class AgentTools:
         )
         matches = []
         for file_path in files:
-            if len(matches) >= MAX_GREP_MATCHES:
+            if len(matches) > MAX_GREP_MATCHES:
                 break
             if not fnmatch.fnmatch(file_path.name, include):
                 continue
             try:
-                lines = file_path.read_text(
-                    encoding="utf-8", errors="replace"
-                ).splitlines()
+                source = file_path.open(
+                    "r", encoding="utf-8", errors="replace", newline=None
+                )
             except Exception:
                 continue
-            for line_number, line in enumerate(lines, 1):
-                if regex.search(line):
-                    matches.append(
-                        f"{self._display_path(file_path)}:{line_number}: {_truncate(line.strip(), 500)}"
-                    )
-                    if len(matches) >= MAX_GREP_MATCHES:
+            try:
+                for line_number, raw_line in enumerate(source, 1):
+                    line = raw_line.rstrip("\r\n")
+                    match = regex.search(line)
+                    if match is None:
+                        continue
+                    column = match.start() + 1
+                    context_before = 220
+                    context_after = 280
+                    excerpt_start = max(0, match.start() - context_before)
+                    excerpt_end = min(len(line), match.end() + context_after)
+                    excerpt = line[excerpt_start:excerpt_end]
+                    if excerpt_start > 0:
+                        excerpt = "..." + excerpt
+                    if excerpt_end < len(line):
+                        excerpt += "..."
+                    view_path = None
+                    if len(matches) < MAX_GREP_MATCHES and len(line) > MAX_READ_LINE_CHARS:
+                        view_path = self._ensure_wrapped_view(file_path, has_long_line=True)
+                    matches.append({
+                        "text": (
+                            f"{self._display_path(file_path)}:{line_number}:{column}: "
+                            f"{excerpt}"
+                        ),
+                        "source_path": file_path.resolve(strict=False),
+                        "view_path": view_path,
+                    })
+                    if len(matches) > MAX_GREP_MATCHES:
                         break
+            finally:
+                source.close()
 
         if not matches:
             return "No matches found."
-        suffix = "\n[truncated]" if len(matches) >= MAX_GREP_MATCHES else ""
-        return "\n".join(matches) + suffix
+
+        results_limited = len(matches) > MAX_GREP_MATCHES
+        visible_matches = matches[:MAX_GREP_MATCHES]
+        return self._format_grep_matches(visible_matches, results_limited)
 
     def _glob(self, tool_input):
+        allowed = {"pattern", "reference"}
+        unknown = sorted(set(tool_input) - allowed)
+        if unknown:
+            raise AgentToolError(
+                "Unsupported glob parameter(s): " + ", ".join(unknown)
+            )
         pattern = _required_string(tool_input, "pattern")
         if _has_parent_reference(pattern):
             raise AgentToolError(
@@ -2497,40 +3212,59 @@ class AgentTools:
                     "Referenced-folder glob patterns must be relative."
                 )
             root = self._reference_root(reference)
-            matches = list(root.glob(pattern))
+            candidates = root.glob(pattern)
         elif _looks_absolute(pattern):
             root = self._resolve_path(pattern)
-            matches = [root] if root.exists() else []
+            candidates = iter([root] if root.exists() else [])
         else:
-            matches = list(self.workspace_dir.glob(pattern))
+            candidates = self.workspace_dir.glob(pattern)
 
-        safe_matches = []
-        for path in matches:
-            try:
-                resolved = path.resolve(strict=False)
-                if reference:
-                    self._ensure_inside_root(resolved, self._reference_root(reference))
-                else:
-                    self._ensure_inside_workspace(resolved)
-            except AgentToolError:
-                continue
-            if resolved.is_file():
-                safe_matches.append(self._display_path(resolved))
-            if len(safe_matches) >= MAX_GLOB_MATCHES:
-                break
+        def safe_files():
+            for path in candidates:
+                try:
+                    resolved = path.resolve(strict=False)
+                    if reference:
+                        self._ensure_inside_root(resolved, root)
+                    else:
+                        self._ensure_inside_workspace(resolved)
+                except AgentToolError:
+                    continue
+                if resolved.is_file():
+                    yield self._display_path(resolved)
 
+        safe_matches = heapq.nsmallest(
+            MAX_GLOB_MATCHES + 1,
+            safe_files(),
+            key=str.lower,
+        )
         if not safe_matches:
             return "No files found."
-        safe_matches.sort()
-        suffix = "\n[truncated]" if len(safe_matches) >= MAX_GLOB_MATCHES else ""
-        return "\n".join(safe_matches) + suffix
+
+        results_limited = len(safe_matches) > MAX_GLOB_MATCHES
+        visible_matches = safe_matches[:MAX_GLOB_MATCHES]
+        while visible_matches:
+            result = "\n".join(visible_matches)
+            if results_limited:
+                result += "\n\n(Results limited. Use a more specific path or pattern.)"
+            if fits_tool_output(result):
+                return result
+            results_limited = True
+            visible_matches.pop()
+
+        return "Results limited. Use a more specific path or pattern."
 
     def _list_skills(self, tool_input):
         return self.skill_registry.list_for_tool()
 
     def _read_skill(self, tool_input):
         name = _required_string(tool_input, "name")
-        return self.skill_registry.read_skill(name, tool_input.get("files"))
+        writer = ToolOutputWriter()
+        self.skill_registry.write_skill(name, tool_input.get("files"), writer)
+        return writer.finalize(
+            strategy="head_tail",
+            allow_subagent_hint=self.subagents_available,
+            view_cache=self._tool_output_view_cache,
+        )
 
     def _dispatch_subagent(self, tool_input):
         if self.subagent_executor is None:
@@ -2547,17 +3281,42 @@ class AgentTools:
         raw_tasks = tool_input["tasks"]
         if not isinstance(raw_tasks, list) or not raw_tasks:
             raise AgentToolError("dispatch_subagent requires a non-empty tasks array.")
-        if len(raw_tasks) > MAX_PARALLEL_SUBAGENTS:
+        if len(raw_tasks) > MAX_SUBAGENT_TASKS_PER_BATCH:
             raise AgentToolError(
-                f"dispatch_subagent accepts at most {MAX_PARALLEL_SUBAGENTS} tasks per batch."
+                f"dispatch_subagent accepts at most {MAX_SUBAGENT_TASKS_PER_BATCH} tasks per batch."
             )
 
         tasks = []
+        allowed_task_fields = {
+            "agent_type",
+            "task",
+            "purpose",
+            "expected_output",
+            "evidence_required",
+            "scope_limit",
+            "priority",
+        }
         for index, raw_task in enumerate(raw_tasks, start=1):
             if not isinstance(raw_task, dict):
                 raise AgentToolError(f"Subagent task {index} must be an object.")
+            unexpected = sorted(set(raw_task) - allowed_task_fields)
+            if unexpected:
+                raise AgentToolError(
+                    f"Subagent task {index} has unexpected fields: "
+                    + ", ".join(unexpected)
+                    + "."
+                )
             agent_type = _required_string(raw_task, "agent_type")
             task = _required_string(raw_task, "task")
+            priority = raw_task.get("priority", 1)
+            if (
+                isinstance(priority, bool)
+                or not isinstance(priority, int)
+                or priority < 1
+            ):
+                raise AgentToolError(
+                    f"Subagent task {index} priority must be a positive integer."
+                )
             spec = self.subagent_registry.get(agent_type)
             if spec is None:
                 raise AgentToolError(
@@ -2565,11 +3324,7 @@ class AgentTools:
                     f"{agent_type!r}. Available: "
                     + ", ".join(self._available_subagent_names())
                 )
-            if (
-                self.plan_mode
-                and self.subagent_registry.resolve_name(agent_type)
-                not in PLAN_SUBAGENT_TYPES
-            ):
+            if self.plan_mode and spec.name not in PLAN_SUBAGENT_TYPES:
                 raise AgentToolError(
                     "Plan mode only allows reader and researcher subagents. "
                     f"Requested: {agent_type!r}."
@@ -2581,6 +3336,7 @@ class AgentTools:
                 "expected_output": str(raw_task.get("expected_output") or "").strip(),
                 "evidence_required": str(raw_task.get("evidence_required") or "").strip(),
                 "scope_limit": str(raw_task.get("scope_limit") or "").strip(),
+                "priority": priority,
             })
 
         return self.subagent_executor(tasks=tasks)
@@ -2602,15 +3358,7 @@ class AgentTools:
             "status": str(status or "success"),
             "metadata": dict(metadata or {}),
         }
-        self._before_visible_output()
-        if not self.suppress_visible_output:
-            add_team_action_entry(
-                self._display_payload["action"],
-                self._display_payload["summary"],
-                self._display_payload["details"],
-                self._display_payload["status"],
-                self._display_payload["metadata"],
-            )
+        self._display_deferred = True
 
     def _spawn_teammate(self, tool_input):
         if not self.team_available:
@@ -2671,7 +3419,8 @@ class AgentTools:
             result = "No active teammates."
             self._set_team_action_display("list_teammates", result)
             return result
-        lines = []
+        writer = ToolOutputWriter()
+        writer.write("Active teammates:\n")
         for teammate in roster:
             line = (
                 f"- {display_teammate_name(teammate.get('name', ''))} "
@@ -2681,8 +3430,13 @@ class AgentTools:
             task_id = str(teammate.get("task_id") or "")
             if task_id:
                 line += f" task_id={task_id}"
-            lines.append(line)
-        result = "Active teammates:\n" + "\n".join(lines)
+            if writer.write(line + "\n") is False:
+                break
+        result = writer.finalize(
+            strategy="head_tail",
+            allow_subagent_hint=False,
+            view_cache=self._tool_output_view_cache,
+        )
         teammate_count = len(roster)
         teammate_label = "teammate" if teammate_count == 1 else "teammates"
         self._set_team_action_display(
@@ -2735,7 +3489,8 @@ class AgentTools:
                 metadata={"mailbox": mailbox, "count": 0, "cleared": clear},
             )
             return result
-        lines = []
+        writer = ToolOutputWriter()
+        writer.write("Inbox messages:\n")
         for message in messages:
             sender = message.get("from", "?")
             content = str(message.get("content", ""))
@@ -2743,8 +3498,13 @@ class AgentTools:
             sender_text = display_teammate_name(sender) if str(sender) != "lead" else "lead"
             status = str(message.get("status") or "")
             suffix = f" [{status}]" if status else ""
-            lines.append(f"[{timestamp}] {sender_text}{suffix}: {content}")
-        result = "Inbox messages:\n" + "\n".join(lines)
+            if writer.write(f"[{timestamp}] {sender_text}{suffix}: {content}\n") is False:
+                break
+        result = writer.finalize(
+            strategy="head_tail",
+            allow_subagent_hint=False,
+            view_cache=self._tool_output_view_cache,
+        )
         message_count = len(messages)
         message_label = "message" if message_count == 1 else "messages"
         self._set_team_action_display(
@@ -2880,9 +3640,20 @@ class AgentTools:
         self._ensure_inside_workspace(resolved)
         return resolved
 
-    def _resolve_read_path(self, path_value, reference=None):
+    def _resolve_read_path(
+        self, path_value, reference=None, allow_tool_output=False
+    ):
         reference = str(reference or "").strip()
         if not reference:
+            path_text = str(path_value or "").strip()
+            if allow_tool_output and path_text:
+                artifact_path = resolve_artifact_uri(path_text)
+                if artifact_path is not None:
+                    return artifact_path
+                if _looks_absolute(path_text):
+                    resolved = Path(path_text).resolve(strict=False)
+                    if self._is_tool_output_path(resolved):
+                        return resolved
             return self._resolve_path(path_value)
         reference_file = self._reference_file(reference)
         if reference_file is not None:
@@ -2945,6 +3716,8 @@ class AgentTools:
             raise AgentToolError("Path is outside the workspace.")
 
     def _display_path(self, path):
+        if self._is_tool_output_path(path):
+            return artifact_uri(path)
         if self.workspace_dir is None:
             return str(path)
         try:
@@ -2966,36 +3739,150 @@ class AgentTools:
     def _record_mutating_command(self, command):
         self.session_mutating_commands.append(command)
 
-    def _run_git_command(self, args, empty_message):
+    def _run_git_command(self, args, empty_message, record_mode=""):
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 ["git"] + list(args),
                 cwd=str(self.workspace_dir),
                 shell=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=GIT_TIMEOUT_SECONDS,
+                bufsize=1,
             )
         except FileNotFoundError:
             return "Exit code: 127\nERROR: git executable was not found."
-        except subprocess.TimeoutExpired:
-            return f"ERROR: git command timed out after {GIT_TIMEOUT_SECONDS} seconds."
 
-        output = completed.stdout or ""
-        error_output = completed.stderr or ""
-        combined = output
-        if error_output:
-            combined = (
-                f"{combined}\n[stderr]\n{error_output}"
-                if combined
-                else f"[stderr]\n{error_output}"
+        events = queue.Queue(maxsize=64)
+        completed_streams = set()
+        reader_stop = threading.Event()
+
+        def enqueue_event(event):
+            while not reader_stop.is_set():
+                try:
+                    events.put(event, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def read_stream(label, stream):
+            try:
+                if stream is None:
+                    return
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    if not enqueue_event((label, chunk)):
+                        break
+            finally:
+                enqueue_event((label, None))
+
+        readers = [
+            threading.Thread(
+                target=read_stream,
+                args=("stdout", process.stdout),
+                name="omni-git-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=("stderr", process.stderr),
+                name="omni-git-stderr",
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        writer = ToolOutputWriter()
+        saw_output = False
+        stderr_started = False
+        timed_out = False
+        storage_limited = False
+        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        while len(completed_streams) < 2 or not events.empty():
+            if time.monotonic() >= deadline and process.poll() is None:
+                timed_out = True
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            try:
+                label, chunk = events.get(timeout=0.05)
+            except queue.Empty:
+                if process.poll() is not None and len(completed_streams) >= 2:
+                    break
+                continue
+            if chunk is None:
+                completed_streams.add(label)
+                continue
+            saw_output = True
+            if label == "stderr" and not stderr_started:
+                if not writer.write("\n[stderr]\n"):
+                    storage_limited = True
+                    reader_stop.set()
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    break
+                stderr_started = True
+            if not writer.write(chunk):
+                storage_limited = True
+                reader_stop.set()
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                break
+
+        try:
+            return_code = process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                return_code = process.wait(timeout=2)
+            except Exception:
+                return_code = process.poll()
+        reader_stop.set()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        for reader in readers:
+            reader.join(timeout=1)
+
+        if not saw_output:
+            writer.write(empty_message)
+        suffix_lines = []
+        if timed_out:
+            suffix_lines.append(
+                f"ERROR: git command timed out after {GIT_TIMEOUT_SECONDS} seconds."
             )
-        if not combined:
-            combined = empty_message
-        combined = _truncate(combined, MAX_TOOL_OUTPUT_CHARS)
-        return f"Exit code: {completed.returncode}\n{combined}"
+        if storage_limited or writer.storage_limited:
+            suffix_lines.append(
+                "ERROR: git output reached the internal artifact storage safety limit."
+            )
+        suffix = ""
+        if suffix_lines:
+            suffix = "\n\n" + "\n".join(suffix_lines)
+        return writer.finalize(
+            strategy="head_tail",
+            record_mode=record_mode,
+            allow_subagent_hint=False,
+            view_cache=self._tool_output_view_cache,
+            prefix=f"Exit code: {return_code}\n",
+            suffix=suffix,
+        )
 
     def _validate_command_scope(self, command):
         if _has_parent_reference(command):
@@ -3012,7 +3899,7 @@ class AgentTools:
         if outside_paths:
             raise AgentToolError(
                 "Bash command references paths outside the workspace: "
-                + ", ".join(outside_paths[:3])
+                + ", ".join(outside_paths)
             )
         if re.search(r"(?i)(\$env:|%[^%\s]+%|\$home|~)", command):
             raise AgentToolError(
@@ -3172,7 +4059,7 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return next_request
 
 
-def _fetch_public_webpage(url, extract_mode, max_chars):
+def _fetch_public_webpage(url, extract_mode):
     normalized_url = _validate_public_http_url(url)
     request = urllib.request.Request(
         normalized_url,
@@ -3210,15 +4097,11 @@ def _fetch_public_webpage(url, extract_mode, max_chars):
     else:
         body = raw_text
 
-    truncated = len(body) > max_chars
-    body = _truncate(body, max_chars)
-    suffix = "\n\n[web_fetch truncated]" if truncated else ""
     return (
         f"URL: {final_url}\n"
         f"Mode: {extract_mode}\n"
-        f"Characters: {len(body)}"
-        f"{'+' if truncated else ''}\n\n"
-        f"{body}{suffix}"
+        f"Characters: {len(body)}\n\n"
+        f"{body}"
     )
 
 
@@ -3353,6 +4236,21 @@ def _section_after(text, heading):
     if next_section >= 0:
         section = section[:next_section]
     return section
+
+
+def _git_diff_records(text):
+    value = str(text or "")
+    matches = list(re.finditer(r"(?m)^diff --git ", value))
+    if not matches:
+        return ()
+    records = []
+    prefix = value[: matches[0].start()]
+    if prefix:
+        records.append(prefix.rstrip("\r\n"))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        records.append(value[match.start():end].rstrip("\r\n"))
+    return tuple(record for record in records if record)
 
 
 def _unified_diff_text(old_content, new_content, display_path):
@@ -3588,47 +4486,6 @@ def _error_result(message):
     return f"ERROR: {message}"
 
 
-def _truncate(text, max_chars):
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars]
-
-
-def _single_line(text, max_chars):
-    value = " ".join(str(text or "").split())
-    return _truncate(value, max_chars)
-
-
-def _timeout_result(command, error, timeout_seconds):
-    output = _timeout_stream(error.stdout)
-    error_output = _timeout_stream(error.stderr)
-    combined = output
-    if error_output:
-        combined = (
-            f"{combined}\n[stderr]\n{error_output}"
-            if combined
-            else f"[stderr]\n{error_output}"
-        )
-    message = (
-        f"Command timed out after {timeout_seconds} seconds: "
-        f"{_truncate(str(command or ''), 240)}"
-    )
-    if combined:
-        message += "\nPartial output before timeout:\n" + _truncate(
-            combined,
-            MAX_TOOL_OUTPUT_CHARS,
-        )
-    return _error_result(message)
-
-
-def _timeout_stream(value):
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
-
-
 def _format_lines(lines, start_line, line_numbers=True):
     if not line_numbers:
         return "\n".join(lines)
@@ -3701,7 +4558,7 @@ def _wait_for_local_port(process, port, timeout_seconds):
     while time.monotonic() < deadline:
         if process.poll() is not None:
             _, stderr = _communicate_process(process, 0.2)
-            detail = _single_line(stderr, 300) if stderr else "no stderr"
+            detail = stderr.strip() if stderr else "no stderr"
             raise AgentToolError(f"local HTTP server exited early: {detail}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.25):

@@ -59,7 +59,6 @@ DEFAULT_SKILLS_ENABLE = True
 DEFAULT_SKILLS_SOURCE_APP = True
 DEFAULT_SKILLS_SOURCE_WORKSPACE = False
 DEFAULT_SKILLS_AUTO_CATALOG = True
-DEFAULT_SKILLS_MAX_CHARS = 12000
 DEFAULT_COMPACTION_ENABLE = True
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
 AUTO_MODEL_SELECTION = "auto"
@@ -112,7 +111,6 @@ GLOBAL_FIELD_KEYS = {
     "skills_source_app",
     "skills_source_workspace",
     "skills_auto_catalog",
-    "skills_max_chars",
     "compaction_enable",
     "compaction_compact_model",
     "memory_model",
@@ -178,7 +176,6 @@ class AppConfig:
     skills_source_app: bool = DEFAULT_SKILLS_SOURCE_APP
     skills_source_workspace: bool = DEFAULT_SKILLS_SOURCE_WORKSPACE
     skills_auto_catalog: bool = DEFAULT_SKILLS_AUTO_CATALOG
-    skills_max_chars: int = DEFAULT_SKILLS_MAX_CHARS
     compaction_enable: bool = DEFAULT_COMPACTION_ENABLE
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
     memory_model: str = DEFAULT_MEMORY_MODEL
@@ -301,7 +298,6 @@ class AppConfig:
                     "workspace": self.skills_source_workspace,
                 },
                 "auto_catalog": self.skills_auto_catalog,
-                "max_skill_chars": self.skills_max_chars,
             },
             "auto_compact": {
                 "enable": self.compaction_enable,
@@ -337,7 +333,6 @@ class AppConfig:
             "skills_source_app": self.skills_source_app,
             "skills_source_workspace": self.skills_source_workspace,
             "skills_auto_catalog": self.skills_auto_catalog,
-            "skills_max_chars": self.skills_max_chars,
             "compaction_enable": self.compaction_enable,
             "compaction_compact_model": self.compaction_compact_model,
             "memory_model": self.memory_model,
@@ -576,13 +571,6 @@ def parse_extra_modalities_config(value):
 
 def parse_multimodal_limit(value):
     return _parse_positive_integer(value, "Multimodal total limit (MB)")
-
-
-def parse_skill_max_chars(value):
-    parsed = _parse_positive_integer(value, "Skill max chars")
-    if parsed < 1000:
-        raise ValueError("Skill max chars must be at least 1000.")
-    return parsed
 
 
 def parse_agent_rounds(value):
@@ -850,12 +838,6 @@ def _sanitize_config(data):
     except ValueError:
         agent_approval_mode = DEFAULT_AGENT_APPROVAL_MODE
     try:
-        skills_max_chars = parse_skill_max_chars(
-            skills_config.get("max_skill_chars", DEFAULT_SKILLS_MAX_CHARS)
-        )
-    except ValueError:
-        skills_max_chars = DEFAULT_SKILLS_MAX_CHARS
-    try:
         web_search_provider = parse_web_search_provider(
             web_search.get("provider", DEFAULT_WEB_SEARCH_PROVIDER)
         )
@@ -903,7 +885,6 @@ def _sanitize_config(data):
         skills_auto_catalog=_parse_bool(
             skills_config.get("auto_catalog"), DEFAULT_SKILLS_AUTO_CATALOG
         ),
-        skills_max_chars=skills_max_chars,
         compaction_enable=_parse_bool(
             compaction_config.get("enable"), DEFAULT_COMPACTION_ENABLE
         ),
@@ -1128,8 +1109,6 @@ def save_config_fields(fields, model_name=None):
             )
         elif key == "skills_auto_catalog":
             config.skills_auto_catalog = _parse_bool(value, config.skills_auto_catalog)
-        elif key == "skills_max_chars":
-            config.skills_max_chars = parse_skill_max_chars(value)
         elif key == "compaction_enable":
             config.compaction_enable = _parse_bool(value, config.compaction_enable)
         elif key == "compaction_compact_model":

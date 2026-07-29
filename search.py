@@ -1,4 +1,5 @@
 import httpx
+from output import ToolOutputValue
 
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -8,8 +9,6 @@ DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_WEB_SEARCH_DEPTH = "basic"
 DEFAULT_WEB_SEARCH_TOPIC = "general"
 DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 15
-MAX_WEB_SEARCH_OUTPUT_CHARS = 12000
-MAX_SEARCH_RESULT_CONTENT_CHARS = 1200
 
 WEB_SEARCH_PROVIDERS = {"tavily"}
 TAVILY_SEARCH_DEPTHS = {"basic", "fast", "ultra-fast", "advanced"}
@@ -154,24 +153,24 @@ def format_tavily_response(data, query="", key_source=""):
     if request_id:
         header.append(f"request_id: {request_id}")
 
-    lines = ["\n".join(header).strip()]
-
-    answer = str(data.get("answer") or "").strip()
+    leading_sections = ["\n".join(header)]
+    answer = str(data.get("answer") or "")
     if answer:
-        lines.append("Answer:\n" + _truncate(answer, MAX_SEARCH_RESULT_CONTENT_CHARS))
+        leading_sections.append("Answer:\n" + answer)
 
     if not results:
-        lines.append("No results found.")
-        return "\n\n".join(lines)
+        leading_sections.append("No results found.")
+        text = "\n\n".join(leading_sections)
+        return ToolOutputValue(text=text, records=(text,), record_mode="search")
 
-    result_lines = []
+    result_records = []
     for index, item in enumerate(results, 1):
         if not isinstance(item, dict):
             continue
         title = str(item.get("title") or "(untitled)").strip()
         url = str(item.get("url") or "").strip()
-        content = str(item.get("content") or "").strip()
-        raw_content = str(item.get("raw_content") or "").strip()
+        content = str(item.get("content") or "")
+        raw_content = str(item.get("raw_content") or "")
         score = item.get("score")
 
         block = [f"[{index}] {title}"]
@@ -180,22 +179,17 @@ def format_tavily_response(data, query="", key_source=""):
         if score is not None:
             block.append(f"Score: {score}")
         if content:
-            block.append(
-                "Content: "
-                + _truncate(" ".join(content.split()), MAX_SEARCH_RESULT_CONTENT_CHARS)
-            )
+            block.append("Content:\n" + content)
         if raw_content:
-            block.append(
-                "Raw content: "
-                + _truncate(
-                    " ".join(raw_content.split()), MAX_SEARCH_RESULT_CONTENT_CHARS
-                )
-            )
-        result_lines.append("\n".join(block))
+            block.append("Raw content:\n" + raw_content)
+        result_records.append("\n".join(block))
 
-    lines.append("Results:\n" + "\n\n".join(result_lines))
-    return _truncate("\n\n".join(lines).strip(), MAX_WEB_SEARCH_OUTPUT_CHARS)
-
+    leading = "\n\n".join(leading_sections + ["Results:"])
+    text = leading
+    if result_records:
+        text += "\n" + "\n\n".join(result_records)
+    records = (leading, *result_records)
+    return ToolOutputValue(text=text, records=records, record_mode="search")
 
 def _tavily_error_message(response):
     detail = ""
@@ -212,7 +206,7 @@ def _tavily_error_message(response):
         )
     if not detail:
         detail = response.text.strip()
-    detail = _truncate(detail, 500) if detail else response.reason_phrase
+    detail = detail if detail else response.reason_phrase
     return f"Tavily search failed ({response.status_code}): {detail}"
 
 
@@ -258,10 +252,3 @@ def _string_list(value):
 
 def re_split_list(value):
     return [item for item in str(value or "").replace(";", ",").split(",")]
-
-
-def _truncate(text, max_chars):
-    text = str(text or "")
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "...[truncated]"

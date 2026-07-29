@@ -1065,7 +1065,6 @@ class TeamRunner(SubagentRunner):
         spec: TeammateSpec,
         tool_schemas: list[dict[str, Any]],
         execute_tool: Callable[[str, dict[str, Any]], str],
-        compact_tool_result: Callable[[str], str] | None = None,
         team_store: TeamStore | None = None,
         api_type: str = "anthropic",
         max_tool_calls: int | None = None,
@@ -1079,7 +1078,6 @@ class TeamRunner(SubagentRunner):
             spec=spec,
             tool_schemas=tool_schemas,
             execute_tool=execute_tool,
-            compact_tool_result=compact_tool_result,
             max_tool_calls=max_tool_calls
             or spec.max_turns * DEFAULT_TEAMMATE_TOOL_CALL_FACTOR,
             event_callback=event_callback,
