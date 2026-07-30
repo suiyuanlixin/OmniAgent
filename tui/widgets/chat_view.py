@@ -28,6 +28,7 @@ from textual.widgets import Static
 from textual.widget import Widget
 
 from references import resolve_references
+from ui import clean_thinking_text
 from tui.theme import (
     DIFF_ADD_BG,
     DIFF_ADD_FG,
@@ -92,6 +93,50 @@ _patch_rich_markdown_tables()
 _patch_rich_markdown_headings()
 
 
+_FILE_ERROR_TOOLS = frozenset({
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "apply_unified_patch",
+})
+_SHELL_ERROR_TOOLS = frozenset({
+    "bash",
+    "local_http_check",
+    "git_status",
+    "git_diff",
+})
+_WEB_ERROR_TOOLS = frozenset({"web_fetch", "web_search"})
+_TEAM_ACTION_ERROR_TOOLS = frozenset({
+    "report_to_lead",
+    "spawn_teammate",
+    "list_teammates",
+    "send_message",
+    "read_inbox",
+    "broadcast",
+    "shutdown_teammate",
+})
+
+
+def _tool_error_shell_command(tool_name: str, summary: str) -> str:
+    summary = str(summary or "").strip()
+    if tool_name == "git_status":
+        return "git status --short"
+    if tool_name == "git_diff":
+        return "git diff" + (f" {summary}" if summary else "")
+    if tool_name == "local_http_check":
+        return "HTTP check" + (f" {summary}" if summary else "")
+    return summary or str(tool_name or "shell").replace("_", " ")
+
+
+def _sentence_case_tool_error(error: str) -> str:
+    text = str(error or "")
+    stripped = text.lstrip()
+    if not stripped or not ("a" <= stripped[0] <= "z"):
+        return text
+    prefix_length = len(text) - len(stripped)
+    return text[:prefix_length] + stripped[0].upper() + stripped[1:]
+
+
 class ChatView(Widget):
     DEFAULT_CSS = render_css(
         """
@@ -118,7 +163,8 @@ class ChatView(Widget):
     .message-row.message-row-team-incoming {
         margin-top: 1;
     }
-    .message-row-user {
+    .message-row-user,
+    .message-row-plan {
         align-horizontal: right;
     }
     .message-row-assistant,
@@ -325,6 +371,44 @@ class ChatView(Widget):
         display: none;
     }
 
+    ToolErrorBlock {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    ToolErrorBlock > .tool-error-toggle {
+        width: 100%;
+        height: 1;
+        min-width: 1;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+        overflow: hidden;
+    }
+    ToolErrorBlock > .tool-error-toggle:hover,
+    ToolErrorBlock > .tool-error-toggle:focus-within {
+        background: transparent;
+        color: $TEXT_MUTED;
+    }
+
+    ToolErrorBlock > .tool-error-content {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        padding: 0 0 0 2;
+        color: $STATUS_ERROR;
+        background: transparent;
+    }
+    ToolErrorBlock > .tool-error-content.hidden {
+        display: none;
+    }
+
     TodosBlock {
         width: 100%;
         height: auto;
@@ -377,7 +461,7 @@ class ChatView(Widget):
     TodosBlock > .todos-content > .todos-panel > .todos-list {
         width: 1fr;
         height: auto;
-        margin: 0 2;
+        margin: 1 2 0 2;
         background: $SURFACE_BACKGROUND;
     }
     TodosBlock > .todos-content > .todos-panel > .todos-list > TodoLine {
@@ -543,7 +627,8 @@ class ChatView(Widget):
         content-align: left middle;
         overflow: hidden;
     }
-    DiffFileRow > .diff-row-header > .diff-row-stats {
+    DiffFileRow > .diff-row-header > .diff-row-stats,
+    DiffFileRow > .diff-row-header > .diff-row-status {
         width: auto;
         height: 1;
         margin: 0;
@@ -551,6 +636,9 @@ class ChatView(Widget):
         background: transparent;
         text-align: left;
         content-align: left middle;
+    }
+    DiffFileRow > .diff-row-header > .diff-row-status {
+        color: $STATUS_ERROR;
     }
 
     DiffFileRow > DiffContent {
@@ -589,6 +677,14 @@ class ChatView(Widget):
     }
     DiffFileRow > .diff-file-row-wrap > .diff-file-row-container > ChangedFileRow {
         background: $INFO_BAR_BACKGROUND;
+    }
+    DiffFileRow > .diff-file-row-wrap > .diff-file-row-container > .diff-file-error-display {
+        width: 100%;
+        height: auto;
+        margin: 0;
+        padding: 0;
+        color: $STATUS_ERROR;
+        background: transparent;
     }
     DiffFileRow > .diff-file-row-wrap > .diff-file-row-bottom-spacer {
         width: 100%;
@@ -654,7 +750,6 @@ class ChatView(Widget):
     ShellRow > .shell-row-header > .shell-row-command.hidden {
         display: none;
     }
-
     ShellRow > .shell-row-wrap {
         width: 100%;
         height: auto;
@@ -841,7 +936,7 @@ class ChatView(Widget):
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
-        if role == "user" and self._user_spacer:
+        if role in {"user", "plan"} and self._user_spacer:
             self.query_one("#chat-log", VerticalScroll).mount(
                 Static("", classes="message-spacer")
             )
@@ -870,6 +965,31 @@ class ChatView(Widget):
             self._stream_role = role
             self._stream_content = str(content or "")
             self._stream_transcript_index = len(self._transcript) - 1
+
+    def add_plan_entry(self, plan: str) -> None:
+        self._activate_message_output()
+        self._stream_target = None
+        self._stream_row = None
+        self._stream_role = None
+        self._stream_content = ""
+        self._stream_transcript_index = None
+        content = f"Plan\n\n{str(plan or '').strip()}"
+        if self._user_spacer:
+            self.query_one("#chat-log", VerticalScroll).mount(
+                Static("", classes="message-spacer")
+            )
+        row, _ = _build_message_widgets(
+            "plan",
+            content,
+            assistant_markdown_enabled=self._assistant_markdown_enabled,
+        )
+        self.query_one("#chat-log", VerticalScroll).mount(row)
+        self.call_after_refresh(self._scroll_end)
+        self.messages.append(("plan", content, datetime.now().isoformat()))
+        self._append_transcript_entry({
+            "kind": "plan",
+            "content": str(plan or "").strip(),
+        })
 
     def add_status(self, content: str) -> None:
         self._activate_message_output()
@@ -1069,12 +1189,17 @@ class ChatView(Widget):
 
     def add_thought(self, content: str, elapsed_seconds: float = 0.0) -> None:
         self._activate_aux_output("thought")
-        block = ThoughtBlock(content=content, elapsed_seconds=elapsed_seconds)
+        content = clean_thinking_text(content)
+        block = ThoughtBlock(
+            content=content,
+            elapsed_seconds=elapsed_seconds,
+            markdown_enabled=self._assistant_markdown_enabled,
+        )
         self.query_one("#chat-log", VerticalScroll).mount(block)
         self.call_after_refresh(self._scroll_end)
         self._append_transcript_entry({
             "kind": "thought",
-            "content": str(content or ""),
+            "content": content,
             "elapsed_seconds": float(elapsed_seconds or 0.0),
         })
 
@@ -1082,7 +1207,11 @@ class ChatView(Widget):
         self._activate_aux_output("thought")
         if self._thought_stream_target is not None:
             return
-        block = ThoughtBlock(content="", elapsed_seconds=elapsed_seconds)
+        block = ThoughtBlock(
+            content="",
+            elapsed_seconds=elapsed_seconds,
+            markdown_enabled=self._assistant_markdown_enabled,
+        )
         self.query_one("#chat-log", VerticalScroll).mount(block)
         self.call_after_refresh(self._scroll_end)
         self._thought_stream_target = block
@@ -1098,21 +1227,18 @@ class ChatView(Widget):
         self.start_thought_stream()
         self._thought_stream_content += str(content or "")
         if self._thought_stream_target is not None:
-            self._thought_stream_target.set_content(self._thought_stream_content)
+            cleaned_content = clean_thinking_text(self._thought_stream_content)
+            self._thought_stream_target.set_content(cleaned_content)
             self._update_transcript_entry(
                 self._thought_stream_transcript_index,
-                content=self._thought_stream_content,
+                content=cleaned_content,
             )
             self.call_after_refresh(self._scroll_end)
-
-    @staticmethod
-    def _trim_trailing_blank_lines(content: str) -> str:
-        return re.sub(r"(?:\r?\n[ \t]*)+\Z", "", str(content or ""))
 
     def finish_thought_stream(self, elapsed_seconds: float = 0.0) -> None:
         if self._thought_stream_target is None:
             return
-        self._thought_stream_content = self._trim_trailing_blank_lines(
+        self._thought_stream_content = clean_thinking_text(
             self._thought_stream_content
         )
         self._thought_stream_target.set_content(self._thought_stream_content)
@@ -1138,7 +1264,7 @@ class ChatView(Widget):
     def replace_thought_stream(self, content: str, elapsed_seconds: float) -> None:
         if self._thought_stream_target is None:
             return
-        self._thought_stream_content = self._trim_trailing_blank_lines(content)
+        self._thought_stream_content = clean_thinking_text(content)
         self._thought_stream_target.set_content(self._thought_stream_content)
         self._thought_stream_target.set_elapsed_seconds(
             max(0.0, float(elapsed_seconds or 0.0))
@@ -1153,19 +1279,24 @@ class ChatView(Widget):
         self._thought_stream_transcript_index = None
         self.call_after_refresh(self._scroll_end)
 
-    def add_explored_entry(self, tool_name: str, description: str) -> None:
+    def add_explored_entry(
+        self, tool_name: str, description: str, error: str = ""
+    ) -> None:
         self._activate_aux_output("explored")
         if self._explored_block is None:
             block = ExploredBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
             self.call_after_refresh(self._scroll_end)
             self._explored_block = block
-        self._explored_block.add_entry(tool_name, description)
-        self._append_transcript_entry({
+        self._explored_block.add_entry(tool_name, description, error=error)
+        transcript_entry = {
             "kind": "explored_entry",
             "tool_name": str(tool_name or ""),
             "description": str(description or ""),
-        })
+        }
+        if error:
+            transcript_entry["error"] = str(error)
+        self._append_transcript_entry(transcript_entry)
         self.call_after_refresh(self._scroll_end)
 
     def reset_explored(self) -> None:
@@ -1230,18 +1361,21 @@ class ChatView(Widget):
         self._write_block = None
         self._shell_block = None
 
-    def add_shell_entry(self, command: str, output: str) -> None:
+    def add_shell_entry(
+        self, command: str, output: str, status: str = ""
+    ) -> None:
         self._activate_aux_output("shell")
         if self._shell_block is None:
             block = ShellBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
             self.call_after_refresh(self._scroll_end)
             self._shell_block = block
-        self._shell_block.add_entry(command, output)
+        self._shell_block.add_entry(command, output, status=status)
         self._append_transcript_entry({
             "kind": "shell",
             "command": str(command or ""),
             "output": str(output or ""),
+            "status": str(status or ""),
         })
         self.call_after_refresh(self._scroll_end)
 
@@ -1272,6 +1406,19 @@ class ChatView(Widget):
         })
         self.call_after_refresh(self._scroll_end)
 
+    def _add_question_error_entry(
+        self, tool_name: str, summary: str, error: str
+    ) -> None:
+        self._activate_aux_output("questions")
+        if self._questions_block is None:
+            block = QuestionsBlock()
+            self.query_one("#chat-log", VerticalScroll).mount(block)
+            self.call_after_refresh(self._scroll_end)
+            self._questions_block = block
+        self._questions_block.add_error(error)
+        self._append_tool_error_transcript(tool_name, summary, error)
+        self.call_after_refresh(self._scroll_end)
+
     def add_todo_entry(
         self, items: list[dict] | None, summary: dict | None = None
     ) -> None:
@@ -1283,6 +1430,82 @@ class ChatView(Widget):
             "items": [dict(item or {}) for item in list(items or [])],
             "summary": dict(summary or {}),
         })
+        self.call_after_refresh(self._scroll_end)
+
+    def _add_todo_error_entry(
+        self, tool_name: str, summary: str, error: str
+    ) -> None:
+        self._activate_aux_output("todo")
+        block = TodosBlock([], {}, error=error)
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_tool_error_transcript(tool_name, summary, error)
+        self.call_after_refresh(self._scroll_end)
+
+    def _append_tool_error_transcript(
+        self, tool_name: str, summary: str, error: str
+    ) -> None:
+        self._append_transcript_entry({
+            "kind": "tool_error",
+            "tool_name": str(tool_name or ""),
+            "summary": str(summary or ""),
+            "error": str(error or ""),
+        })
+
+    def add_tool_error_entry(
+        self, tool_name: str, summary: str, error: str
+    ) -> None:
+        tool_name = str(tool_name or "")
+        summary = str(summary or "")
+        error = _sentence_case_tool_error(
+            str(error or "") or "Tool call failed."
+        )
+        if ExploredBlock.handles_tool(tool_name):
+            self.add_explored_entry(
+                tool_name,
+                ExploredBlock.error_description(tool_name, summary),
+                error=error,
+            )
+            return
+        if tool_name in _FILE_ERROR_TOOLS:
+            add_entry = (
+                self.add_write_entry
+                if tool_name == "write_file"
+                else self.add_edit_entry
+            )
+            add_entry(summary, 0, 0, error, status="failed")
+            return
+        if tool_name in _SHELL_ERROR_TOOLS:
+            self.add_shell_entry(
+                _tool_error_shell_command(tool_name, summary),
+                error,
+                status="failed",
+            )
+            return
+        if tool_name == "web_fetch":
+            self.add_web_fetch_entry(summary, status="failed")
+            return
+        if tool_name == "web_search":
+            self.add_web_search_entry(summary, status="failed")
+            return
+        if tool_name == "update_todo":
+            self._add_todo_error_entry(tool_name, summary, error)
+            return
+        if tool_name == "ask_user":
+            self._add_question_error_entry(tool_name, summary, error)
+            return
+        if tool_name in _TEAM_ACTION_ERROR_TOOLS:
+            self.add_team_action_entry(
+                tool_name,
+                summary,
+                error,
+                "error",
+                {"error": error},
+            )
+            return
+        self._activate_aux_output("tool_error")
+        block = ToolErrorBlock(tool_name, summary, error)
+        self.query_one("#chat-log", VerticalScroll).mount(block)
+        self._append_tool_error_transcript(tool_name, summary, error)
         self.call_after_refresh(self._scroll_end)
 
     def add_subagent_entry(self, agent_type: str, transcript: list[dict]) -> None:
@@ -1613,6 +1836,11 @@ class ChatView(Widget):
                     spacing_before=bool(entry.get("spacing_before")),
                 )
             return
+        if kind == "plan":
+            plan = str(entry.get("content") or "").strip()
+            if plan:
+                self.add_plan_entry(plan)
+            return
         if kind == "thought":
             self.add_thought(
                 str(entry.get("content") or ""),
@@ -1623,6 +1851,7 @@ class ChatView(Widget):
             self.add_explored_entry(
                 str(entry.get("tool_name") or ""),
                 str(entry.get("description") or ""),
+                str(entry.get("error") or ""),
             )
             return
         if kind == "question":
@@ -1637,11 +1866,24 @@ class ChatView(Widget):
                 dict(entry.get("summary") or {}),
             )
             return
+        if kind == "tool_error":
+            self.add_tool_error_entry(
+                str(entry.get("tool_name") or ""),
+                str(entry.get("summary") or ""),
+                str(entry.get("error") or ""),
+            )
+            return
         if kind == "web_fetch":
-            self.add_web_fetch_entry(str(entry.get("url") or ""))
+            self.add_web_fetch_entry(
+                str(entry.get("url") or ""),
+                str(entry.get("status") or ""),
+            )
             return
         if kind == "web_search":
-            self.add_web_search_entry(str(entry.get("content") or ""))
+            self.add_web_search_entry(
+                str(entry.get("content") or ""),
+                str(entry.get("status") or ""),
+            )
             return
         if kind == "edit":
             self.add_edit_entry(
@@ -1665,6 +1907,7 @@ class ChatView(Widget):
             self.add_shell_entry(
                 str(entry.get("command") or ""),
                 str(entry.get("output") or ""),
+                str(entry.get("status") or ""),
             )
             return
         if kind == "changed_files":
@@ -1716,24 +1959,35 @@ class ChatView(Widget):
             )
             return
 
-    def add_web_fetch_entry(self, url: str) -> None:
+    def add_web_fetch_entry(self, url: str, status: str = "") -> None:
         self._activate_aux_output("web_fetch")
-        content = f"→ [white]Webfetch[/white] [gray]{_escape_markup(url)}[/gray]"
+        failed = (
+            f" [{STATUS_ERROR}]failed[/]"
+            if str(status or "").strip().lower() == "failed"
+            else ""
+        )
+        content = f"→ [white]Webfetch[/white] [gray]{_escape_markup(url)}[/gray]{failed}"
         self.query_one("#chat-log", VerticalScroll).mount(
             Static(content, classes="web-summary-entry", markup=True)
         )
         self._append_transcript_entry({
             "kind": "web_fetch",
             "url": str(url or ""),
+            "status": str(status or ""),
         })
         self.call_after_refresh(self._scroll_end)
 
-    def add_web_search_entry(self, content: str) -> None:
+    def add_web_search_entry(self, content: str, status: str = "") -> None:
         self._activate_aux_output("web_search")
         summary = _escape_markup(content)
+        failed = (
+            f" [{STATUS_ERROR}]failed[/]"
+            if str(status or "").strip().lower() == "failed"
+            else ""
+        )
         self.query_one("#chat-log", VerticalScroll).mount(
             Static(
-                f"→ [white]Websearch[/white] [gray]{summary}[/gray]",
+                f"→ [white]Websearch[/white] [gray]{summary}[/gray]{failed}",
                 classes="web-summary-entry",
                 markup=True,
             )
@@ -1741,6 +1995,7 @@ class ChatView(Widget):
         self._append_transcript_entry({
             "kind": "web_search",
             "content": str(content or ""),
+            "status": str(status or ""),
         })
         self.call_after_refresh(self._scroll_end)
 
@@ -1872,8 +2127,8 @@ def _build_message_widgets(
     bubble_classes = "message-bubble"
     content_classes = "message-bubble-content"
     half_classes = "message-half"
-    if role == "user":
-        row_classes += " message-row-user"
+    if role in {"user", "plan"}:
+        row_classes += f" message-row-{role}"
         bubble_classes += " message-bubble-user"
         content_classes += " message-bubble-user"
         half_classes += " message-half-user"
@@ -1894,7 +2149,7 @@ def _build_message_widgets(
             classes=content_classes,
             expand=False,
         )
-    elif role in {"user", "assistant"}:
+    elif role in {"user", "plan", "assistant"}:
         rendered_content, copy_references = (
             _reference_message_content(content, reference_base_dir)
             if role == "user"
@@ -1915,7 +2170,7 @@ def _build_message_widgets(
             markup=False,
             expand=False,
         )
-    if role == "user":
+    if role in {"user", "plan"}:
         bubble = Vertical(
             TopHalfSpacer(classes=half_classes),
             content_widget,
@@ -2246,8 +2501,11 @@ class SelectableMessageStatic(Static, can_focus=True):
 
 
 class _LeadingBlankTrimmedMarkdown:
-    def __init__(self, source: str):
+    def __init__(self, source: str, *, foreground_color: str | None = None):
         self.source = str(source or "")
+        self._foreground_style = (
+            Style(color=foreground_color) if foreground_color else None
+        )
 
     def __rich_console__(self, console, options):
         lines = console.render_lines(
@@ -2257,10 +2515,31 @@ class _LeadingBlankTrimmedMarkdown:
         )
         while lines and self._is_unstyled_blank_line(lines[0]):
             lines.pop(0)
-        for line_index, line in enumerate(lines):
-            yield from line
-            if line_index < len(lines) - 1:
-                yield Segment.line()
+        self._halve_code_block_padding(lines)
+        self._remove_code_block_outer_blank_lines(lines)
+        for line in lines:
+            for segment in line:
+                yield self._with_foreground_color(segment)
+            # Textual measures Rich renderables by counting line terminators.
+            # Keep the final terminator so the last visible Markdown row isn't
+            # clipped and mistaken for an extra blank before the next block.
+            yield Segment.line()
+
+    def _with_foreground_color(self, segment: Segment) -> Segment:
+        foreground_style = self._foreground_style
+        if foreground_style is None or segment.control is not None:
+            return segment
+        style = segment.style
+        meta = getattr(style, "meta", None) if style is not None else None
+        if meta and meta.get("omniagent_code_padding_half"):
+            return segment
+        if style is None:
+            combined_style = foreground_style
+        elif isinstance(style, Style):
+            combined_style = style + foreground_style
+        else:
+            combined_style = Style.parse(str(style)) + foreground_style
+        return Segment(segment.text, combined_style, segment.control)
 
     @staticmethod
     def _is_unstyled_blank_line(line) -> bool:
@@ -2280,6 +2559,103 @@ class _LeadingBlankTrimmedMarkdown:
                 return False
         return True
 
+    @classmethod
+    def _halve_code_block_padding(cls, lines) -> None:
+        line_backgrounds = [cls._uniform_line_background(line) for line in lines]
+        start = 0
+        while start < len(lines):
+            background = line_backgrounds[start]
+            if background is None:
+                start += 1
+                continue
+            end = start + 1
+            while end < len(lines) and line_backgrounds[end] == background:
+                end += 1
+            visible = [
+                index
+                for index in range(start, end)
+                if cls._line_has_visible_text(lines[index])
+            ]
+            if visible:
+                if start < visible[0]:
+                    lines[start] = cls._code_padding_half_line(
+                        lines[start], background, top=True
+                    )
+                if visible[-1] < end - 1:
+                    lines[end - 1] = cls._code_padding_half_line(
+                        lines[end - 1], background, top=False
+                    )
+            start = end
+
+    @staticmethod
+    def _uniform_line_background(line):
+        background = None
+        found = False
+        for segment in line:
+            if not segment.text:
+                continue
+            style = segment.style
+            segment_background = (
+                getattr(style, "bgcolor", None) if style is not None else None
+            )
+            if segment_background is None:
+                return None
+            if not found:
+                background = segment_background
+                found = True
+            elif segment_background != background:
+                return None
+        return background if found else None
+
+    @staticmethod
+    def _line_has_visible_text(line) -> bool:
+        return any(segment.text.strip() for segment in line)
+
+    @staticmethod
+    def _code_padding_half_line(line, background, *, top: bool):
+        width = sum(cell_len(segment.text) for segment in line)
+        if width <= 0:
+            return line
+        glyph = "\u2584" if top else "\u2580"
+        style = Style(
+            color=background,
+            bgcolor=PAGE_BACKGROUND,
+            meta={
+                "omniagent_code_padding_half": True,
+                "omniagent_code_padding_edge": "top" if top else "bottom",
+            },
+        )
+        return [Segment(glyph * width, style)]
+
+    @classmethod
+    def _remove_code_block_outer_blank_lines(cls, lines) -> None:
+        index = 0
+        while index < len(lines):
+            if (
+                cls._is_unstyled_blank_line(lines[index])
+                and index + 1 < len(lines)
+                and cls._code_padding_edge(lines[index + 1]) == "top"
+            ):
+                lines.pop(index)
+                continue
+            if (
+                cls._code_padding_edge(lines[index]) == "bottom"
+                and index + 1 < len(lines)
+                and cls._is_unstyled_blank_line(lines[index + 1])
+            ):
+                lines.pop(index + 1)
+                continue
+            index += 1
+
+    @staticmethod
+    def _code_padding_edge(line) -> str:
+        for segment in line:
+            style = segment.style
+            meta = getattr(style, "meta", None) if style is not None else None
+            if meta and meta.get("omniagent_code_padding_half"):
+                return str(meta.get("omniagent_code_padding_edge") or "")
+        return ""
+
 
 class MarkdownMessageStatic(Static, can_focus=True):
     BINDINGS = [
@@ -2287,9 +2663,16 @@ class MarkdownMessageStatic(Static, can_focus=True):
         Binding("ctrl+a", "select_all", show=False, priority=True),
     ]
 
-    def __init__(self, content: str = "", *args, **kwargs):
+    def __init__(
+        self,
+        content: str = "",
+        *args,
+        foreground_color: str | None = None,
+        **kwargs,
+    ):
         super().__init__("", *args, **kwargs)
         self._markdown_source = str(content or "")
+        self._markdown_foreground_color = foreground_color
         self._selection_anchor = 0
         self._selection_focus = 0
         self._drag_selecting = False
@@ -2297,13 +2680,15 @@ class MarkdownMessageStatic(Static, can_focus=True):
         self._render_cache_source = ""
         self._render_cache_text = ""
         self._render_cache_styled: Text | None = None
+        self._render_cache_unselectable_ranges: list[tuple[int, int]] = []
 
     def render(self):
         start, end = self._selection_range()
         if start == end:
             return self._markdown_renderable()
         text = self._rendered_markdown_text().copy()
-        text.stylize("reverse", start, end)
+        for range_start, range_end in self._selectable_ranges(start, end):
+            text.stylize("reverse", range_start, range_end)
         return text
 
     def update(self, content="") -> None:
@@ -2312,6 +2697,7 @@ class MarkdownMessageStatic(Static, can_focus=True):
         self._render_cache_source = ""
         self._render_cache_text = ""
         self._render_cache_styled = None
+        self._render_cache_unselectable_ranges = []
         self.clear_selection(refresh=False)
         self.refresh(layout=True)
 
@@ -2361,7 +2747,11 @@ class MarkdownMessageStatic(Static, can_focus=True):
     @property
     def selected_text(self) -> str:
         start, end = self._selection_range()
-        return self._plain_content()[start:end]
+        content = self._plain_content()
+        return "".join(
+            content[range_start:range_end]
+            for range_start, range_end in self._selectable_ranges(start, end)
+        )
 
     def clear_selection(self, refresh: bool = True) -> None:
         self._selection_anchor = 0
@@ -2370,7 +2760,10 @@ class MarkdownMessageStatic(Static, can_focus=True):
             self.refresh()
 
     def _markdown_renderable(self):
-        return _LeadingBlankTrimmedMarkdown(self._markdown_source)
+        return _LeadingBlankTrimmedMarkdown(
+            self._markdown_source,
+            foreground_color=self._markdown_foreground_color,
+        )
 
     def _plain_content(self) -> str:
         self._rendered_markdown_text()
@@ -2394,16 +2787,22 @@ class MarkdownMessageStatic(Static, can_focus=True):
         )
         rendered = Text()
         plain_lines: list[str] = []
+        unselectable_ranges: list[tuple[int, int]] = []
         for line_index, segments in enumerate(lines):
             line_text = Text()
             preserve_trailing_whitespace = False
+            code_padding_half = False
             for segment in segments:
                 if not segment.text:
                     continue
                 if self._segment_has_background(segment.style):
                     preserve_trailing_whitespace = True
+                if self._segment_is_code_padding_half(segment.style):
+                    code_padding_half = True
                 line_text.append(segment.text, segment.style)
-            if preserve_trailing_whitespace:
+            if code_padding_half:
+                plain_lines.append(" " * len(line_text.plain))
+            elif preserve_trailing_whitespace:
                 plain_lines.append(line_text.plain)
             else:
                 trim_length = len(line_text.plain.rstrip())
@@ -2414,11 +2813,15 @@ class MarkdownMessageStatic(Static, can_focus=True):
                 line_text = Text("")
             if line_index:
                 rendered.append("\n")
+            line_start = len(rendered)
             rendered.append_text(line_text)
+            if code_padding_half and len(rendered) > line_start:
+                unselectable_ranges.append((line_start, len(rendered)))
         self._render_cache_width = width
         self._render_cache_source = self._markdown_source
         self._render_cache_text = "\n".join(plain_lines)
         self._render_cache_styled = rendered
+        self._render_cache_unselectable_ranges = unselectable_ranges
         return rendered
 
     @staticmethod
@@ -2435,11 +2838,40 @@ class MarkdownMessageStatic(Static, can_focus=True):
                 return True
         return False
 
+    @staticmethod
+    def _segment_is_code_padding_half(style) -> bool:
+        if style is None:
+            return False
+        meta = getattr(style, "meta", None)
+        return bool(meta and meta.get("omniagent_code_padding_half"))
+
     def _selection_range(self) -> tuple[int, int]:
         start = max(0, min(self._selection_anchor, self._selection_focus))
         end = max(0, max(self._selection_anchor, self._selection_focus))
         limit = len(self._plain_content())
         return min(start, limit), min(end, limit)
+
+    def _selectable_ranges(self, start: int, end: int):
+        cursor = start
+        for blocked_start, blocked_end in self._render_cache_unselectable_ranges:
+            if blocked_end <= cursor:
+                continue
+            if blocked_start >= end:
+                break
+            if cursor < blocked_start:
+                yield cursor, min(blocked_start, end)
+            cursor = max(cursor, blocked_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            yield cursor, end
+
+    def _snap_selectable_index(self, index: int) -> int:
+        for blocked_start, blocked_end in self._render_cache_unselectable_ranges:
+            if blocked_start < index < blocked_end:
+                midpoint = blocked_start + ((blocked_end - blocked_start) // 2)
+                return blocked_start if index <= midpoint else blocked_end
+        return index
 
     def _index_from_event(self, event: events.MouseEvent) -> int:
         lines = self._wrapped_line_ranges()
@@ -2451,7 +2883,10 @@ class MarkdownMessageStatic(Static, can_focus=True):
         raw_start, raw_end = lines[line_index]
         column = max(0, event.x - left_padding)
         line_text = self._plain_content()[raw_start:raw_end]
-        return raw_start + SelectableMessageStatic._index_from_column(line_text, column)
+        index = raw_start + SelectableMessageStatic._index_from_column(
+            line_text, column
+        )
+        return self._snap_selectable_index(index)
 
     def _selection_index_from_event(self, event: events.MouseEvent) -> int:
         lines = self._wrapped_line_ranges()
@@ -2469,7 +2904,8 @@ class MarkdownMessageStatic(Static, can_focus=True):
         after = raw_start + SelectableMessageStatic._index_after_column(
             line_text, column
         )
-        return before if before < self._selection_anchor else after
+        index = before if before < self._selection_anchor else after
+        return self._snap_selectable_index(index)
 
     def _wrapped_line_ranges(self) -> list[tuple[int, int]]:
         content = self._plain_content()
@@ -2498,19 +2934,35 @@ class MarkdownMessageStatic(Static, can_focus=True):
 
 
 class ThoughtBlock(Vertical):
-    def __init__(self, content: str = "", elapsed_seconds: float = 0.0):
+    def __init__(
+        self,
+        content: str = "",
+        elapsed_seconds: float = 0.0,
+        markdown_enabled: bool = True,
+    ):
         super().__init__()
         self.thought_content = str(content or "")
         self.elapsed_seconds = float(elapsed_seconds or 0.0)
+        self.markdown_enabled = bool(markdown_enabled)
         self.expanded = False
         self._toggle_widget: Static | None = None
         self._content_widget: Static | None = None
 
     def compose(self) -> ComposeResult:
         self._toggle_widget = Static(self._header_label(), classes="thought-toggle")
-        self._content_widget = Static(
-            self.thought_content, classes="thought-content hidden", markup=False
-        )
+        if self.markdown_enabled:
+            self._content_widget = MarkdownMessageStatic(
+                self.thought_content,
+                classes="thought-content hidden",
+                expand=False,
+                foreground_color=TEXT_MUTED,
+            )
+        else:
+            self._content_widget = Static(
+                self.thought_content,
+                classes="thought-content hidden",
+                markup=False,
+            )
         yield self._toggle_widget
         yield self._content_widget
 
@@ -2521,7 +2973,7 @@ class ThoughtBlock(Vertical):
         control = event.control
         if not hasattr(control, "has_class"):
             return
-        if control.has_class("thought-toggle") or control.has_class("thought-content"):
+        if control.has_class("thought-toggle"):
             self.expanded = not self.expanded
             self._refresh()
             event.stop()
@@ -2560,10 +3012,19 @@ class ExploredBlock(Vertical):
         "read_skill",
     })
     SEARCH_TOOLS = frozenset({"grep", "glob", "list_dir", "list_skills"})
+    TOOL_LABELS = {
+        "read_file": "Read",
+        "read_program_docs": "Read program docs",
+        "read_skill": "Read skill",
+        "grep": "Grep",
+        "glob": "Glob",
+        "list_dir": "List dir",
+        "list_skills": "List skills",
+    }
 
     def __init__(self):
         super().__init__()
-        self.entries: list[tuple[str, str]] = []
+        self.entries: list[tuple[str, str, str]] = []
         self.expanded = False
         self._toggle_widget: Static | None = None
         self._content_widget: Static | None = None
@@ -2592,13 +3053,33 @@ class ExploredBlock(Vertical):
             self._refresh()
             event.stop()
 
-    def add_entry(self, tool_name: str, description: str) -> None:
-        self.entries.append((str(tool_name), str(description)))
+    @classmethod
+    def handles_tool(cls, tool_name: str) -> bool:
+        return str(tool_name or "") in cls.READ_TOOLS | cls.SEARCH_TOOLS
+
+    @classmethod
+    def error_description(cls, tool_name: str, summary: str) -> str:
+        name = str(tool_name or "")
+        label = cls.TOOL_LABELS.get(name, name.replace("_", " ").title()) or "Tool"
+        description = f"[white]{_escape_markup(label)}[/white]"
+        summary = str(summary or "").strip()
+        if summary:
+            description += f" [gray]{_escape_markup(summary)}[/gray]"
+        return description
+
+    def add_entry(
+        self, tool_name: str, description: str, *, error: str = ""
+    ) -> None:
+        self.entries.append((str(tool_name), str(description), str(error or "")))
         self._refresh()
 
     def _header_label(self) -> str:
-        reads = sum(1 for name, _ in self.entries if name in self.READ_TOOLS)
-        searches = sum(1 for name, _ in self.entries if name in self.SEARCH_TOOLS)
+        reads = sum(
+            1 for name, _, _ in self.entries if name in self.READ_TOOLS
+        )
+        searches = sum(
+            1 for name, _, _ in self.entries if name in self.SEARCH_TOOLS
+        )
         parts = []
         if reads:
             parts.append(f"{reads} read" if reads == 1 else f"{reads} reads")
@@ -2611,13 +3092,22 @@ class ExploredBlock(Vertical):
         counts = ", ".join(parts)
         return f"→ [white]Explored[/white] [gray]{counts}[/gray]"
 
+    def _content_text(self) -> str:
+        lines: list[str] = []
+        for tool_name, description, error in self.entries:
+            description = description or self.error_description(tool_name, "")
+            if error:
+                description += f" [{STATUS_ERROR}]failed[/]"
+            lines.append(description)
+        return "\n".join(lines)
+
     def _refresh(self) -> None:
         toggle = self._toggle_widget
         content = self._content_widget
         if toggle is None or content is None:
             return
         toggle.update(self._header_label())
-        content.update("\n".join(desc for _, desc in self.entries))
+        content.update(self._content_text())
         if self.expanded and self.entries:
             content.remove_class("hidden")
         else:
@@ -2628,6 +3118,7 @@ class QuestionsBlock(Vertical):
     def __init__(self):
         super().__init__()
         self.entries: list[tuple[str, str]] = []
+        self.errors: list[str] = []
         self.expanded = False
         self._toggle_widget: Static | None = None
         self._content_widget: Static | None = None
@@ -2660,10 +3151,15 @@ class QuestionsBlock(Vertical):
         self.entries.append((str(question or ""), str(answer or "")))
         self._refresh()
 
+    def add_error(self, error: str) -> None:
+        self.errors.append(str(error or "") or "Tool call failed.")
+        self._refresh()
+
     def _header_label(self) -> str:
         count = len(self.entries)
-        suffix = "answered" if count == 1 else "answered"
-        return f"[gray]#[/] [white]Questions[/white] [gray]{count} {suffix}[/gray]"
+        count_label = f" [gray]{count} answered[/gray]" if count else ""
+        failed = f" [{STATUS_ERROR}]failed[/]" if self.errors else ""
+        return f"[gray]#[/] [white]Questions[/white]{count_label}{failed}"
 
     def _content_text(self) -> str:
         parts = []
@@ -2672,6 +3168,10 @@ class QuestionsBlock(Vertical):
                 f"[gray]{_escape_markup(question)}[/gray]\n"
                 f"[white]{_escape_markup(answer)}[/white]"
             )
+        parts.extend(
+            f"[{STATUS_ERROR}]{_escape_markup(error)}[/]"
+            for error in self.errors
+        )
         return "\n\n".join(parts)
 
     def _refresh(self) -> None:
@@ -2681,17 +3181,119 @@ class QuestionsBlock(Vertical):
             return
         toggle.update(self._header_label())
         content.update(self._content_text())
-        if self.expanded and self.entries:
+        if self.expanded and (self.entries or self.errors):
             content.remove_class("hidden")
         else:
             content.add_class("hidden")
 
 
+class ToolErrorBlock(Vertical):
+    EXPANDABLE_TOOLS = frozenset({"dispatch_subagent"})
+    LABELS = {
+        "update_todo": "Todos",
+        "ask_user": "Questions",
+        "submit_plan": "Plan",
+        "read_file": "Read",
+        "read_program_docs": "Read program docs",
+        "web_fetch": "Webfetch",
+        "list_dir": "List dir",
+        "write_file": "Write",
+        "edit_file": "Edit",
+        "apply_patch": "Edit",
+        "apply_unified_patch": "Edit",
+        "bash": "Shell",
+        "local_http_check": "HTTP check",
+        "git_status": "Git status",
+        "git_diff": "Git diff",
+        "grep": "Grep",
+        "glob": "Glob",
+        "list_skills": "List skills",
+        "read_skill": "Read skill",
+        "web_search": "Websearch",
+        "dispatch_subagent": "Subagent",
+        "report_to_lead": "Report to Lead",
+        "spawn_teammate": "Spawn teammate",
+        "list_teammates": "List teammates",
+        "send_message": "Send message",
+        "read_inbox": "Read inbox",
+        "broadcast": "Broadcast",
+        "shutdown_teammate": "Shutdown teammate",
+    }
+
+    def __init__(self, tool_name: str, summary: str, error: str):
+        super().__init__()
+        self.tool_name = str(tool_name or "")
+        self.summary = str(summary or "").strip()
+        self.error = str(error or "").strip() or "Tool call failed."
+        self.expandable = self.tool_name in self.EXPANDABLE_TOOLS
+        self.expanded = False
+        self._toggle_widget: Static | None = None
+        self._content_widget: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        self._toggle_widget = Static(
+            self._header_label(), classes="tool-error-toggle", markup=True
+        )
+        self._content_widget = Static(
+            self.error, classes="tool-error-content hidden", markup=False
+        )
+        yield self._toggle_widget
+        yield self._content_widget
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def on_click(self, event: events.Click) -> None:
+        if not self.expandable:
+            return
+        control = event.control
+        if not hasattr(control, "has_class"):
+            return
+        if control.has_class("tool-error-toggle") or control.has_class(
+            "tool-error-content"
+        ):
+            self.expanded = not self.expanded
+            self._refresh()
+            event.stop()
+
+    def _header_label(self) -> str:
+        label = self.LABELS.get(
+            self.tool_name, self.tool_name.replace("_", " ").strip().title()
+        ) or "Tool"
+        prefix = "$" if self.tool_name in {
+            "bash",
+            "local_http_check",
+            "git_status",
+            "git_diff",
+        } else "#"
+        header = f"[gray]{prefix}[/] [white]{_escape_markup(label)}[/white]"
+        if self.summary:
+            header += f" [gray]{_escape_markup(self.summary)}[/gray]"
+        return f"{header} [{STATUS_ERROR}]failed[/]"
+
+    def _refresh(self) -> None:
+        if self._toggle_widget is not None:
+            self._toggle_widget.update(self._header_label())
+        if self._content_widget is None:
+            return
+        self._content_widget.update(self.error)
+        if self.expandable and self.expanded and self.error:
+            self._content_widget.remove_class("hidden")
+        else:
+            self._content_widget.add_class("hidden")
+
+
 class TodosBlock(Vertical):
-    def __init__(self, items: list[dict], summary: dict | None = None):
+    def __init__(
+        self,
+        items: list[dict],
+        summary: dict | None = None,
+        error: str = "",
+    ):
         super().__init__()
         self.items = [dict(item or {}) for item in list(items or [])]
         self.summary = dict(summary or {})
+        self.error = str(error or "")
         self.expanded = False
         self._toggle_widget: Static | None = None
         self._content_widget: Vertical | None = None
@@ -2724,6 +3326,8 @@ class TodosBlock(Vertical):
     def _header_label(self) -> str:
         total = int(self.summary.get("total", len(self.items)) or 0)
         completed = int(self.summary.get("completed", 0) or 0)
+        if self.error:
+            return f"[gray]#[/] [white]Todos[/white] [{STATUS_ERROR}]failed[/]"
         if self.expanded:
             return "[gray]#[/] [white]Todos[/white]"
         return (
@@ -2741,7 +3345,12 @@ class TodosBlock(Vertical):
         toggle.update(self._header_label())
         completed = int(self.summary.get("completed", 0) or 0)
         total = int(self.summary.get("total", len(self.items)) or 0)
-        summary.update(f"{completed} of {total} todos completed")
+        if self.error:
+            summary.update(
+                f"[{STATUS_ERROR}]{_escape_markup(self.error)}[/]"
+            )
+        else:
+            summary.update(f"{completed} of {total} todos completed")
         existing = list(rows.children)
         target = len(self.items)
         while len(existing) > target:
@@ -2872,6 +3481,8 @@ class TeamActionBlock(Vertical):
         action = _escape_markup(action)
         summary = _escape_markup(self.summary)
         suffix = f" [gray]{summary}[/gray]" if summary else ""
+        if self.status.strip().lower() in {"error", "failed"}:
+            suffix += f" [{STATUS_ERROR}]failed[/]"
         return f"{marker} [white]{action}[/white]{suffix}"
 
     def _content_with_half_row_gaps(self) -> list[Widget]:
@@ -3182,6 +3793,26 @@ def _team_chat_transcript(transcript: list[dict]) -> list[dict]:
 
 def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
     entries: list[dict] = []
+    pending_explored: list[tuple[str, int]] = []
+
+    def apply_explored_error(
+        tool_name: str, summary: str, error: str, entry_index: int | None
+    ) -> None:
+        if entry_index is None:
+            entries.append({
+                "kind": "explored_entry",
+                "tool_name": tool_name,
+                "description": ExploredBlock.error_description(tool_name, summary),
+                "error": error,
+            })
+            return
+        target = entries[entry_index]
+        if not str(target.get("description") or ""):
+            target["description"] = ExploredBlock.error_description(
+                tool_name, summary
+            )
+        target["error"] = error
+
     for entry in transcript:
         if not isinstance(entry, dict):
             continue
@@ -3199,6 +3830,7 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
             arguments = entry.get("arguments", {})
             description = _subagent_explored_description(name, arguments)
             if description:
+                pending_explored.append((name, len(entries)))
                 entries.append({
                     "kind": "explored_entry",
                     "tool_name": name,
@@ -3207,9 +3839,39 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
             continue
         if kind != "tool_result":
             continue
+        result_name = str(entry.get("name") or "")
+        explored_entry_index = None
+        for pending_index, (pending_name, entry_index) in enumerate(
+            pending_explored
+        ):
+            if pending_name == result_name:
+                explored_entry_index = entry_index
+                pending_explored.pop(pending_index)
+                break
         display = entry.get("display")
         if isinstance(display, dict):
             display_kind = str(display.get("kind") or "")
+            if display_kind == "tool_error":
+                tool_name = str(
+                    display.get("tool_name", entry.get("name", "")) or ""
+                )
+                summary = str(display.get("summary") or "")
+                error = str(
+                    display.get("error", entry.get("content", ""))
+                    or "Tool call failed."
+                )
+                if ExploredBlock.handles_tool(tool_name):
+                    apply_explored_error(
+                        tool_name, summary, error, explored_entry_index
+                    )
+                else:
+                    entries.append({
+                        "kind": "tool_error",
+                        "tool_name": tool_name,
+                        "summary": summary,
+                        "error": error,
+                    })
+                continue
             if display_kind == "web_fetch":
                 entries.append({"kind": "web_fetch", "url": display.get("url", "")})
                 continue
@@ -3226,6 +3888,7 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
                     "additions": display.get("additions", 0),
                     "deletions": display.get("deletions", 0),
                     "diff": display.get("diff", ""),
+                    "status": display.get("status", ""),
                 })
                 continue
             if display_kind == "shell":
@@ -3264,6 +3927,22 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
                     },
                 })
                 continue
+        content = str(entry.get("content") or "")
+        if bool(entry.get("is_error")) or content.startswith("ERROR:"):
+            error = content[6:].lstrip() if content.startswith("ERROR:") else content
+            tool_name = str(entry.get("name") or "")
+            error = error or "Tool call failed."
+            if ExploredBlock.handles_tool(tool_name):
+                apply_explored_error(
+                    tool_name, "", error, explored_entry_index
+                )
+            else:
+                entries.append({
+                    "kind": "tool_error",
+                    "tool_name": tool_name,
+                    "summary": "",
+                    "error": error,
+                })
     return entries
 
 
@@ -3361,8 +4040,10 @@ class ShellBlock(Vertical):
     def __init__(self):
         super().__init__()
 
-    def add_entry(self, command: str, output: str) -> None:
-        row = ShellRow(command, output)
+    def add_entry(
+        self, command: str, output: str, status: str = ""
+    ) -> None:
+        row = ShellRow(command, output, status=status)
         self.mount(row)
 
 
@@ -3372,10 +4053,11 @@ class ShellRow(Vertical):
     Expanded: shows full command + output in a dark container.
     """
 
-    def __init__(self, command: str, output: str):
+    def __init__(self, command: str, output: str, status: str = ""):
         super().__init__()
         self.command = str(command or "")
         self.output = str(output or "")
+        self.status = str(status or "").strip().lower()
         self._expanded = False
         self._header_command: Static | None = None
         self._output_widget: Static | None = None
@@ -3387,7 +4069,7 @@ class ShellRow(Vertical):
                 "Shell", classes="shell-row-shell-label", markup=True, expand=False
             )
             self._header_command = Static(
-                _escape_markup(self.command),
+                "",
                 classes="shell-row-command",
                 markup=True,
                 expand=False,
@@ -3434,7 +4116,7 @@ class ShellRow(Vertical):
             wrap.add_class("hidden")
         hc = self._header_command
         if hc is not None:
-            if self._expanded:
+            if self._expanded and self.status != "failed":
                 hc.add_class("hidden")
             else:
                 hc.remove_class("hidden")
@@ -3465,10 +4147,27 @@ class ShellRow(Vertical):
         hc = self._header_command
         if hc is None:
             return
+        if self._expanded:
+            hc.update(
+                f"[{STATUS_ERROR}]failed[/]"
+                if self.status == "failed"
+                else ""
+            )
+            return
         width = max(0, hc.content_region.width or hc.size.width)
         if width <= 0:
             return
-        hc.update(_escape_markup(self._truncate_command_for_width(self.command, width)))
+        failed = self.status == "failed"
+        command_width = max(0, width - (7 if failed else 0))
+        command = self._truncate_command_for_width(
+            self.command, command_width
+        )
+        content = _escape_markup(command)
+        if failed:
+            if content:
+                content += " "
+            content += f"[{STATUS_ERROR}]failed[/]"
+        hc.update(content)
 
 
 class DiffFileRow(Vertical):
@@ -3498,6 +4197,7 @@ class DiffFileRow(Vertical):
         self._row_expanded = False
         self._row_container: Vertical | None = None
         self._file_row: ChangedFileRow | None = None
+        self._error_widget: Static | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="diff-row-header"):
@@ -3513,6 +4213,13 @@ class DiffFileRow(Vertical):
                 markup=True,
                 expand=False,
             )
+            if self.status == "failed":
+                yield Static(
+                    f"[{STATUS_ERROR}]failed[/]",
+                    classes="diff-row-status",
+                    markup=True,
+                    expand=False,
+                )
             if self.show_stats:
                 yield Static(
                     self._stats_text(),
@@ -3520,23 +4227,33 @@ class DiffFileRow(Vertical):
                     markup=True,
                     expand=False,
                 )
-        self._file_row = ChangedFileRow({
-            "file_path": self.file_path,
-            "additions": self.additions,
-            "deletions": self.deletions,
-            "diff": self.diff,
-        })
+        if self.status == "failed":
+            self._error_widget = Static(
+                _escape_markup(self.diff),
+                classes="diff-file-error-display",
+                markup=True,
+            )
+        else:
+            self._file_row = ChangedFileRow({
+                "file_path": self.file_path,
+                "additions": self.additions,
+                "deletions": self.deletions,
+                "diff": self.diff,
+            })
         with Vertical(classes="diff-file-row-wrap hidden"):
             yield HalfRowSpacer(classes="diff-file-row-top-spacer")
             with Vertical(classes="diff-file-row-container"):
-                yield self._file_row
+                if self._error_widget is not None:
+                    yield self._error_widget
+                elif self._file_row is not None:
+                    yield self._file_row
             yield BottomHalfRowSpacer(classes="diff-file-row-bottom-spacer")
 
     def on_mount(self) -> None:
         pass
 
     def on_click(self, event: events.Click) -> None:
-        if self._file_row is None:
+        if self._file_row is None and self._error_widget is None:
             return
         try:
             wrap = self.query_one(".diff-file-row-wrap", Vertical)
@@ -3547,13 +4264,14 @@ class DiffFileRow(Vertical):
             wrap.remove_class("hidden")
         else:
             wrap.add_class("hidden")
-            self._file_row.expanded = False
-            if self._file_row._content_widget:
-                self._file_row._content_widget.add_class("hidden")
+            if self._file_row is not None:
+                self._file_row.expanded = False
+                if self._file_row._content_widget:
+                    self._file_row._content_widget.add_class("hidden")
         event.stop()
 
     def _stats_text(self) -> str:
-        if self.status == "rejected":
+        if self.status in {"rejected", "failed"}:
             return ""
         parts = []
         if self.additions:

@@ -93,8 +93,11 @@ from tui.widgets.text_area_modal import PromptFileModal, TextAreaModal
 from tui.widgets.todos_panel import TodosPanel
 from team import TeamStore, display_teammate_name
 from ui import (
+    build_tool_error_display,
     clean_display_text,
     clean_display_text_preserve_newlines,
+    clean_thinking_text,
+    tool_result_is_error,
 )
 
 
@@ -745,6 +748,14 @@ class AgentTUIApp(App):
                 )
         self._apply_config_to_controls()
 
+    def _on_agent_plan_mode_changed(self, enabled: bool) -> None:
+        self._call_ui(self._apply_agent_plan_mode_change, bool(enabled))
+
+    def _apply_agent_plan_mode_change(self, enabled: bool) -> None:
+        save_config_field("agent_plan_enable", enabled)
+        self._reload_config()
+        self._apply_config_to_controls()
+
     def on_chat_input_plan_mode_changed(self, event: ChatInput.PlanModeChanged) -> None:
         save_config_field("agent_plan_enable", event.enabled)
         self._reload_config()
@@ -995,7 +1006,7 @@ class AgentTUIApp(App):
     def add_thinking_message(self, content) -> None:
         if self._suppress_stream_output:
             return
-        text = clean_display_text_preserve_newlines(content)
+        text = clean_thinking_text(content)
         if not text:
             return
         self._call_ui(
@@ -1088,6 +1099,27 @@ class AgentTUIApp(App):
 
     def set_context_usage(self, input_tokens, context_window_tokens) -> None:
         self._call_ui(self._set_context_label, input_tokens, context_window_tokens)
+
+    def request_plan_confirmation(self, plan) -> bool:
+        request = self._build_inline_prompt_request([
+            _InlinePromptQuestion(
+                question="Allow this plan?",
+                options=[
+                    _InlinePromptOption("Allow", value="Allow"),
+                    _InlinePromptOption("Cancel", value="Cancel"),
+                ],
+                separate_options=True,
+            )
+        ])
+        self._call_ui(self._open_plan_prompt, str(plan or "").strip(), request)
+        request.event.wait()
+        if request.cancelled:
+            return False
+        return bool(request.answers[0].selected_option_index == 0)
+
+    def _open_plan_prompt(self, plan: str, request: _InlinePromptRequest) -> None:
+        self.query_one("#messages-view", ChatView).add_plan_entry(plan)
+        self._open_inline_prompt(request)
 
     def request_confirmation(self, title, detail="") -> bool:
         question = str(title or "Confirm").strip()
@@ -1563,6 +1595,22 @@ class AgentTUIApp(App):
         self, items: list[dict], summary: dict | None = None
     ) -> None:
         self.query_one("#messages-view", ChatView).add_todo_entry(items, summary)
+
+    def add_tool_error_entry(self, display: dict) -> None:
+        payload = dict(display or {})
+        self._call_ui(
+            self._append_tool_error_entry,
+            str(payload.get("tool_name") or ""),
+            str(payload.get("summary") or ""),
+            str(payload.get("error") or ""),
+        )
+
+    def _append_tool_error_entry(
+        self, tool_name: str, summary: str, error: str
+    ) -> None:
+        self.query_one("#messages-view", ChatView).add_tool_error_entry(
+            tool_name, summary, error
+        )
 
     def add_web_fetch_entry(self, url: str) -> None:
         self._call_ui(self._append_web_fetch_entry, url)
@@ -4129,6 +4177,7 @@ class AgentTUIApp(App):
                     entry,
                 )
             ),
+            plan_mode_changed_callback=self._on_agent_plan_mode_changed,
         )
         chat.set_usage_history(session_record.get("usage_history") or [])
         return chat
@@ -4732,9 +4781,17 @@ class AgentTUIApp(App):
         name = str(message.get("tool_name") or message.get("name") or "")
         if self._replay_tool_result_display(view, message.get("display")):
             return
+        content = clean_display_text_preserve_newlines(message.get("content", ""))
+        if tool_result_is_error(name, content):
+            display = build_tool_error_display(name, {}, content)
+            view.add_tool_error_entry(
+                str(display.get("tool_name") or ""),
+                str(display.get("summary") or ""),
+                str(display.get("error") or ""),
+            )
+            return
         if name == "update_todo":
             return
-        content = clean_display_text_preserve_newlines(message.get("content", ""))
         label = f"Tool result: {name}".strip()
         if content:
             label = f"{label}\n{content}"
@@ -4746,16 +4803,22 @@ class AgentTUIApp(App):
         name = str(block.get("tool_name") or "")
         if self._replay_tool_result_display(view, block.get("display")):
             return
-        if name == "update_todo":
-            return
         content = clean_display_text_preserve_newlines(block.get("content", ""))
         tool_use_id = str(block.get("tool_use_id") or "")
         is_error = bool(block.get("is_error"))
+        if is_error or tool_result_is_error(name, content):
+            display = build_tool_error_display(name, {}, content)
+            view.add_tool_error_entry(
+                str(display.get("tool_name") or ""),
+                str(display.get("summary") or ""),
+                str(display.get("error") or ""),
+            )
+            return
+        if name == "update_todo":
+            return
         label = "Tool result"
         if tool_use_id:
             label += f": {tool_use_id}"
-        if is_error:
-            label += " [error]"
         if content:
             label = f"{label}\n{content}"
         view.add_status(label)
@@ -4765,6 +4828,19 @@ class AgentTUIApp(App):
         if not isinstance(display, dict):
             return False
         kind = str(display.get("kind") or "")
+        if kind == "tool_error":
+            view.add_tool_error_entry(
+                str(display.get("tool_name") or ""),
+                str(display.get("summary") or ""),
+                str(display.get("error") or ""),
+            )
+            return True
+        if kind == "plan":
+            plan = clean_display_text_preserve_newlines(display.get("plan", ""))
+            if plan:
+                view.add_plan_entry(plan)
+                return True
+            return False
         if kind == "ask_user":
             entries = display.get("entries")
             if isinstance(entries, list):

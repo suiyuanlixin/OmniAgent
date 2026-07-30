@@ -702,7 +702,7 @@ class ChatInput(Widget):
         background: $PAGE_BACKGROUND;
     }
     ChatInput.todo-visible #pending-top-gap {
-        color: $INFO_BAR_BACKGROUND;
+        color: $SURFACE_BACKGROUND;
     }
     #pending-top-gap.visible {
         display: block;

@@ -6,6 +6,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from ui import (
+    build_tool_error_display,
+    tool_display_is_error,
+    tool_result_is_error,
+)
+
 
 DISPATCH_SUBAGENT_TOOL_NAME = "dispatch_subagent"
 API_TYPE_ANTHROPIC = "anthropic"
@@ -708,7 +714,7 @@ class SubagentRunner:
             if chunk_type == "content_block_start":
                 content_block = self.parent._get_field(chunk, "content_block")
                 block_type = self.parent._get_field(content_block, "type", "")
-                initial_reasoning = self.parent._anthropic_reasoning_text(content_block)
+                initial_reasoning = self.parent._anthropic_reasoning_text(content_block, clean=False)
                 if block_type == "text":
                     if initial_reasoning:
                         blocks.append({
@@ -787,12 +793,17 @@ class SubagentRunner:
             if self.event_callback is not None:
                 self.event_callback({"kind": kind, "content": ""})
             return
-        if not str(content or "").strip():
-            return
+        content = str(content or "")
         if kind == "thought_delta":
+            if not content:
+                return
             self._streamed_thinking = True
         elif kind == "message_delta":
+            if not content.strip():
+                return
             self._streamed_text = True
+        elif not content.strip():
+            return
         if self.event_callback is not None:
             self.event_callback({"kind": kind, "content": content})
 
@@ -812,7 +823,9 @@ class SubagentRunner:
                     "type": "tool_result",
                     "tool_use_id": tool_call.get("id", ""),
                     "content": result,
-                    "is_error": result.startswith("ERROR:"),
+                    "is_error": tool_result_is_error(
+                        tool_call.get("name", ""), result
+                    ),
                 })
             history.append({"role": "user", "content": results})
             return
@@ -848,7 +861,7 @@ class SubagentRunner:
                 "name": str(name or ""),
                 "content": result,
                 "is_error": True,
-                "display": None,
+                "display": build_tool_error_display(name, arguments, result),
             })
             return result
         if isinstance(arguments, str):
@@ -869,11 +882,15 @@ class SubagentRunner:
             if callable(consume_display):
                 display = consume_display()
         full_result = str(result or "")
+        if tool_result_is_error(name, full_result, display) and not tool_display_is_error(
+            display
+        ):
+            display = build_tool_error_display(name, arguments, full_result)
         self._record_event({
             "kind": "tool_result",
             "name": str(name or ""),
             "content": full_result,
-            "is_error": full_result.startswith("ERROR:"),
+            "is_error": tool_result_is_error(name, full_result, display),
             "display": display,
         })
         return full_result

@@ -260,7 +260,7 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 
 核心特性：
 
-- Plan mode：只读规划模式，适合先澄清需求、拆任务、看设计、提问题。
+- Plan mode：只读规划模式，适合先澄清需求、拆任务、看设计、提问题。主 Agent 完成最终方案后会调用专属 `submit_plan` 工具，以用户消息气泡样式显示 `Plan` 与计划正文并请求允许；用户允许后会在同一轮自动切换到 Build mode 执行，执行结束后不会自动回到 Plan mode，拒绝则保持 Plan mode 且不执行。
 - Build mode：实际执行模式，允许在工作区内读写文件和运行命令。
 - Todo 跟踪：使用 `update_todo` 维护当前执行计划，并同步显示到对话流与 Todo 面板。
 - 审批保护：写文件、补丁、命令执行会根据审批模式要求确认。
@@ -273,7 +273,7 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 - 修改：`apply_patch`、`apply_unified_patch`
 - 执行：`bash`
 - 文档与网页：`read_program_docs`、`web_fetch`
-- 协作：`update_todo`、`ask_user`
+- 协作：`update_todo`、`ask_user`；Plan mode 主 Agent 专属：`submit_plan`
 - 外部能力：`web_search`、`list_skills`、`read_skill`
 
 大输出处理采用固定上限的 Artifact 协议：

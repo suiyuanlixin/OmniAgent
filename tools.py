@@ -48,10 +48,15 @@ from ui import (
     add_web_search_entry,
     add_write_entry,
     append_chat_status,
+    build_tool_error_display,
     get_agent_confirmation,
     get_agent_choice,
     get_agent_choices,
     get_agent_diff_confirmation,
+    get_agent_plan_confirmation,
+    add_tool_error_entry,
+    tool_display_is_error,
+    tool_result_is_error,
 )
 from search import (
     DEFAULT_WEB_SEARCH_DEPTH,
@@ -101,6 +106,7 @@ GIT_TIMEOUT_SECONDS = 30
 AGENT_APPROVAL_CONFIRM = "confirm"
 AGENT_APPROVAL_APPROVE = "approve"
 AGENT_APPROVAL_FULL = "full"
+SUBMIT_PLAN_TOOL_NAME = "submit_plan"
 PLAN_SUBAGENT_TYPES = frozenset({"reader", "researcher"})
 PROGRAM_DOC_FILENAMES = ("README.md",)
 WEB_FETCH_MAX_RESPONSE_BYTES = 1000000
@@ -111,6 +117,7 @@ NO_WORKSPACE_TOOLS = {
     "web_search",
     "update_todo",
     "ask_user",
+    SUBMIT_PLAN_TOOL_NAME,
     "read_file",
     "list_dir",
     "grep",
@@ -126,6 +133,7 @@ REFERENCE_ONLY_TOOLS = frozenset({
 PLAN_MODE_ALLOWED_TOOLS = frozenset({
     "update_todo",
     "ask_user",
+    SUBMIT_PLAN_TOOL_NAME,
     "dispatch_subagent",
     "read_file",
     "read_program_docs",
@@ -188,6 +196,28 @@ WEB_FETCH_TOOL_DEFINITION = {
         "additionalProperties": False,
     },
 }
+
+SUBMIT_PLAN_TOOL_DEFINITION = {
+    "name": SUBMIT_PLAN_TOOL_NAME,
+    "description": (
+        "Submit the main Agent's final implementation plan for user approval. "
+        "This tool is available only to the main Agent in Plan mode. It displays the plan, "
+        "asks whether the user allows it, and returns the decision. If allowed, OmniAgent "
+        "switches to Build mode and the main Agent must immediately implement the approved plan."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "plan": {
+                "type": "string",
+                "description": "The complete final plan to display to the user for approval.",
+            },
+        },
+        "required": ["plan"],
+        "additionalProperties": False,
+    },
+}
+
 
 ASK_USER_TOOL_DEFINITION = {
     "name": "ask_user",
@@ -1006,6 +1036,7 @@ class AgentTools:
             web_search_topic,
         )
         self._display_payload = None
+        self._submitted_plan_approved = None
         self.suppress_visible_output = False
         self._session_original_contents = {}
         self.reference_files = {}
@@ -1119,10 +1150,20 @@ class AgentTools:
                 lines.append(f"- {spec.name}: {spec.description}")
         return "\n".join(lines)
 
+    def plan_tool_definitions(self):
+        if not self.plan_mode:
+            return []
+        return [SUBMIT_PLAN_TOOL_DEFINITION]
+
     def subagent_tool_definitions(self):
         if not self.subagents_available:
             return []
         return [self._dispatch_subagent_tool_definition()]
+
+    def consume_submitted_plan_approval(self):
+        decision = self._submitted_plan_approved
+        self._submitted_plan_approved = None
+        return decision
 
     def set_team_config(self, team_store=None, team_enabled=False):
         self.team_store = team_store
@@ -1755,8 +1796,40 @@ class AgentTools:
                 str(payload.get("status") or "success"),
                 dict(payload.get("metadata") or {}),
             )
+        elif kind == "tool_error":
+            add_tool_error_entry(payload)
 
-    def _finish_tool_result(self, name, result, allow_subagent_hint=True):
+    def _promote_tool_error_display(
+        self, name, tool_input, result, *, was_error=False
+    ):
+        if not was_error:
+            return result
+        visible_result = str(result or "")
+        if not tool_display_is_error(self._display_payload):
+            self._display_payload = build_tool_error_display(
+                name, tool_input, visible_result
+            )
+            self._display_deferred = True
+        if not tool_result_is_error(name, visible_result):
+            visible_result = (
+                f"ERROR: {visible_result}"
+                if visible_result
+                else "ERROR: Tool call failed."
+            )
+        return visible_result
+
+    def _finish_deferred_display(self, name, result):
+        if tool_result_is_error(name, result, self._display_payload) and not (
+            tool_display_is_error(self._display_payload)
+        ):
+            self._display_deferred = False
+            return
+        self._emit_deferred_display()
+
+    def _finish_tool_result(
+        self, name, result, tool_input=None, allow_subagent_hint=True
+    ):
+        was_error = tool_result_is_error(name, result, self._display_payload)
         try:
             if name not in GENERIC_OUTPUT_EXEMPT_TOOLS:
                 result = self._finalize_tool_output(
@@ -1766,11 +1839,17 @@ class AgentTools:
             result = _error_result(
                 "Tool output could not be preserved by the Artifact store: " + str(error)
             )
+            was_error = True
         self._sync_display_payload_result(name, result)
-        self._emit_deferred_display()
+        result = self._promote_tool_error_display(
+            name, tool_input, result, was_error=was_error
+        )
+        self._finish_deferred_display(name, result)
         return result
 
-    def _finish_tool_error(self, name, result, allow_subagent_hint=True):
+    def _finish_tool_error(
+        self, name, result, tool_input=None, allow_subagent_hint=True
+    ):
         try:
             if name != DISPATCH_SUBAGENT_TOOL_NAME:
                 result = self._finalize_tool_output(
@@ -1782,13 +1861,17 @@ class AgentTools:
                 + str(error)
             )
         self._sync_display_payload_result(name, result)
-        self._emit_deferred_display()
+        result = self._promote_tool_error_display(
+            name, tool_input, result, was_error=True
+        )
+        self._finish_deferred_display(name, result)
         return result
 
     def execute(self, name, tool_input, allow_subagent_hint=True):
         try:
             self._display_payload = None
             self._display_deferred = False
+            self._submitted_plan_approved = None
             if isinstance(tool_input, str):
                 tool_input = json.loads(tool_input or "{}")
             if not isinstance(tool_input, dict):
@@ -1797,6 +1880,7 @@ class AgentTools:
                 return self._finish_tool_error(
                     name,
                     _error_result("No workspace directory"),
+                    tool_input=tool_input,
                     allow_subagent_hint=allow_subagent_hint,
                 )
             if (
@@ -1810,6 +1894,21 @@ class AgentTools:
                     _error_result(
                         "Tool is unavailable unless the user explicitly referenced a file or folder in this request."
                     ),
+                    tool_input=tool_input,
+                    allow_subagent_hint=allow_subagent_hint,
+                )
+            if name == SUBMIT_PLAN_TOOL_NAME and not allow_subagent_hint:
+                return self._finish_tool_error(
+                    name,
+                    _error_result("submit_plan is available only to the main Agent."),
+                    tool_input=tool_input,
+                    allow_subagent_hint=allow_subagent_hint,
+                )
+            if name == SUBMIT_PLAN_TOOL_NAME and not self.plan_mode:
+                return self._finish_tool_error(
+                    name,
+                    _error_result("submit_plan is available only in Plan mode."),
+                    tool_input=tool_input,
                     allow_subagent_hint=allow_subagent_hint,
                 )
             if self.plan_mode and name not in PLAN_MODE_ALLOWED_TOOLS:
@@ -1819,11 +1918,13 @@ class AgentTools:
                         f"Tool '{name}' is not available in Plan mode (read-only). "
                         "Switch to Build mode to use modification tools."
                     ),
+                    tool_input=tool_input,
                     allow_subagent_hint=allow_subagent_hint,
                 )
             handlers = {
                 "update_todo": self._update_todo,
                 "ask_user": self._ask_user,
+                SUBMIT_PLAN_TOOL_NAME: self._submit_plan,
                 "read_file": self._read_file,
                 "read_program_docs": self._read_program_docs,
                 "web_fetch": self._web_fetch,
@@ -1857,11 +1958,15 @@ class AgentTools:
                 return self._finish_tool_result(
                     name,
                     plan_gate_result,
+                    tool_input=tool_input,
                     allow_subagent_hint=allow_subagent_hint,
                 )
             result = handler(tool_input)
             return self._finish_tool_result(
-                name, result, allow_subagent_hint=allow_subagent_hint
+                name,
+                result,
+                tool_input=tool_input,
+                allow_subagent_hint=allow_subagent_hint,
             )
         except Exception as error:
             result = _error_result(str(error))
@@ -1877,7 +1982,10 @@ class AgentTools:
                 except Exception:
                     self._display_payload = None
             return self._finish_tool_error(
-                name, result, allow_subagent_hint=allow_subagent_hint
+                name,
+                result,
+                tool_input=tool_input,
+                allow_subagent_hint=allow_subagent_hint,
             )
 
     def consume_display_payload(self):
@@ -1948,6 +2056,30 @@ class AgentTools:
         return self.todo_store.tool_result(
             max_tool_calls=self.max_tool_calls,
             used_tool_calls=self.used_tool_calls,
+        )
+
+    def _submit_plan(self, tool_input):
+        unknown = sorted(set(tool_input) - {"plan"})
+        if unknown:
+            raise AgentToolError(
+                "Unsupported submit_plan parameter(s): " + ", ".join(unknown)
+            )
+        plan = _required_string(tool_input, "plan").strip()
+        self._before_visible_output()
+        approved = bool(get_agent_plan_confirmation(plan))
+        self._submitted_plan_approved = approved
+        self._display_payload = {
+            "kind": "plan",
+            "plan": plan,
+            "approved": approved,
+        }
+        if approved:
+            return (
+                "The user allowed this plan. Build mode is now active. "
+                "Begin implementing the approved plan immediately."
+            )
+        return (
+            "The user did not allow this plan. Remain in Plan mode and do not implement it."
         )
 
     def _ask_user(self, tool_input):

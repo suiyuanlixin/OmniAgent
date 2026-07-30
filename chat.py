@@ -10,11 +10,14 @@ from typing import Any, Dict, List, Optional
 
 from ui import (
     add_explored_entry,
+    add_tool_error_entry,
     append_subagent_event,
     begin_overflow_replay_scope,
     append_team_event,
+    build_tool_error_display,
     clean_and_print_stream_response,
     clean_display_text,
+    clean_thinking_text,
     commit_overflow_replay_scope,
     finish_compaction_entry,
     finish_team_entry,
@@ -32,6 +35,8 @@ from ui import (
     start_compaction_entry,
     start_subagent_entry,
     start_team_entry,
+    tool_display_is_error,
+    tool_result_is_error,
 )
 from config import (
     API_TYPE_ANTHROPIC,
@@ -57,6 +62,7 @@ from tools import (
     PROGRAM_DOCS_TOOL_DEFINITION,
     PLAN_MODE_ALLOWED_TOOLS,
     PLAN_SUBAGENT_TYPES,
+    SUBMIT_PLAN_TOOL_NAME,
     TOOL_DEFINITIONS,
     WEB_FETCH_TOOL_DEFINITION,
     WEB_SEARCH_TOOL_DEFINITION,
@@ -292,6 +298,7 @@ class OmniAgent:
         current_model_name="",
         history_path=None,
         usage_history_callback=None,
+        plan_mode_changed_callback=None,
     ):
         _ensure_user_prompt_file()
         self.memory_store = MemoryStore(history_path=history_path)
@@ -299,6 +306,7 @@ class OmniAgent:
         self.session_memory_lock = threading.Lock()
         self.usage_history_lock = threading.Lock()
         self.usage_history_callback = usage_history_callback
+        self.plan_mode_changed_callback = plan_mode_changed_callback
         self._agent_tools_execution_lock = threading.RLock()
         self._team_tasks_lock = threading.RLock()
         self._team_tasks = {}
@@ -352,6 +360,10 @@ class OmniAgent:
         self.agent_running = False
         self.agent_stop_requested = False
         self.agent_tool_calls = 0
+        self.agent_tool_call_limit = self.max_agent_tool_calls
+        self.agent_round_index = 0
+        self.agent_round_limit = self.max_agent_rounds
+        self.agent_plan_rejected = False
         self.agent_final_check_done = False
         self.agent_plan_check_signature = None
         self.agent_plan_check_exit_note = ""
@@ -520,9 +532,13 @@ class OmniAgent:
     def set_agent_approval_mode(self, approval_mode):
         self.agent_tools.set_approval_mode(approval_mode)
 
-    def set_plan_mode(self, enabled):
+    def set_plan_mode(self, enabled, *, notify=False):
+        enabled = bool(enabled)
+        changed = self.agent_tools.plan_mode != enabled
         self.agent_tools.set_plan_mode(enabled)
         self.agent_final_check_done = False
+        if changed and notify and self.plan_mode_changed_callback is not None:
+            self.plan_mode_changed_callback(enabled)
 
     def set_agent_skills(self, enabled):
         self.agent_tools.set_skills_enabled(enabled)
@@ -895,6 +911,10 @@ class OmniAgent:
         self.agent_running = True
         self.agent_stop_requested = False
         self.agent_tool_calls = 0
+        self.agent_tool_call_limit = self.max_agent_tool_calls
+        self.agent_round_index = 0
+        self.agent_round_limit = self.max_agent_rounds
+        self.agent_plan_rejected = False
         self.agent_final_check_done = False
         self.agent_plan_check_signature = None
         self.agent_plan_check_exit_note = ""
@@ -907,7 +927,7 @@ class OmniAgent:
         self.agent_tools.begin_agent_session(clear_todos=not self.resume_existing_plan)
         self.resume_existing_plan = False
         self.agent_tools.set_budget_context(
-            self.max_agent_tool_calls,
+            self.agent_tool_call_limit,
             self.agent_tool_calls,
         )
         try:
@@ -946,7 +966,9 @@ class OmniAgent:
         full_thinking = ""
         final_response = ""
 
-        for round_index in range(1, self.max_agent_rounds + 1):
+        for round_index in range(1, (self.max_agent_rounds * 2) + 1):
+            if round_index > self.agent_round_limit:
+                break
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
             self._prepare_agent_model_round(round_index)
@@ -976,19 +998,27 @@ class OmniAgent:
                     self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
-            if self._agent_tool_budget_exceeded(len(tool_uses)):
+            if self._agent_tool_budget_exceeded(tool_uses):
                 message = self._agent_tool_budget_message()
+                tool_results = []
+                for tool_use in tool_uses:
+                    error_result = _error_text(message)
+                    display = self._tool_display_for_result(
+                        tool_use.get("name", ""),
+                        tool_use.get("input", {}),
+                        error_result,
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.get("id", ""),
+                        "tool_name": tool_use.get("name", ""),
+                        "content": error_result,
+                        "is_error": True,
+                        "display": display,
+                    })
                 self.conversation_history.append({
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.get("id", ""),
-                            "content": _error_text(message),
-                            "is_error": True,
-                        }
-                        for tool_use in tool_uses
-                    ],
+                    "content": tool_results,
                 })
                 self._separate_after_agent_thinking()
                 print_error(message)
@@ -1005,18 +1035,21 @@ class OmniAgent:
                     tool_use.get("name", ""),
                     tool_use.get("input", {}),
                 )
+                display = self._consume_last_tool_display()
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_use.get("id", ""),
                     "tool_name": tool_use.get("name", ""),
                     "content": tool_result,
-                    "is_error": tool_result.startswith("ERROR:"),
-                    "display": self._consume_last_tool_display(),
+                    "is_error": tool_result_is_error(
+                        tool_use.get("name", ""), tool_result, display
+                    ),
+                    "display": display,
                 })
             self.conversation_history.append({"role": "user", "content": tool_results})
             finish_thinking_round()
 
-        message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        message = f"Agent loop stopped after {self.agent_round_limit} tool rounds."
         self._separate_after_agent_thinking()
         print_error(message)
         return {"thinking": full_thinking, "response": final_response or message}
@@ -1133,7 +1166,9 @@ class OmniAgent:
         full_thinking = ""
         final_response = ""
 
-        for round_index in range(1, self.max_agent_rounds + 1):
+        for round_index in range(1, (self.max_agent_rounds * 2) + 1):
+            if round_index > self.agent_round_limit:
+                break
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
             self._prepare_agent_model_round(round_index)
@@ -1167,14 +1202,21 @@ class OmniAgent:
                     self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
-            if self._agent_tool_budget_exceeded(len(tool_calls)):
+            if self._agent_tool_budget_exceeded(tool_calls):
                 message = self._agent_tool_budget_message()
                 for tool_call in tool_calls:
+                    error_result = _error_text(message)
+                    display = self._tool_display_for_result(
+                        tool_call["name"],
+                        tool_call.get("arguments", {}),
+                        error_result,
+                    )
                     self.conversation_history.append(
                         self._chat_tool_result_message(
                             tool_call["id"],
                             tool_call["name"],
-                            _error_text(message),
+                            error_result,
+                            display=display,
                         )
                     )
                 self._separate_after_agent_thinking()
@@ -1200,7 +1242,7 @@ class OmniAgent:
                 )
             finish_thinking_round()
 
-        message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        message = f"Agent loop stopped after {self.agent_round_limit} tool rounds."
         self._separate_after_agent_thinking()
         print_error(message)
         return {"thinking": full_thinking, "response": final_response or message}
@@ -1368,15 +1410,21 @@ class OmniAgent:
 
             tool_results = []
             for tool_use in tool_uses:
-                tool_result = self._execute_normal_web_search_tool(
-                    tool_use.get("name", ""),
-                    tool_use.get("input", {}),
+                tool_result, display = (
+                    self._execute_normal_web_search_tool_with_display(
+                        tool_use.get("name", ""),
+                        tool_use.get("input", {}),
+                    )
                 )
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_use.get("id", ""),
+                    "tool_name": tool_use.get("name", ""),
                     "content": tool_result,
-                    "is_error": tool_result.startswith("ERROR:"),
+                    "is_error": tool_result_is_error(
+                        tool_use.get("name", ""), tool_result, display
+                    ),
+                    "display": display,
                 })
             self.conversation_history.append({"role": "user", "content": tool_results})
 
@@ -1389,14 +1437,11 @@ class OmniAgent:
 
     def _append_normal_web_search_tool_results(self, tool_calls, provider):
         for tool_call in tool_calls:
-            tool_result = self._execute_normal_web_search_tool(
-                tool_call.get("name", ""),
-                tool_call.get("arguments", {}),
-            )
-            display = self._tool_display_for_result(
-                tool_call.get("name", ""),
-                tool_call.get("arguments", {}),
-                tool_result,
+            tool_result, display = (
+                self._execute_normal_web_search_tool_with_display(
+                    tool_call.get("name", ""),
+                    tool_call.get("arguments", {}),
+                )
             )
             if provider == "ollama":
                 self.conversation_history.append(
@@ -1415,6 +1460,18 @@ class OmniAgent:
                         display=display,
                     )
                 )
+
+    def _execute_normal_web_search_tool_with_display(self, name, arguments):
+        self.agent_tools.consume_display_payload()
+        result = self._execute_normal_web_search_tool(name, arguments)
+        tool_display = self.agent_tools.consume_display_payload()
+        display = self._tool_display_for_result(
+            name,
+            arguments,
+            result,
+            existing_display=tool_display,
+        )
+        return result, display
 
     def _execute_normal_web_search_tool(self, name, arguments):
         arguments = arguments if isinstance(arguments, dict) else {}
@@ -1986,21 +2043,21 @@ class OmniAgent:
                 for tool_use in tool_uses:
                     if self._agent_should_stop():
                         return self._agent_stopped_response(full_thinking, text)
-                    tool_result = self._execute_normal_web_search_tool(
-                        tool_use.get("name", ""),
-                        tool_use.get("input", {}),
+                    tool_result, display = (
+                        self._execute_normal_web_search_tool_with_display(
+                            tool_use.get("name", ""),
+                            tool_use.get("input", {}),
+                        )
                     )
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_use.get("id", ""),
                         "tool_name": tool_use.get("name", ""),
                         "content": tool_result,
-                        "is_error": tool_result.startswith("ERROR:"),
-                        "display": self._tool_display_for_result(
-                            tool_use.get("name", ""),
-                            tool_use.get("input", {}),
-                            tool_result,
+                        "is_error": tool_result_is_error(
+                            tool_use.get("name", ""), tool_result, display
                         ),
+                        "display": display,
                     })
                 self.conversation_history.append({
                     "role": "user",
@@ -2059,7 +2116,7 @@ class OmniAgent:
             if chunk_type == "content_block_start":
                 content_block = self._get_field(chunk, "content_block")
                 block_type = self._get_field(content_block, "type", "")
-                initial_reasoning = self._anthropic_reasoning_text(content_block)
+                initial_reasoning = self._anthropic_reasoning_text(content_block, clean=False)
                 if block_type == "text":
                     if initial_reasoning:
                         field_thinking += initial_reasoning
@@ -2377,7 +2434,8 @@ class OmniAgent:
                     self.agent_tools.web_search_available,
                     self.agent_tools.skills_available,
                     self.agent_tools.todos_enabled,
-                    extra_definitions=self.agent_tools.subagent_tool_definitions()
+                    extra_definitions=self.agent_tools.plan_tool_definitions()
+                    + self.agent_tools.subagent_tool_definitions()
                     + self.agent_tools.team_tool_definitions(),
                     plan_mode=self.agent_tools.plan_mode,
                 ),
@@ -2442,7 +2500,9 @@ class OmniAgent:
         full_thinking = ""
         final_response = ""
 
-        for round_index in range(1, self.max_agent_rounds + 1):
+        for round_index in range(1, (self.max_agent_rounds * 2) + 1):
+            if round_index > self.agent_round_limit:
+                break
             if self._agent_should_stop():
                 return self._agent_stopped_response(full_thinking, final_response)
             self._prepare_agent_model_round(round_index)
@@ -2476,13 +2536,20 @@ class OmniAgent:
                     self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
-            if self._agent_tool_budget_exceeded(len(tool_calls)):
+            if self._agent_tool_budget_exceeded(tool_calls):
                 message = self._agent_tool_budget_message()
                 for tool_call in tool_calls:
+                    error_result = _error_text(message)
+                    display = self._tool_display_for_result(
+                        tool_call["name"],
+                        tool_call.get("arguments", {}),
+                        error_result,
+                    )
                     self.conversation_history.append(
                         self._ollama_tool_result_message(
                             tool_call["name"],
-                            _error_text(message),
+                            error_result,
+                            display=display,
                         )
                     )
 
@@ -2508,7 +2575,7 @@ class OmniAgent:
                 )
             finish_thinking_round()
 
-        message = f"Agent loop stopped after {self.max_agent_rounds} tool rounds."
+        message = f"Agent loop stopped after {self.agent_round_limit} tool rounds."
         self._separate_after_agent_thinking()
         print_error(message)
         return {"thinking": full_thinking, "response": final_response or message}
@@ -2528,7 +2595,8 @@ class OmniAgent:
                 self.agent_tools.web_search_available,
                 self.agent_tools.skills_available,
                 self.agent_tools.todos_enabled,
-                extra_definitions=self.agent_tools.subagent_tool_definitions()
+                extra_definitions=self.agent_tools.plan_tool_definitions()
+                + self.agent_tools.subagent_tool_definitions()
                 + self.agent_tools.team_tool_definitions(),
                 plan_mode=self.agent_tools.plan_mode,
             ),
@@ -2548,7 +2616,7 @@ class OmniAgent:
             if chunk_type == "content_block_start":
                 content_block = self._get_field(chunk, "content_block")
                 block_type = self._get_field(content_block, "type", "")
-                initial_reasoning = self._anthropic_reasoning_text(content_block)
+                initial_reasoning = self._anthropic_reasoning_text(content_block, clean=False)
                 if block_type == "text":
                     if initial_reasoning:
                         blocks.append({
@@ -2639,17 +2707,22 @@ class OmniAgent:
     def _print_agent_stopped_by_user(self):
         print_warn("Agent stopped by user.")
 
-    def _agent_tool_budget_exceeded(self, requested_tool_calls):
-        return self.agent_tool_calls + requested_tool_calls > self.max_agent_tool_calls
+    def _agent_tool_budget_exceeded(self, tool_calls):
+        requested_tool_calls = sum(
+            1
+            for tool_call in list(tool_calls or [])
+            if str(tool_call.get("name") or "") != SUBMIT_PLAN_TOOL_NAME
+        )
+        return self.agent_tool_calls + requested_tool_calls > self.agent_tool_call_limit
 
     def _agent_tool_budget_message(self):
         summary = self.agent_tools.todo_budget_summary()
         if summary:
             return (
-                f"Agent stopped after {self.max_agent_tool_calls} tool calls.\n"
+                f"Agent stopped after {self.agent_tool_call_limit} tool calls.\n"
                 f"{summary}"
             )
-        return f"Agent stopped after {self.max_agent_tool_calls} tool calls."
+        return f"Agent stopped after {self.agent_tool_call_limit} tool calls."
 
     def _print_agent_round(self, round_index):
         return
@@ -2698,6 +2771,7 @@ class OmniAgent:
         self._separate_after_agent_thinking()
 
     def _prepare_agent_model_round(self, round_index):
+        self.agent_round_index = int(round_index)
         if round_index > 1:
             self._auto_compact_context()
         self._print_agent_round(round_index)
@@ -3954,6 +4028,8 @@ class OmniAgent:
         ]
 
     def _append_agent_final_check_if_needed(self):
+        if self.agent_plan_rejected and self.agent_tools.plan_mode:
+            return False
         if self.agent_tools.has_incomplete_todos():
             signature = self._agent_plan_check_signature()
             if self.agent_plan_check_signature == signature:
@@ -4053,12 +4129,13 @@ class OmniAgent:
         return f"{response}\n\n{note}"
 
     def _execute_agent_tool(self, name, tool_input):
-        self.agent_tool_calls += 1
+        if name != SUBMIT_PLAN_TOOL_NAME:
+            self.agent_tool_calls += 1
         if name == DISPATCH_SUBAGENT_TOOL_NAME:
             self._subagent_dispatch_display = None
             with self._agent_tools_execution_lock:
                 self.agent_tools.set_budget_context(
-                    self.max_agent_tool_calls,
+                    self.agent_tool_call_limit,
                     self.agent_tool_calls,
                 )
                 change_count_before = self.agent_tools.session_change_count()
@@ -4082,13 +4159,15 @@ class OmniAgent:
                     or self.agent_tools.todo_revision() != todo_revision_before
                 ):
                     self.agent_final_check_done = False
-                self.agent_tools.consume_display_payload()
-                self._last_tool_display = self._subagent_dispatch_display
+                tool_display = self.agent_tools.consume_display_payload()
+                self._last_tool_display = (
+                    self._subagent_dispatch_display or tool_display
+                )
                 self._subagent_dispatch_display = None
         else:
             with self._agent_tools_execution_lock:
                 self.agent_tools.set_budget_context(
-                    self.max_agent_tool_calls,
+                    self.agent_tool_call_limit,
                     self.agent_tool_calls,
                 )
                 change_count_before = self.agent_tools.session_change_count()
@@ -4110,7 +4189,33 @@ class OmniAgent:
                 ):
                     self.agent_final_check_done = False
                 self._last_tool_display = self.agent_tools.consume_display_payload()
-        self._track_explored_tool(name, tool_input)
+        if name == SUBMIT_PLAN_TOOL_NAME:
+            decision = self.agent_tools.consume_submitted_plan_approval()
+            if decision is True:
+                self.agent_plan_rejected = False
+                self.agent_round_limit = min(
+                    self.max_agent_rounds * 2,
+                    self.agent_round_index + self.max_agent_rounds,
+                )
+                self.agent_tool_call_limit = (
+                    self.agent_tool_calls + self.max_agent_tool_calls
+                )
+                self.set_plan_mode(False, notify=True)
+            elif decision is False:
+                self.agent_plan_rejected = True
+                self.agent_round_limit = min(
+                    self.max_agent_rounds * 2,
+                    max(self.agent_round_limit, self.agent_round_index + 1),
+                )
+        if tool_result_is_error(name, tool_result, self._last_tool_display):
+            self._last_tool_display = self._tool_display_for_result(
+                name,
+                tool_input,
+                tool_result,
+                existing_display=self._last_tool_display,
+            )
+        else:
+            self._track_explored_tool(name, tool_input)
         # Tool-specific OpenCode-style output limits are applied by AgentTools.
         # The shared context budget remains the final history-level compaction layer.
         return str(tool_result or "")
@@ -4120,10 +4225,19 @@ class OmniAgent:
         self._last_tool_display = None
         return display
 
-    @staticmethod
-    def _tool_display_for_result(name, tool_input, tool_result):
+    def _tool_display_for_result(
+        self, name, tool_input, tool_result, existing_display=None
+    ):
         if not isinstance(tool_input, dict):
             tool_input = {}
+        if tool_result_is_error(name, tool_result, existing_display):
+            if tool_display_is_error(existing_display):
+                return existing_display
+            display = build_tool_error_display(name, tool_input, tool_result)
+            add_tool_error_entry(display)
+            return display
+        if existing_display is not None:
+            return existing_display
         if name == "web_fetch":
             url = str(tool_input.get("url") or "").strip()
             if url:
@@ -4138,8 +4252,6 @@ class OmniAgent:
                     "kind": "web_search",
                     "content": query,
                 }
-        if str(tool_result or "").startswith("ERROR:"):
-            return None
         return None
 
     def _track_explored_tool(self, name, tool_input):
@@ -5029,7 +5141,7 @@ class OmniAgent:
                 if chunk_type == "content_block_start":
                     content_block = self._get_field(chunk, "content_block")
                     block_type = self._get_field(content_block, "type")
-                    initial_reasoning = self._anthropic_reasoning_text(content_block)
+                    initial_reasoning = self._anthropic_reasoning_text(content_block, clean=False)
                     if block_type == "text":
                         block = {"type": "text", "text": ""}
                     elif (
@@ -5634,10 +5746,15 @@ class OmniAgent:
                 "confirmation."
                 "\n- ask_user is available in Build and Plan mode. In Plan mode, use it for short, "
                 "high-impact clarification questions; you may batch a few related questions in one call."
-                "\n- Your final output in Plan mode does not need a rigid format, but it "
-                "should usually make clear: the recommendation or conclusion, why it is "
-                "recommended, concrete implementation steps or a task list, and any points "
-                "that still need user confirmation."
+                "\n- When the final implementation plan is ready, do not present it as a "
+                "normal assistant response. The main Agent must call submit_plan exactly once "
+                "with the complete plan. This displays the plan and asks the user whether to "
+                "allow it. Subagents cannot call submit_plan."
+                "\n- If submit_plan reports approval, Build mode becomes active in the same "
+                "run. Immediately execute the approved plan with Build tools; do not ask the "
+                "user to switch modes, and do not return to Plan mode after execution."
+                "\n- If submit_plan reports rejection, do not implement the plan or make any "
+                "other changes; remain in Plan mode and wait for the user's next instruction."
                 "\n- update_todo is optional in Plan mode. Use it when a concrete execution "
                 "todo list would help the later Build phase; otherwise a clear plan, design, "
                 "or roadmap is enough."
@@ -5939,7 +6056,8 @@ class OmniAgent:
         include_plan = self.agent_tools.todos_enabled
         plan_mode = self.agent_tools.plan_mode
         extra_definitions = (
-            self.agent_tools.subagent_tool_definitions()
+            self.agent_tools.plan_tool_definitions()
+            + self.agent_tools.subagent_tool_definitions()
             + self.agent_tools.team_tool_definitions()
         )
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
@@ -6281,7 +6399,9 @@ class OmniAgent:
         }
 
     def _stream_reasoning_delta(self, delta, current_thinking, raw_thinking):
-        reasoning = self._anthropic_reasoning_text(delta, include_details=False)
+        reasoning = self._anthropic_reasoning_text(
+            delta, clean=False, include_details=False
+        )
         if reasoning:
             raw_thinking += reasoning
             clean_thinking = _clean_reasoning_text(raw_thinking)
@@ -6338,7 +6458,7 @@ class OmniAgent:
         return text
 
     def _anthropic_delta_reasoning_text(self, delta):
-        return self._anthropic_reasoning_text(delta)
+        return self._anthropic_reasoning_text(delta, clean=False)
 
     def _reasoning_details_text(self, details):
         if not details:
@@ -6875,12 +6995,7 @@ def _estimate_text_tokens(text):
 
 
 def _clean_reasoning_text(content):
-    text = str(content or "")
-    text = re.sub(r"<\s*/?\s*think\s*>", "", text, flags=re.IGNORECASE)
-    text = re.sub(
-        r"<\s*/?\s*(?:t|th|thi|thin|think)?\s*$", "", text, flags=re.IGNORECASE
-    )
-    return text.strip()
+    return clean_thinking_text(content)
 
 
 def _combine_reasoning_text(*parts):

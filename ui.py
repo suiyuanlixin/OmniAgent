@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 
 from rich.console import Console
@@ -62,6 +63,148 @@ def clean_display_text_preserve_newlines(text):
     else:
         text = str(text or "")
     return text.strip()
+
+
+def clean_thinking_text(text):
+    text = str(text or "")
+    text = re.sub(r"<\s*/?\s*think\s*>", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _tool_error_single_line(value, max_chars=120):
+    if isinstance(value, (list, tuple)):
+        value = ", ".join(str(item or "") for item in value[:3])
+    elif isinstance(value, dict):
+        value = json.dumps(value, ensure_ascii=False)
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def _tool_error_summary(tool_name, tool_input):
+    name = str(tool_name or "").strip()
+    arguments = tool_input if isinstance(tool_input, dict) else {}
+    if name == "update_todo":
+        items = arguments.get("items")
+        if isinstance(items, list):
+            return f"{len(items)} todo item{'s' if len(items) != 1 else ''}"
+    if name == "dispatch_subagent":
+        tasks = arguments.get("tasks")
+        if isinstance(tasks, list):
+            return f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}"
+    if name == "ask_user":
+        question = arguments.get("question")
+        questions = arguments.get("questions")
+        if not question and isinstance(questions, list) and questions:
+            first = questions[0]
+            if isinstance(first, dict):
+                question = first.get("question")
+        return _tool_error_single_line(question)
+
+    preferred_keys = {
+        "read_file": ("file_path", "reference"),
+        "web_fetch": ("url",),
+        "list_dir": ("path", "reference"),
+        "write_file": ("file_path",),
+        "edit_file": ("file_path",),
+        "apply_patch": ("file_path",),
+        "apply_unified_patch": ("file_path",),
+        "bash": ("command",),
+        "local_http_check": ("root", "paths"),
+        "git_diff": ("file_path",),
+        "grep": ("pattern", "path", "reference"),
+        "glob": ("pattern", "reference"),
+        "read_skill": ("name",),
+        "web_search": ("query",),
+        "report_to_lead": ("kind",),
+        "spawn_teammate": ("teammate_type", "purpose"),
+        "send_message": ("teammate_name", "recipient", "to"),
+        "read_inbox": ("teammate_name",),
+        "shutdown_teammate": ("teammate_name",),
+    }.get(name, ())
+    parts = []
+    for key in preferred_keys:
+        value = _tool_error_single_line(arguments.get(key), max_chars=80)
+        if value and value not in parts:
+            parts.append(value)
+    return _tool_error_single_line(" ".join(parts))
+
+
+def _tool_error_message(tool_name, error):
+    error_text = clean_display_text_preserve_newlines(error)
+    if error_text.startswith("ERROR:"):
+        error_text = error_text[6:].lstrip()
+    name = str(tool_name or "")
+    if name not in {"bash", "git_status", "git_diff"}:
+        return error_text
+    exit_codes = re.findall(r"(?:^|\n)Exit code:\s*(-?\d+)", error_text)
+    if not exit_codes or int(exit_codes[-1]) == 0:
+        return error_text
+    exit_code = int(exit_codes[-1])
+    metadata_match = re.search(
+        r"<shell_metadata>(.*?)</shell_metadata>\s*$",
+        error_text,
+        flags=re.DOTALL,
+    )
+    metadata_details = ""
+    if metadata_match:
+        metadata_lines = [
+            line.strip()
+            for line in metadata_match.group(1).splitlines()
+            if line.strip()
+            and not re.fullmatch(r"Exit code:\s*-?\d+", line.strip())
+        ]
+        metadata_details = "\n".join(metadata_lines)
+        body = error_text[: metadata_match.start()].strip()
+    else:
+        body = re.sub(r"^Exit code:\s*-?\d+\s*", "", error_text).strip()
+    if body == "(no output)":
+        body = ""
+    details = "\n\n".join(part for part in (body, metadata_details) if part)
+    message = f"Command exited with code {exit_code}."
+    return f"{message}\n\n{details}" if details else message
+
+
+def build_tool_error_display(tool_name, tool_input, error):
+    error_text = _tool_error_message(tool_name, error)
+    return {
+        "kind": "tool_error",
+        "tool_name": str(tool_name or "").strip(),
+        "summary": _tool_error_summary(tool_name, tool_input),
+        "error": error_text or "Tool call failed.",
+    }
+
+
+def tool_display_is_error(display):
+    if not isinstance(display, dict):
+        return False
+    kind = str(display.get("kind") or "")
+    status = str(display.get("status") or "").strip().lower()
+    if kind == "tool_error":
+        return True
+    if kind in {"file_edit", "file_write"} and status == "rejected":
+        return True
+    return kind == "team_action" and status in {"error", "failed"}
+
+
+def tool_result_is_error(tool_name, result, display=None):
+    if tool_display_is_error(display):
+        return True
+    if isinstance(display, dict) and str(display.get("error") or "").strip():
+        return True
+    text = str(result or "").strip()
+    if text.startswith("ERROR:"):
+        return True
+    if str(tool_name or "") not in {
+        "bash",
+        "local_http_check",
+        "git_status",
+        "git_diff",
+    }:
+        return False
+    exit_codes = re.findall(r"(?:^|\n)Exit code:\s*(-?\d+)", text)
+    return bool(exit_codes and int(exit_codes[-1]) != 0)
 
 
 def _display_content_block(block):
@@ -156,8 +299,7 @@ def rollback_overflow_replay_scope():
 
 
 def print_stream_thinking_continue(content):
-    while "\n\n" in content:
-        content = content.replace("\n\n", "\n")
+    content = str(content or "")
     if not content:
         return
     bridge = get_bridge()
@@ -223,6 +365,12 @@ def add_todo_entry(items, summary=None):
     bridge = get_bridge()
     if bridge is not None:
         bridge.add_todo_entry(items, summary)
+
+
+def add_tool_error_entry(display):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.add_tool_error_entry(dict(display or {}))
 
 
 def add_web_fetch_entry(url):
@@ -333,6 +481,13 @@ def get_agent_confirmation(title, detail):
     bridge = get_bridge()
     if bridge is not None:
         return bridge.request_confirmation(title, detail)
+    return False
+
+
+def get_agent_plan_confirmation(plan):
+    bridge = get_bridge()
+    if bridge is not None:
+        return bridge.request_plan_confirmation(plan)
     return False
 
 

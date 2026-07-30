@@ -9,7 +9,7 @@ from textual.widgets import Static
 from textual.widget import Widget
 
 from tui.theme import (
-    INFO_BAR_BACKGROUND,
+    SURFACE_BACKGROUND,
     TEXT_MUTED,
     TEXT_PRIMARY,
     render_css,
@@ -42,7 +42,7 @@ class TodoLine(Static):
         background = (
             self.styles.background.hex
             if self.styles.background is not None
-            else INFO_BAR_BACKGROUND
+            else SURFACE_BACKGROUND
         )
 
         text = Text(no_wrap=True, overflow="crop")
@@ -93,28 +93,28 @@ class TodosPanel(Widget):
         width: 100%;
         height: 1;
         background: $PAGE_BACKGROUND;
-        color: $INFO_BAR_BACKGROUND;
+        color: $SURFACE_BACKGROUND;
     }
 
     TodosPanel > #todos-shell > #todos-panel {
         width: 100%;
         height: auto;
         padding: 0;
-        background: $INFO_BAR_BACKGROUND;
+        background: $SURFACE_BACKGROUND;
     }
 
     #todos-header {
         width: 1fr;
         height: 1;
         margin: 0 2;
-        background: $INFO_BAR_BACKGROUND;
+        background: $SURFACE_BACKGROUND;
     }
 
     #todos-summary {
         width: auto;
         height: 1;
         color: $TEXT_PRIMARY;
-        background: $INFO_BAR_BACKGROUND;
+        background: $SURFACE_BACKGROUND;
     }
 
     #todos-current {
@@ -122,7 +122,7 @@ class TodosPanel(Widget):
         min-width: 0;
         height: 1;
         color: $TEXT_MUTED;
-        background: $INFO_BAR_BACKGROUND;
+        background: $SURFACE_BACKGROUND;
         margin-left: 1;
         overflow: hidden;
     }
@@ -133,7 +133,7 @@ class TodosPanel(Widget):
     #todos-header-spacer {
         width: 1fr;
         height: 1;
-        background: $INFO_BAR_BACKGROUND;
+        background: $SURFACE_BACKGROUND;
     }
 
     #todos-toggle {
@@ -141,14 +141,14 @@ class TodosPanel(Widget):
         min-width: 1;
         height: 1;
         color: $TEXT_PRIMARY;
-        background: $INFO_BAR_BACKGROUND;
+        background: $SURFACE_BACKGROUND;
     }
 
     #todos-list {
         width: 1fr;
         height: auto;
-        margin: 0 2;
-        background: $INFO_BAR_BACKGROUND;
+        margin: 1 2 0 2;
+        background: $SURFACE_BACKGROUND;
     }
     #todos-list.hidden {
         display: none;
@@ -158,7 +158,7 @@ class TodosPanel(Widget):
         width: 100%;
         height: 1;
         color: $TEXT_PRIMARY;
-        background: $INFO_BAR_BACKGROUND;
+        background: $SURFACE_BACKGROUND;
     }
     """
     )
