@@ -3,6 +3,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from persistence import atomic_write_text
+
 from search import (
     DEFAULT_WEB_SEARCH_DEPTH,
     DEFAULT_WEB_SEARCH_ENABLE,
@@ -913,10 +915,9 @@ def _sanitize_config(data):
 
 
 def _persist_config(config):
-    path = Path(CONFIG_FILE)
-    path.write_text(
+    atomic_write_text(
+        CONFIG_FILE,
         json.dumps(config.to_dict(), indent=4, ensure_ascii=False) + "\n",
-        encoding="utf-8",
     )
 
 

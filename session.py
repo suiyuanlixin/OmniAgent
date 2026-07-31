@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from persistence import atomic_write_json, atomic_write_text
+
 from ui import (
     clean_display_text,
     print_error,
@@ -47,11 +49,11 @@ def ensure_session_storage():
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     ORPHAN_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     if not PROJECT_INDEX_FILE.exists():
-        PROJECT_INDEX_FILE.write_text("[]\n", encoding="utf-8")
+        atomic_write_text(PROJECT_INDEX_FILE, "[]\n")
     if not PINNED_INDEX_FILE.exists():
-        PINNED_INDEX_FILE.write_text("[]\n", encoding="utf-8")
+        atomic_write_text(PINNED_INDEX_FILE, "[]\n")
     if not PINNED_PROJECT_INDEX_FILE.exists():
-        PINNED_PROJECT_INDEX_FILE.write_text("[]\n", encoding="utf-8")
+        atomic_write_text(PINNED_PROJECT_INDEX_FILE, "[]\n")
 
 
 def normalize_project_path(path_text):
@@ -79,10 +81,7 @@ def _safe_read_json(path, default):
 
 
 def _safe_write_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    atomic_write_json(path, data)
 
 
 def normalize_session_path(session_path):
@@ -424,7 +423,7 @@ def create_session(project=None, title="", model_name=""):
     }
     _safe_write_json(paths["session"], record)
     if not paths["history"].exists():
-        paths["history"].write_text("", encoding="utf-8")
+        atomic_write_text(paths["history"], "")
     return record
 
 
@@ -458,7 +457,7 @@ def save_session_record(record):
     record["history_path"] = str(paths["history"])
     _safe_write_json(paths["session"], record)
     if not paths["history"].exists():
-        paths["history"].write_text("", encoding="utf-8")
+        atomic_write_text(paths["history"], "")
     return record
 
 

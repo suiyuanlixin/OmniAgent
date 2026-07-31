@@ -478,7 +478,6 @@ class AgentTUIApp(App):
 
     @property
     def config(self):
-        self._config_cache = load_config()
         return self._config_cache
 
     @config.setter
@@ -582,6 +581,8 @@ class AgentTUIApp(App):
     def on_unmount(self) -> None:
         self._pause_thinking_elapsed_timer()
         self._thinking_started_at = None
+        if self.chat is not None:
+            self.chat.shutdown()
         clear_bridge()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -2546,7 +2547,7 @@ class AgentTUIApp(App):
         try:
             renamed = rename_model_profile(old_name, new_name)
         except Exception as error:
-            self.add_status_message("[?]", f"?????: {error}")
+            self.add_status_message("[✗]", f"模型重命名失败: {error}")
             return
         self._settings_model_profile_key = renamed
         self._reload_config()
@@ -3745,7 +3746,7 @@ class AgentTUIApp(App):
         try:
             delete_model_profile(target)
         except Exception as error:
-            self.add_status_message("[?]", f"??????: {error}")
+            self.add_status_message("[✗]", f"删除模型失败: {error}")
             return
         self._reload_config()
         config = self.config
@@ -4053,6 +4054,8 @@ class AgentTUIApp(App):
 
     def _clear_loaded_session_state(self, refresh_sidebar: bool = True) -> None:
         self._prompt_request = None
+        if self.chat is not None:
+            self.chat.shutdown()
         self.chat = None
         self.chat_busy = False
         self.current_session_record = None

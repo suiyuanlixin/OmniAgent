@@ -3,6 +3,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from persistence import append_jsonl, atomic_write_text
+
 
 MEMORY_DIR = Path(__file__).resolve().parent / "memory"
 CORE_MEMORY_FILE = "core.md"
@@ -99,8 +101,7 @@ class MemoryStore:
                 if key not in row:
                     row[key] = value
         try:
-            with self.history_path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+            append_jsonl(self.history_path, row)
             return True
         except OSError:
             return False
@@ -615,7 +616,7 @@ class MemoryStore:
 
     def _create_if_missing(self, path, content):
         if not path.exists():
-            path.write_text(content, encoding="utf-8")
+            atomic_write_text(path, content)
 
     def _episode_files(self):
         if not self.episodic_dir.exists():
@@ -684,7 +685,7 @@ class MemoryStore:
         if existing == content:
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        atomic_write_text(path, content)
         return True
 
     def _write_memory_file(self, path, body, max_chars, reason_name):

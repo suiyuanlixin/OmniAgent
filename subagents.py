@@ -460,6 +460,14 @@ class SubagentRunner:
             turn_elapsed_seconds = time.monotonic() - turn_started_at
             if self.parent.thinking_mode:
                 self._record_event({"kind": "thought_end"})
+            if self._should_stop():
+                message = f"ERROR: {self.worker_label} cancelled."
+                self._record_event({
+                    "kind": "message",
+                    "role": "status",
+                    "content": message,
+                })
+                return message
 
             history.append(assistant_message)
             if _thinking and self._streamed_thinking:
@@ -613,6 +621,8 @@ class SubagentRunner:
         raw_content = ""
         tool_parts = {}
         for chunk in response:
+            if self._should_stop():
+                break
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
@@ -645,6 +655,8 @@ class SubagentRunner:
         thinking = self.parent._combine_stream_reasoning_text(
             field_thinking, tagged_thinking
         )
+        if self._should_stop():
+            return {"role": "assistant", "content": content}, thinking, content, []
         assistant_tool_calls, tool_calls = self.parent._chat_stream_tool_calls(
             tool_parts
         )
@@ -667,6 +679,8 @@ class SubagentRunner:
         thinking = ""
         tool_parts = {}
         for chunk in response:
+            if self._should_stop():
+                break
             message = self.parent._get_field(chunk, "message", {}) or {}
             reasoning = self.parent._get_field(message, "thinking", "") or ""
             if reasoning and self.parent.thinking_mode:
@@ -682,6 +696,8 @@ class SubagentRunner:
                 tool_parts,
                 self.parent._get_field(message, "tool_calls", None) or [],
             )
+        if self._should_stop():
+            return {"role": "assistant", "content": content}, thinking, content, []
         assistant_tool_calls, parsed_tools = self.parent._ollama_stream_tool_calls(
             tool_parts
         )
@@ -710,6 +726,8 @@ class SubagentRunner:
         )
 
         for chunk in response:
+            if self._should_stop():
+                break
             chunk_type = self.parent._get_field(chunk, "type", "")
             if chunk_type == "content_block_start":
                 content_block = self.parent._get_field(chunk, "content_block")
@@ -779,6 +797,8 @@ class SubagentRunner:
                         block["input"] = self.parent._parse_tool_arguments(raw_input)
                 active_block_index = None
 
+        if self._should_stop():
+            return {"role": "assistant", "content": []}, "", "", []
         for block in blocks:
             block.pop("_input_json", None)
         thinking, text, tool_uses = self.parent._parse_anthropic_blocks(blocks)

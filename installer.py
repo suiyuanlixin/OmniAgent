@@ -13,6 +13,9 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 
+from persistence import atomic_write_json
+from skills import normalize_concrete_version
+
 
 DEFAULT_CLAWHUB_REGISTRY = "https://clawhub.ai"
 DEFAULT_SKILLHUB_REGISTRY = "https://api.skillhub.cn"
@@ -317,14 +320,14 @@ def install_registry_skill(
     except SkillInstallError:
         registry_info = None
     else:
-        registry_version = _normalize_concrete_version(registry_info.get("version"))
+        registry_version = normalize_concrete_version(registry_info.get("version"))
 
     archive = _download_skill_archive(provider, slug, version, registry)
     archive_sha256 = hashlib.sha256(archive).hexdigest()
     bundle = _validated_skill_archive(archive)
     warnings = _security_warnings_from_texts(bundle["texts"], bundle["files"])
     resolved_version = (
-        _normalize_concrete_version(bundle.get("version")) or registry_version or ""
+        normalize_concrete_version(bundle.get("version")) or registry_version or ""
     )
 
     if dry_run:
@@ -736,10 +739,7 @@ def _write_origin(
         "installed_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "files": files,
     }
-    (origin_dir / "origin.json").write_text(
-        json.dumps(origin, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    atomic_write_json(origin_dir / "origin.json", origin, trailing_newline=False)
 
 
 def _update_lock(
@@ -770,9 +770,7 @@ def _update_lock(
         "archive_sha256": archive_sha256,
         "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
-    lock_path.write_text(
-        json.dumps(lock, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    atomic_write_json(lock_path, lock, trailing_newline=False)
 
 
 def _registry_value(provider, registry):
@@ -862,14 +860,7 @@ def _version_from_meta_json(text):
         return ""
     if not isinstance(data, dict):
         return ""
-    return _normalize_concrete_version(data.get("version"))
-
-
-def _normalize_concrete_version(value):
-    text = str(value or "").strip()
-    if not text or text.lower() == "latest":
-        return ""
-    return text
+    return normalize_concrete_version(data.get("version"))
 
 
 def _single_line(text, max_chars):

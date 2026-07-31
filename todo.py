@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from persistence import append_jsonl, atomic_write_json
+
 
 TODO_STATUS_PENDING = "pending"
 TODO_STATUS_IN_PROGRESS = "in_progress"
@@ -36,17 +38,6 @@ PRIORITY_RANK = {
     TODO_PRIORITY_P1: 1,
     TODO_PRIORITY_P2: 2,
     TODO_PRIORITY_P3: 3,
-}
-
-TODO_APPROVAL_NOT_REQUIRED = "not_required"
-TODO_APPROVAL_PENDING = "pending"
-TODO_APPROVAL_APPROVED = "approved"
-TODO_APPROVAL_REJECTED = "rejected"
-VALID_TODO_APPROVAL_STATES = {
-    TODO_APPROVAL_NOT_REQUIRED,
-    TODO_APPROVAL_PENDING,
-    TODO_APPROVAL_APPROVED,
-    TODO_APPROVAL_REJECTED,
 }
 
 FINAL_VERIFICATION_TODO_ID = "final-verification"
@@ -141,8 +132,6 @@ class TodoStore:
         self.todo_dir = None
         self.current_todo_path = None
         self.events_path = None
-        self.approval_state = TODO_APPROVAL_NOT_REQUIRED
-        self.approval_note = ""
         self.todo_signature = ""
         self._loading = False
         self.set_todo_dir(todo_dir, load=True)
@@ -165,12 +154,10 @@ class TodoStore:
         self._notify()
 
     def clear(self):
-        if not self.items and self.approval_state == TODO_APPROVAL_NOT_REQUIRED:
+        if not self.items:
             return
         old_items = self._copy_items()
         self.items = []
-        self.approval_state = TODO_APPROVAL_NOT_REQUIRED
-        self.approval_note = ""
         self.todo_signature = ""
         self.revision += 1
         self._record_event(
@@ -182,13 +169,8 @@ class TodoStore:
 
     def update(self, todos):
         old_items = self._copy_items()
-        old_approval_state = self.approval_state
         items = self._items_from_todos(todos)
-        items = _preserve_approved_todo_items(
-            items,
-            old_items,
-            old_approval_state,
-        )
+        items = _preserve_active_todo_items(items, old_items)
 
         if items:
             existing_ids = {item.id for item in items}
@@ -200,17 +182,10 @@ class TodoStore:
 
         self.items = items
         self.todo_signature = _todo_signature(items)
-        self._refresh_approval_state(False)
         self.revision += 1
-        self._record_update_events(old_items, old_approval_state)
+        self._record_update_events(old_items)
         self._persist()
         self._notify()
-
-    def approve_todos(self, note="", source="user"):
-        return False
-
-    def reject_todos(self, reason="", source="user"):
-        return False
 
     def retry_todo(self, todo_id, reason=""):
         item = self._find_item(todo_id)
@@ -230,7 +205,7 @@ class TodoStore:
         item.reason = ""
         item.verified = False
         item.verification_note = ""
-        self.approval_note = _single_line(
+        note = _single_line(
             reason or f"Todo item '{todo_id}' retried from {previous}.",
             240,
         )
@@ -241,7 +216,7 @@ class TodoStore:
                 "id": item.id,
                 "from_status": previous,
                 "to_status": item.status,
-                "reason": self.approval_note,
+                "reason": note,
             },
         )
         self._persist()
@@ -256,14 +231,14 @@ class TodoStore:
             raise ValueError(f"Todo item '{todo_id}' is {item.status}, not blocked.")
         item.status = TODO_STATUS_PENDING
         item.reason = ""
-        self.approval_note = _single_line(
+        note = _single_line(
             reason or f"Todo item '{todo_id}' unblocked.",
             240,
         )
         self.revision += 1
         self._record_event(
             "todo_item_unblocked",
-            {"id": item.id, "to_status": item.status, "reason": self.approval_note},
+            {"id": item.id, "to_status": item.status, "reason": note},
         )
         self._persist()
         self._notify()
@@ -308,9 +283,6 @@ class TodoStore:
             for item in self.items
         )
 
-    def needs_action_approval(self):
-        return False
-
     def incomplete_items(self):
         return [item for item in self.items if item.status != TODO_STATUS_COMPLETED]
 
@@ -338,8 +310,6 @@ class TodoStore:
             "has_unverified_completed_criteria": self.has_unverified_completed_criteria(),
             "all_completed": self.all_completed(),
             "revision": self.revision,
-            "approval_state": self.approval_state,
-            "approval_note": self.approval_note,
             "todo_path": str(self._snapshot_source_path() or ""),
             "events_path": str(self._events_source_path() or ""),
             "quality_warnings": self.quality_warnings(
@@ -421,12 +391,8 @@ class TodoStore:
         in_progress = [
             item for item in non_system if item.status == TODO_STATUS_IN_PROGRESS
         ]
-        if (
-            actionable
-            and self.approval_state == TODO_APPROVAL_APPROVED
-            and not in_progress
-        ):
-            warnings.append("Approved active todo list has no in_progress item.")
+        if actionable and not in_progress:
+            warnings.append("Active todo list has no in_progress item.")
 
         generated_ids = [
             item.id for item in non_system if item.id.startswith(("step-", "todo-"))
@@ -646,10 +612,6 @@ class TodoStore:
         _validate_single_in_progress(items)
         return items
 
-    def _refresh_approval_state(self, structure_changed):
-        self.approval_state = TODO_APPROVAL_NOT_REQUIRED
-        self.approval_note = ""
-
     def _remove_final_verification_todo(self):
         next_items = [
             item for item in self.items if item.id != FINAL_VERIFICATION_TODO_ID
@@ -732,8 +694,6 @@ class TodoStore:
             "version": 2,
             "updated_at": _utc_now(),
             "revision": self.revision,
-            "approval_state": self.approval_state,
-            "approval_note": self.approval_note,
             "todo_signature": self.todo_signature,
             "items": self.to_dicts(),
             "quality_warnings": self.quality_warnings(),
@@ -743,13 +703,11 @@ class TodoStore:
         if self._loading or not self.current_todo_path:
             return
         try:
-            self.todo_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.current_todo_path.with_suffix(".json.tmp")
-            tmp_path.write_text(
-                json.dumps(self._snapshot(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            atomic_write_json(
+                self.current_todo_path,
+                self._snapshot(),
+                trailing_newline=False,
             )
-            tmp_path.replace(self.current_todo_path)
         except OSError:
             return
 
@@ -766,8 +724,6 @@ class TodoStore:
             _validate_dependencies(items)
             self.items = items
             self.revision = int(data.get("revision") or 0)
-            self.approval_state = TODO_APPROVAL_NOT_REQUIRED
-            self.approval_note = ""
             self.todo_signature = str(
                 data.get("todo_signature")
                 or data.get("plan_signature")
@@ -776,14 +732,12 @@ class TodoStore:
         except Exception:
             self.items = []
             self.revision = 0
-            self.approval_state = TODO_APPROVAL_NOT_REQUIRED
-            self.approval_note = ""
             self.todo_signature = ""
         finally:
             self._loading = False
         self._notify()
 
-    def _record_update_events(self, old_items, old_approval_state):
+    def _record_update_events(self, old_items):
         old_by_id = {item.id: item for item in old_items}
         new_by_id = {item.id: item for item in self.items}
 
@@ -813,16 +767,6 @@ class TodoStore:
                     {"id": item.id, "item": item.to_dict()},
                 )
 
-        if old_approval_state != self.approval_state:
-            self._record_event(
-                "todo_approval_changed",
-                {
-                    "from": old_approval_state,
-                    "to": self.approval_state,
-                    "note": self.approval_note,
-                },
-            )
-
     def _record_event(self, event_type, payload):
         if self._loading or not self.events_path:
             return
@@ -833,9 +777,7 @@ class TodoStore:
             "payload": payload or {},
         }
         try:
-            self.todo_dir.mkdir(parents=True, exist_ok=True)
-            with self.events_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            append_jsonl(self.events_path, event)
         except OSError:
             return
 
@@ -883,16 +825,7 @@ def _validate_dependencies(items):
             )
 
 
-def _requires_todo_approval(
-    old_items,
-    new_items,
-    old_approval_state,
-    structure_changed,
-):
-    return False
-
-
-def _preserve_approved_todo_items(items, old_items, old_approval_state):
+def _preserve_active_todo_items(items, old_items):
     if not any(
         item.status in ACTIONABLE_TODO_STATUSES and not item.system
         for item in old_items
@@ -964,36 +897,6 @@ def _validate_single_in_progress(items):
         raise ValueError("Only one todo item can be in_progress at a time.")
 
 
-def _hold_unapproved_progress(
-    items,
-    old_items,
-    old_approval_state,
-    approval_required,
-):
-    if not approval_required:
-        return
-
-    old_by_id = {item.id: item for item in old_items}
-    for item in items:
-        if item.system or item.status not in {
-            TODO_STATUS_IN_PROGRESS,
-            TODO_STATUS_COMPLETED,
-        }:
-            continue
-
-        old_item = old_by_id.get(item.id)
-        if (
-            old_approval_state == TODO_APPROVAL_APPROVED
-            and old_item is not None
-            and old_item.status == TODO_STATUS_COMPLETED
-        ):
-            continue
-
-        item.status = TODO_STATUS_PENDING
-        item.verified = False
-        item.verification_note = ""
-
-
 def _normalize_todo_status(status):
     value = str(status or TODO_STATUS_PENDING).strip().lower().replace(" ", "_")
     value = STATUS_ALIASES.get(value, value)
@@ -1007,13 +910,6 @@ def _normalize_todo_priority(priority):
     value = PRIORITY_ALIASES.get(value, value)
     if value not in VALID_TODO_PRIORITIES:
         return DEFAULT_TODO_PRIORITY
-    return value
-
-
-def _normalize_approval_state(state):
-    value = str(state or TODO_APPROVAL_NOT_REQUIRED).strip().lower()
-    if value not in VALID_TODO_APPROVAL_STATES:
-        return TODO_APPROVAL_NOT_REQUIRED
     return value
 
 

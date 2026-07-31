@@ -2516,7 +2516,6 @@ class _LeadingBlankTrimmedMarkdown:
         while lines and self._is_unstyled_blank_line(lines[0]):
             lines.pop(0)
         self._halve_code_block_padding(lines)
-        self._remove_code_block_outer_blank_lines(lines)
         for line in lines:
             for segment in line:
                 yield self._with_foreground_color(segment)
@@ -2626,35 +2625,6 @@ class _LeadingBlankTrimmedMarkdown:
             },
         )
         return [Segment(glyph * width, style)]
-
-    @classmethod
-    def _remove_code_block_outer_blank_lines(cls, lines) -> None:
-        index = 0
-        while index < len(lines):
-            if (
-                cls._is_unstyled_blank_line(lines[index])
-                and index + 1 < len(lines)
-                and cls._code_padding_edge(lines[index + 1]) == "top"
-            ):
-                lines.pop(index)
-                continue
-            if (
-                cls._code_padding_edge(lines[index]) == "bottom"
-                and index + 1 < len(lines)
-                and cls._is_unstyled_blank_line(lines[index + 1])
-            ):
-                lines.pop(index + 1)
-                continue
-            index += 1
-
-    @staticmethod
-    def _code_padding_edge(line) -> str:
-        for segment in line:
-            style = segment.style
-            meta = getattr(style, "meta", None) if style is not None else None
-            if meta and meta.get("omniagent_code_padding_half"):
-                return str(meta.get("omniagent_code_padding_edge") or "")
-        return ""
 
 
 class MarkdownMessageStatic(Static, can_focus=True):

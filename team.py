@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from persistence import append_jsonl, atomic_write_json, atomic_write_text
+
 from subagents import SubagentRunner
 
 TEAM_STORE_DIR = ".omniagent" / Path("team")
@@ -508,11 +510,7 @@ class TeamStore:
         cp = self.config_path
         if cp is None:
             return
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        atomic_write_json(cp, data)
 
     def save_spec(
         self,
@@ -920,8 +918,7 @@ class TeamStore:
         if report_kind:
             entry["report_kind"] = str(report_kind)
         with self._lock:
-            with open(str(inbox_path), "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            append_jsonl(inbox_path, entry)
         target = "lead" if resolved_to == "lead" else display_teammate_name(resolved_to)
         return f"Message sent to '{target}'."
 
@@ -939,7 +936,7 @@ class TeamStore:
             except (json.JSONDecodeError, OSError):
                 return []
             if clear and messages:
-                inbox_path.write_text("", encoding="utf-8")
+                atomic_write_text(inbox_path, "")
             return messages
 
     @_synchronized
@@ -968,9 +965,10 @@ class TeamStore:
         self.ensure_dirs()
         resolved = self.resolve_name(name)
         thread_path = self.threads_dir / f"{resolved}.jsonl"
-        with open(str(thread_path), "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        content = "".join(
+            json.dumps(message, ensure_ascii=False) + "\n" for message in messages
+        )
+        atomic_write_text(thread_path, content)
 
     @_synchronized
     def load_thread(self, name: str) -> list[dict[str, Any]]:

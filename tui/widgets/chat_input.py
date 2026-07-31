@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from time import perf_counter
 from textual import events
@@ -1997,7 +1998,8 @@ class ChatInput(Widget):
             await_remove = container.remove_children()
             self._update_dropdown_trigger(prefix, normalized, selected_value)
             self.run_worker(
-                self._remount_dropdown_after_remove(
+                partial(
+                    self._remount_dropdown_after_remove,
                     prefix,
                     normalized,
                     str(selected_value or ""),

@@ -1,6 +1,5 @@
 __pycache__/
 .venv/
-record/
 memory/
 sessions/
 config.json
@@ -9,3 +8,4 @@ skills/
 .clawhub/
 .skillhub/
 .omniagent/
+.claude/

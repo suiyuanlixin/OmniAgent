@@ -7,7 +7,6 @@ import queue
 import os
 import re
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -36,6 +35,7 @@ from output import (
     is_tool_output_path,
     resolve_artifact_uri,
 )
+from processes import process_group_options, terminate_process_tree
 from todo import TodoStore
 from skills import SkillRegistry
 from ui import (
@@ -984,7 +984,6 @@ class AgentTools:
         web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
         web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
         todo_update_callback=None,
-        todo_approval_output_callback=None,
         todos_enabled=True,
         skills_enabled=True,
         skills_app_enabled=True,
@@ -995,8 +994,7 @@ class AgentTools:
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
         self.visible_output_callback = visible_output_callback
-        self.todo_approval_output_callback = todo_approval_output_callback
-        self.todos_enabled = True
+        self.todos_enabled = bool(todos_enabled)
         self.plan_mode = bool(plan_mode)
         self.stop_requested_callback = stop_requested_callback
         self._tool_output_view_cache = OrderedDict()
@@ -1081,7 +1079,10 @@ class AgentTools:
         self.todo_store.set_on_change(callback if self.todos_enabled else None)
 
     def set_todos_enabled(self, enabled):
-        self.todos_enabled = True
+        self.todos_enabled = bool(enabled)
+        self.todo_store.set_on_change(
+            self.todo_update_callback if self.todos_enabled else None
+        )
 
     def set_plan_mode(self, enabled):
         self.plan_mode = bool(enabled)
@@ -1602,12 +1603,6 @@ class AgentTools:
 
     def todo_history(self, limit=20):
         return self.todo_store.history_tail(limit)
-
-    def approve_todos(self, note=""):
-        return self.todo_store.approve_todos(note=note, source="user")
-
-    def reject_todos(self, reason=""):
-        return self.todo_store.reject_todos(reason=reason, source="user")
 
     def retry_todo(self, todo_id, reason=""):
         return self.todo_store.retry_todo(todo_id, reason=reason)
@@ -2696,10 +2691,7 @@ class AgentTools:
             "errors": "replace",
             "bufsize": 1,
         }
-        if os.name == "nt":
-            popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            popen_options["start_new_session"] = True
+        popen_options.update(process_group_options())
         process = subprocess.Popen(command, **popen_options)
         writer = ToolOutputWriter()
         reader_error = []
@@ -2739,53 +2731,9 @@ class AgentTools:
         deadline = time.monotonic() + timeout_seconds
         return_code = None
 
-        def kill_process_tree():
-            if process.poll() is not None:
-                return True, "process already exited"
-            if os.name == "nt":
-                try:
-                    completed = subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                        timeout=5,
-                    )
-                    if completed.returncode == 0 or process.poll() is not None:
-                        return True, "taskkill completed"
-                    return False, f"taskkill exited with code {completed.returncode}"
-                except Exception as error:
-                    return False, f"taskkill failed: {error}"
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-                return True, "process group kill requested"
-            except ProcessLookupError:
-                return True, "process already exited"
-            except Exception as error:
-                return False, f"process group kill failed: {error}"
-
         def terminate_bounded():
-            tree_ok, detail = kill_process_tree()
-            forced = False
-            try:
-                code = process.wait(timeout=3)
-                return code, ("terminated" if tree_ok else "terminated-after-tree-error"), detail
-            except subprocess.TimeoutExpired:
-                forced = True
-            except Exception as error:
-                detail = f"{detail}; wait failed: {error}"
-                forced = True
-            if forced:
-                try:
-                    process.kill()
-                except Exception as error:
-                    detail = f"{detail}; force-kill failed: {error}"
-                try:
-                    code = process.wait(timeout=3)
-                    return code, "force-killed", detail
-                except Exception as error:
-                    detail = f"{detail}; exit could not be confirmed: {error}"
-                    return process.poll(), "unconfirmed", detail
+            result = terminate_process_tree(process)
+            return result.return_code, result.status, result.detail
 
         try:
             while True:
@@ -2960,6 +2908,7 @@ class AgentTools:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **process_group_options(),
         )
 
         try:
@@ -3883,6 +3832,7 @@ class AgentTools:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                **process_group_options(),
             )
         except FileNotFoundError:
             return "Exit code: 127\nERROR: git executable was not found."
@@ -3939,10 +3889,8 @@ class AgentTools:
         while len(completed_streams) < 2 or not events.empty():
             if time.monotonic() >= deadline and process.poll() is None:
                 timed_out = True
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+                terminate_process_tree(process)
+                reader_stop.set()
             try:
                 label, chunk = events.get(timeout=0.05)
             except queue.Empty:
@@ -3957,10 +3905,7 @@ class AgentTools:
                 if not writer.write("\n[stderr]\n"):
                     storage_limited = True
                     reader_stop.set()
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
+                    terminate_process_tree(process)
                     break
                 stderr_started = True
             if not writer.write(chunk):
@@ -3975,14 +3920,7 @@ class AgentTools:
         try:
             return_code = process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            try:
-                process.kill()
-            except Exception:
-                pass
-            try:
-                return_code = process.wait(timeout=2)
-            except Exception:
-                return_code = process.poll()
+            return_code = terminate_process_tree(process).return_code
         reader_stop.set()
         for stream in (process.stdout, process.stderr):
             if stream is not None:
@@ -4085,12 +4023,6 @@ class AgentTools:
         if self.visible_output_callback:
             self.visible_output_callback()
         self.output_needs_separator = True
-
-    def _before_todo_approval_output(self):
-        if self.todo_approval_output_callback:
-            self.todo_approval_output_callback()
-        elif self.visible_output_callback:
-            self.visible_output_callback()
 
     def _auto_approves(self, risk_reason):
         if self.approval_mode == AGENT_APPROVAL_FULL:
@@ -4724,17 +4656,14 @@ def _request_http_status(url, timeout_seconds):
 def _terminate_process(process):
     if process is None:
         return
-    if process.poll() is None:
-        process.terminate()
+    terminate_process_tree(process, wait_seconds=2)
+    for stream in (process.stdout, process.stderr, process.stdin):
+        if stream is None:
+            continue
         try:
-            _communicate_process(process, 2)
-            return
-        except subprocess.TimeoutExpired:
-            process.kill()
-    try:
-        _communicate_process(process, 2)
-    except subprocess.TimeoutExpired:
-        pass
+            stream.close()
+        except OSError:
+            pass
 
 
 def _communicate_process(process, timeout):
