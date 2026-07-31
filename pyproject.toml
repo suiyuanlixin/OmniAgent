@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omniagent"
+dynamic = ["version", "dependencies"]
+description = "A local AI Agent workspace built with Python, Textual, and Rich."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+[project.scripts]
+omniagent = "omniagent.main:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "omniagent.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -41,7 +41,7 @@ Windows PowerShell：
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -e .
 ```
 
 macOS / Linux：
@@ -49,7 +49,7 @@ macOS / Linux：
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## 快速开始
@@ -57,8 +57,10 @@ pip install -r requirements.txt
 启动程序：
 
 ```bash
-python main.py
+python -m omniagent
 ```
+
+安装后也可以直接运行 `omniagent`。
 
 说明：
 
@@ -69,7 +71,7 @@ python main.py
 
 ## 配置
 
-当前配置文件为仓库根目录下的 `config.json`。程序实际使用的是“全局设置 + 多模型档案”结构，而不是旧版单模型平铺格式。
+源码检出环境中的配置文件仍为仓库根目录下的 `config.json`；通过普通安装运行时，默认使用 `~/.omniagent/config.json`。可通过 `OMNIAGENT_HOME` 环境变量指定统一的本地数据目录。程序实际使用的是“全局设置 + 多模型档案”结构，而不是旧版单模型平铺格式。
 
 示例：
 
@@ -419,6 +421,8 @@ Skills 是给 Agent 使用的可复用工作流说明，不直接执行脚本，
 
 ## 记忆、会话与本地数据
 
+源码检出环境继续使用仓库根目录保存本地数据；普通安装环境默认使用 `~/.omniagent/`。设置 `OMNIAGENT_HOME` 可以覆盖该位置。以下相对路径均以这个本地数据目录为基准。
+
 ### 持久记忆
 
 程序会在 `memory/` 下维护长期记忆：
@@ -472,7 +476,7 @@ sessions/
 
 ## 自定义提示词
 
-首次运行会生成 `prompt.md`。你可以把个人提示词、回复风格、角色设定写在其中。该文件会在每次模型请求前读取，并同时影响普通聊天与 Agent 模式。
+首次运行会在本地数据目录生成 `prompt.md`。你可以把个人提示词、回复风格、角色设定写在其中。该文件会在每次模型请求前读取，并同时影响普通聊天与 Agent 模式。
 
 `prompt.md` 已被 `.gitignore` 忽略，适合保存只在本机使用的长期提示词。
 
@@ -480,44 +484,47 @@ sessions/
 
 ```text
 OmniAgent/
+├── pyproject.toml           # 构建、安装与命令行入口
+├── requirements.txt        # 锁定的运行依赖
 ├── README.md
-├── requirements.txt
-├── main.py                  # 程序入口与外部引用处理
-├── chat.py                  # 对话引擎、模型调用、Agent 主循环
-├── config.py                # 配置模型、全局设置与持久化
-├── commands.py              # 斜杠命令定义
-├── tools.py                 # Agent 工具定义与执行器
-├── search.py                # Tavily 搜索封装
-├── memory.py                # 持久记忆与历史
-├── session.py               # 会话与项目索引存储
-├── todo.py                  # Todo 状态与快照
-├── references.py            # 文件 / 文件夹引用解析
-├── skills.py                # Skills 加载与读取
-├── installer.py             # Skills 安装器
-├── subagents.py             # 子智能体注册与限制
-├── team.py                  # Team 模式与 teammate 管理
-├── ui.py                    # 控制台展示辅助
-└── tui/
-    ├── __main__.py          # `python -m tui` 入口
-    ├── app.py               # Textual 主应用
-    ├── theme.py             # 主题与 CSS 生成
-    ├── runtime.py           # TUI / console bridge
-    └── widgets/             # 输入框、聊天区、侧边栏、设置页、Todo 面板等组件
+└── src/
+    └── omniagent/
+        ├── __init__.py
+        ├── __main__.py      # `python -m omniagent` 入口
+        ├── paths.py         # 源码根目录与本地数据目录解析
+        ├── main.py          # 应用入口与外部引用处理
+        ├── chat.py          # 对话引擎、模型调用、Agent 主循环
+        ├── config.py        # 配置模型、全局设置与持久化
+        ├── commands.py      # 斜杠命令定义
+        ├── tools.py         # Agent 工具定义与执行器
+        ├── output.py        # Artifact 与工具输出处理
+        ├── search.py        # Tavily 搜索封装
+        ├── memory.py        # 持久记忆与历史
+        ├── session.py       # 会话与项目索引存储
+        ├── todo.py          # Todo 状态与快照
+        ├── references.py    # 文件 / 文件夹引用解析
+        ├── skills.py        # Skills 加载与读取
+        ├── installer.py     # Skills 安装器
+        ├── subagents.py     # 子智能体注册与限制
+        ├── team.py          # Team 模式与 teammate 管理
+        ├── ui.py            # 控制台展示辅助
+        └── tui/
+            ├── __main__.py  # `python -m omniagent.tui` 入口
+            ├── app.py       # Textual 主应用
+            ├── theme.py     # 主题与 CSS 生成
+            ├── runtime.py   # TUI / console bridge
+            └── widgets/     # 输入框、聊天区、设置页、Todo 面板等组件
 ```
 
 ## 开发说明
 
-当前仓库以 `requirements.txt` + 手动运行为主，未提供：
-
-- `pyproject.toml`
-- 自动化测试目录
-- 仓库级 `pytest` / `ruff` / `black` / `mypy` 配置
+当前仓库使用 `pyproject.toml` + `src` 包结构，并保留锁定依赖的 `requirements.txt`。当前仍未提供自动化测试目录和仓库级 `pytest` / `ruff` / `black` / `mypy` 配置。
 
 推荐开发流程：
 
 ```bash
-pip install -r requirements.txt
-python main.py
+pip install -e .
+python -m omniagent
 ```
 
 修改后重点手动验证：
