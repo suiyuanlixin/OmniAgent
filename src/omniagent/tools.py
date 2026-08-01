@@ -1297,7 +1297,9 @@ class AgentTools:
                 "Use list_teammates and read_inbox to coordinate and collect results. Use this to parallelize "
                 "work across different roles. Use implementer for application code and devops "
                 "for CI, Docker, deployment, build, environment, or infrastructure work. "
-                "Writing teammates require an explicit write_scope.\n\n"
+                "Writing teammates require an explicit write_scope. If the requested scope "
+                "overlaps an active owner, the task waits and starts automatically after the "
+                "scope is released.\n\n"
                 "Available teammate types:\n"
                 f"{store.describe() if store else ''}"
             ),

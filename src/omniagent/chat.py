@@ -21,6 +21,7 @@ from .ui import (
     commit_overflow_replay_scope,
     finish_compaction_entry,
     finish_team_entry,
+    update_team_entry_status,
     finish_thinking_round,
     print_error,
     print_info,
@@ -4614,14 +4615,14 @@ class OmniAgent:
                     record
                     for record in self._team_tasks.values()
                     if record.get("teammate_name") == resolved_name
-                    and record.get("status") in {"starting", "running", "cancelling"}
+                    and record.get("status") in ACTIVE_TEAMMATE_STATUSES
                 ),
                 None,
             )
             if existing is not None:
                 return {
                     "result": _error_text(
-                        f"Teammate '{spec.name}' already has a running task "
+                        f"Teammate '{spec.name}' already has an active task "
                         f"({existing.get('task_id', '')})."
                     ),
                     "display": None,
@@ -4657,31 +4658,56 @@ class OmniAgent:
             "status": "starting",
             "write_scope": tuple(write_scope),
             "report_count": 0,
+            "prelude_transcript": [],
             "stop_event": stop_event,
             "display": display,
             "thread": None,
         }
         try:
             with self._team_tasks_lock:
-                self.team_store.start_task(
+                task_state = self.team_store.start_task(
                     spec.name,
                     task_id=task_id,
                     task=label,
                     write_scope=write_scope,
                 )
+                initial_status = str(task_state.get("status") or "running")
+                record["status"] = initial_status
+                display["status"] = initial_status
                 self._team_tasks[task_id] = record
         except ValueError as error:
             return {"result": _error_text(str(error)), "display": None}
         self._before_agent_visible_output()
-        start_team_entry(task_id, spec.name, spec.role, label, task_id)
+        start_team_entry(
+            task_id, spec.name, spec.role, label, task_id, status=initial_status
+        )
+        if initial_status == "waiting":
+            waiting_for = task_state.get("waiting_for") or {}
+            owner = str(waiting_for.get("name") or "another teammate")
+            owner_role = str(waiting_for.get("role") or "writer")
+            owner_scope = ", ".join(waiting_for.get("write_scope") or ())
+            wait_event = {
+                "kind": "message",
+                "role": "status",
+                "content": (
+                    f"Waiting for write scope held by {owner} ({owner_role}): "
+                    f"{owner_scope}."
+                ),
+            }
+            record["prelude_transcript"].append(dict(wait_event))
+            display["transcript"].append(dict(wait_event))
+            append_team_event(task_id, wait_event)
         worker = threading.Thread(
-            target=self._run_teammate_task,
+            target=(
+                self._run_waiting_teammate_task
+                if initial_status == "waiting"
+                else self._run_teammate_task
+            ),
             args=(record, spec, teammate_task),
             name=f"omniagent-team-{resolved_name}-{task_id[:8]}",
             daemon=True,
         )
         record["thread"] = worker
-        record["status"] = "running"
         try:
             worker.start()
         except Exception as error:
@@ -4702,6 +4728,17 @@ class OmniAgent:
                 pass
             finish_team_entry(task_id, "failed", record["result"])
             return {"result": record["result"], "display": display}
+        if initial_status == "waiting":
+            waiting_for = task_state.get("waiting_for") or {}
+            owner = str(waiting_for.get("name") or "another teammate")
+            return {
+                "result": (
+                    f"Teammate '{spec.name}' queued background task {task_id}; "
+                    f"waiting for write scope held by {owner}. "
+                    "It will start automatically when the scope is released."
+                ),
+                "display": display,
+            }
         return {
             "result": (
                 f"Teammate '{spec.name}' started background task {task_id}. "
@@ -4773,41 +4810,130 @@ class OmniAgent:
             if runner is not None:
                 transcript = list(runner.transcript)
 
+        self._complete_teammate_task(
+            record,
+            spec,
+            status=status,
+            result=str(result or ""),
+            error_text=error_text,
+            transcript=transcript,
+        )
+
+    def _run_waiting_teammate_task(self, record, spec, teammate_task):
+        task_id = str(record.get("task_id") or "")
+        stop_event = record.get("stop_event")
+        cancelled_result = "Task cancelled while waiting for write_scope ownership."
+        while stop_event is None or not stop_event.is_set():
+            try:
+                with self._agent_tools_execution_lock:
+                    activated = self.team_store.try_activate_task(
+                        spec.name, task_id=task_id
+                    )
+                if activated:
+                    activation_event = {
+                        "kind": "message",
+                        "role": "status",
+                        "content": "Write scope acquired; starting queued task.",
+                    }
+                    with self._team_tasks_lock:
+                        record["status"] = "running"
+                        display = record.get("display") or {}
+                        display["status"] = "running"
+                        record.setdefault("prelude_transcript", []).append(
+                            dict(activation_event)
+                        )
+                        display.setdefault("transcript", []).append(
+                            dict(activation_event)
+                        )
+                    update_team_entry_status(task_id, "running")
+                    append_team_event(task_id, activation_event)
+                    if stop_event is not None and stop_event.is_set():
+                        self._complete_teammate_task(
+                            record,
+                            spec,
+                            status="cancelled",
+                            result=cancelled_result,
+                            error_text=cancelled_result,
+                            transcript=[],
+                        )
+                        return
+                    self._run_teammate_task(record, spec, teammate_task)
+                    return
+            except Exception as error:
+                error_text = format_worker_request_error(
+                    f"Teammate '{spec.name}'", error
+                )
+                self._complete_teammate_task(
+                    record,
+                    spec,
+                    status="failed",
+                    result=_error_text(error_text),
+                    error_text=error_text,
+                    transcript=[],
+                )
+                return
+            if stop_event is None:
+                time.sleep(0.1)
+            else:
+                stop_event.wait(0.1)
+        self._complete_teammate_task(
+            record,
+            spec,
+            status="cancelled",
+            result=cancelled_result,
+            error_text=cancelled_result,
+            transcript=[],
+        )
+
+    def _complete_teammate_task(
+        self,
+        record,
+        spec,
+        *,
+        status,
+        result,
+        error_text="",
+        transcript=None,
+    ):
+        task_id = str(record.get("task_id") or "")
+        transcript = list(transcript or [])
         try:
             self.team_store.save_thread(spec.name, transcript)
         except Exception:
             pass
-        try:
-            if self.team_store.is_active(spec.name):
-                self.team_store.update_status(
-                    spec.name,
-                    status,
-                    task_count=1,
-                    task_id=task_id,
-                    error=error_text if status in {"failed", "cancelled"} else None,
-                    write_scope=[],
-                )
-        except Exception:
-            pass
-        completion = str(result or "")
+        with self._team_tasks_lock:
+            try:
+                if self.team_store.is_active(spec.name):
+                    self.team_store.update_status(
+                        spec.name,
+                        status,
+                        task_count=1,
+                        task_id=task_id,
+                        error=error_text if status in {"failed", "cancelled"} else None,
+                        write_scope=[],
+                    )
+            except Exception:
+                pass
+            record["status"] = status
+            record["result"] = str(result or "")
+            display = record.get("display") or {}
+            display["status"] = status
+            display["result"] = str(result or "")
+            display["transcript"] = [
+                *list(record.get("prelude_transcript") or []),
+                *transcript,
+            ]
         try:
             self.team_store.send_message(
                 spec.name,
                 "lead",
-                completion,
+                str(result or ""),
                 kind="task_result",
                 task_id=task_id,
                 status=status,
             )
         except Exception:
             pass
-        with self._team_tasks_lock:
-            record["status"] = status
-            record["result"] = str(result or "")
-            display = record.get("display") or {}
-            display["status"] = status
-            display["result"] = str(result or "")
-            display["transcript"] = transcript
         finish_team_entry(task_id, status, str(result or ""))
 
     def _execute_teammate_tool(self, record, spec, name, tool_input):
@@ -4921,12 +5047,16 @@ class OmniAgent:
             return ""
         resolved = self.team_store.resolve_name(teammate_name)
         cancelled = []
+        waiting_cancelled = False
         with self._team_tasks_lock:
             for task_id, record in self._team_tasks.items():
                 if (
                     record.get("teammate_name") == resolved
-                    and record.get("status") in {"starting", "running", "cancelling"}
+                    and record.get("status") in ACTIVE_TEAMMATE_STATUSES
                 ):
+                    was_waiting = record.get("status") == "waiting"
+                    if was_waiting:
+                        waiting_cancelled = True
                     stop_event = record.get("stop_event")
                     if stop_event is not None:
                         stop_event.set()
@@ -4935,12 +5065,14 @@ class OmniAgent:
                     display["status"] = "cancelling"
                     cancelled.append(task_id)
                     finish_team_entry(task_id, "cancelling", "")
+            if cancelled:
+                self.team_store.update_status(
+                    teammate_name,
+                    "cancelling",
+                    task_id=cancelled[-1],
+                    write_scope=[] if waiting_cancelled else None,
+                )
         if cancelled:
-            self.team_store.update_status(
-                teammate_name,
-                "cancelling",
-                task_id=cancelled[-1],
-            )
             return "Cancellation requested for task(s): " + ", ".join(cancelled)
         return ""
 
@@ -5860,8 +5992,9 @@ class OmniAgent:
                 "Docker, deployment, build, environment, and infrastructure configuration to "
                 "devops. Every write-capable teammate must receive a narrow write_scope."
                 "\n- While a write-capable teammate is active, neither the Lead nor a Builder "
-                "Subagent may modify files inside that teammate's write_scope. Integrate only "
-                "after ownership is released."
+                "Subagent may modify files inside that teammate's write_scope. A conflicting "
+                "spawn_teammate task waits automatically and starts after ownership is released; "
+                "integrate only after ownership is released."
                 "\n- Before the final answer, call read_inbox and collect every teammate result "
                 "that the answer depends on; a started or running teammate is not evidence."
                 "\n- Skip team delegation only for simple one-step work, tightly coupled edits "

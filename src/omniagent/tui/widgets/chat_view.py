@@ -1587,6 +1587,7 @@ class ChatView(Widget):
         role: str = "",
         purpose: str = "",
         task_id: str = "",
+        status: str = "running",
     ) -> None:
         self._activate_aux_output("team")
         entry_id = str(entry_id)
@@ -1595,7 +1596,7 @@ class ChatView(Widget):
             role,
             purpose,
             task_id or entry_id,
-            "running",
+            str(status or "running"),
             [],
             self._assistant_markdown_enabled,
         )
@@ -1607,7 +1608,7 @@ class ChatView(Widget):
             "role": str(role or ""),
             "purpose": str(purpose or ""),
             "task_id": str(task_id or entry_id),
-            "status": "running",
+            "status": str(status or "running"),
             "result": "",
             "transcript": [],
         })
@@ -1627,6 +1628,21 @@ class ChatView(Widget):
                 transcript=deepcopy(block.persistent_transcript()),
             )
         self.call_after_refresh(self._scroll_end)
+
+    def update_team_entry_status(self, entry_id: str, status: str) -> bool:
+        entry_id = str(entry_id)
+        block = self._team_blocks.get(entry_id)
+        if block is None:
+            return False
+        block.set_status(status)
+        transcript_index = self._team_transcript_indices.get(entry_id)
+        if transcript_index is not None:
+            self._update_transcript_entry(
+                transcript_index,
+                status=block.status,
+            )
+        self.call_after_refresh(self._scroll_end)
+        return True
 
     def finish_team_entry(self, entry_id: str, status: str, result: str = "") -> bool:
         entry_id = str(entry_id)
@@ -3343,6 +3359,7 @@ def _friendly_team_status(status: str) -> str:
     return {
         "active": "Ready",
         "starting": "Starting",
+        "waiting": "Waiting",
         "running": "Working",
         "completed": "Done",
         "failed": "Failed",
@@ -3358,6 +3375,7 @@ def _team_status_color(status: str) -> str:
     return {
         "active": STATUS_INFO,
         "starting": STATUS_INFO,
+        "waiting": STATUS_WARNING,
         "running": STATUS_INFO,
         "completed": STATUS_SUCCESS,
         "failed": STATUS_ERROR,
@@ -3731,6 +3749,10 @@ class TeamRunBlock(SubagentBlock):
         if purpose:
             title += f" [gray]\u00b7 {purpose}[/gray]"
         return title
+
+    def set_status(self, status: str) -> None:
+        self.status = str(status or "running")
+        self._refresh()
 
     def finish(self, status: str, result: str = "") -> None:
         self.status = str(status or "completed")

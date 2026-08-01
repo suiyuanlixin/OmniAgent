@@ -31,7 +31,8 @@ WRITE_TOOL_NAMES = frozenset({
 TEAMMATE_REPORT_TOOL_NAME = "report_to_lead"
 TEAMMATE_REPORT_KINDS = frozenset({"progress", "blocker", "finding", "question"})
 MAX_TEAMMATE_REPORTS_PER_TASK = 3
-ACTIVE_TEAMMATE_STATUSES = frozenset({"starting", "running", "cancelling"})
+ACTIVE_TEAMMATE_STATUSES = frozenset({"starting", "running", "cancelling", "waiting"})
+WRITE_OWNER_STATUSES = frozenset({"starting", "running", "cancelling"})
 
 FORBIDDEN_TEAM_TOOL_NAMES = {
     "dispatch_subagent",
@@ -635,6 +636,7 @@ class TeamStore:
             teammate["status"] = "interrupted"
             teammate["error"] = "The previous OmniAgent session ended before this task completed."
             teammate["write_scope"] = []
+            teammate.pop("waiting_for", None)
             teammate["updated_at"] = _now_iso()
             changed += 1
         if changed:
@@ -708,12 +710,16 @@ class TeamStore:
             )
         config = self.load_config()
         teammates = config.get("teammates", [])
+        waiting_for = None
         for teammate in teammates:
-            if str(teammate.get("status") or "") not in ACTIVE_TEAMMATE_STATUSES:
+            status = str(teammate.get("status") or "")
+            if status not in ACTIVE_TEAMMATE_STATUSES:
                 continue
             existing_task_id = str(teammate.get("task_id") or "")
             if self.resolve_name(teammate.get("name")) == resolved and existing_task_id != task_id:
-                raise ValueError(f"Teammate '{spec.name}' already has a running task.")
+                raise ValueError(f"Teammate '{spec.name}' already has an active task.")
+            if status not in WRITE_OWNER_STATUSES:
+                continue
             owned_scopes = tuple(
                 str(item) for item in teammate.get("write_scope") or [] if str(item)
             )
@@ -722,12 +728,12 @@ class TeamStore:
                 for scope in scopes
                 for owned in owned_scopes
             ):
-                owner_name = str(teammate.get("name") or "another teammate")
-                owner_role = str(teammate.get("role") or "writer")
-                raise ValueError(
-                    "write_scope overlaps active owner "
-                    f"{owner_name} ({owner_role}): {', '.join(owned_scopes)}"
-                )
+                waiting_for = {
+                    "name": str(teammate.get("name") or "another teammate"),
+                    "role": str(teammate.get("role") or "writer"),
+                    "write_scope": owned_scopes,
+                }
+                break
         entry = next(
             (
                 teammate
@@ -744,19 +750,65 @@ class TeamStore:
                 "task_count": 0,
             }
             teammates.append(entry)
+        status = "waiting" if waiting_for is not None else "running"
         entry.update({
             "name": spec.name,
             "role": spec.role,
-            "status": "running",
+            "status": status,
             "task_id": str(task_id),
             "task": str(task or ""),
             "write_scope": list(scopes),
             "updated_at": _now_iso(),
         })
+        if waiting_for is not None:
+            entry["waiting_for"] = waiting_for
+        else:
+            entry.pop("waiting_for", None)
         entry.pop("error", None)
         config["teammates"] = teammates
         self.save_config(config)
         return dict(entry)
+
+    @_synchronized
+    def try_activate_task(self, name: str, *, task_id: str) -> bool:
+        """Atomically claim a waiting task's write scope when it becomes free."""
+        resolved = self.resolve_name(name)
+        config = self.load_config()
+        teammates = config.get("teammates", [])
+        entry = next(
+            (
+                teammate
+                for teammate in teammates
+                if self.resolve_name(teammate.get("name")) == resolved
+                and str(teammate.get("task_id") or "") == str(task_id)
+            ),
+            None,
+        )
+        if entry is None or str(entry.get("status") or "") != "waiting":
+            return False
+        scopes = tuple(
+            str(item) for item in entry.get("write_scope") or [] if str(item)
+        )
+        for teammate in teammates:
+            if (
+                teammate is entry
+                or str(teammate.get("status") or "") not in WRITE_OWNER_STATUSES
+            ):
+                continue
+            owned_scopes = tuple(
+                str(item) for item in teammate.get("write_scope") or [] if str(item)
+            )
+            if any(
+                write_scopes_overlap(scope, owned)
+                for scope in scopes
+                for owned in owned_scopes
+            ):
+                return False
+        entry["status"] = "running"
+        entry.pop("waiting_for", None)
+        entry["updated_at"] = _now_iso()
+        self.save_config(config)
+        return True
 
     @_synchronized
     def update_status(
@@ -787,6 +839,8 @@ class TeamStore:
                     t["write_scope"] = list(write_scope)
                 elif str(status or "") not in ACTIVE_TEAMMATE_STATUSES:
                     t["write_scope"] = []
+                if str(status or "") != "waiting":
+                    t.pop("waiting_for", None)
                 if error is not None:
                     t["error"] = str(error)
                 elif status not in {"failed", "cancelled"}:
@@ -848,7 +902,7 @@ class TeamStore:
     def active_write_owners(self) -> list[dict[str, Any]]:
         owners = []
         for teammate in self.load_config().get("teammates", []):
-            if str(teammate.get("status") or "") not in ACTIVE_TEAMMATE_STATUSES:
+            if str(teammate.get("status") or "") not in WRITE_OWNER_STATUSES:
                 continue
             scope = tuple(str(item) for item in teammate.get("write_scope") or [] if str(item))
             if not scope:

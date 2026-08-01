@@ -403,16 +403,26 @@ def append_subagent_event(entry_id, event):
         bridge.append_subagent_event(entry_id, event)
 
 
-def start_team_entry(entry_id, teammate_name, role="", purpose="", task_id=""):
+def start_team_entry(
+    entry_id, teammate_name, role="", purpose="", task_id="", status="running"
+):
     bridge = get_bridge()
     if bridge is not None:
-        bridge.start_team_entry(entry_id, teammate_name, role, purpose, task_id)
+        bridge.start_team_entry(
+            entry_id, teammate_name, role, purpose, task_id, status
+        )
 
 
 def append_team_event(entry_id, event):
     bridge = get_bridge()
     if bridge is not None:
         bridge.append_team_event(entry_id, event)
+
+
+def update_team_entry_status(entry_id, status):
+    bridge = get_bridge()
+    if bridge is not None:
+        bridge.update_team_entry_status(entry_id, status)
 
 
 def finish_team_entry(entry_id, status, result=""):

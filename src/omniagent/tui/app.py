@@ -1656,6 +1656,7 @@ class AgentTUIApp(App):
         role: str = "",
         purpose: str = "",
         task_id: str = "",
+        status: str = "running",
     ) -> None:
         self._call_ui(
             self._start_team_entry,
@@ -1664,6 +1665,7 @@ class AgentTUIApp(App):
             role,
             purpose,
             task_id,
+            status,
         )
 
     def _start_team_entry(
@@ -1673,9 +1675,10 @@ class AgentTUIApp(App):
         role: str = "",
         purpose: str = "",
         task_id: str = "",
+        status: str = "running",
     ) -> None:
         self.query_one("#messages-view", ChatView).start_team_entry(
-            entry_id, teammate_name, role, purpose, task_id
+            entry_id, teammate_name, role, purpose, task_id, status
         )
 
     def append_team_event(self, entry_id: str, event: dict) -> None:
@@ -1683,6 +1686,16 @@ class AgentTUIApp(App):
 
     def _append_team_event(self, entry_id: str, event: dict) -> None:
         self.query_one("#messages-view", ChatView).append_team_event(entry_id, event)
+
+    def update_team_entry_status(self, entry_id: str, status: str) -> None:
+        self._call_ui(self._update_team_entry_status, entry_id, status)
+
+    def _update_team_entry_status(self, entry_id: str, status: str) -> None:
+        updated = self.query_one("#messages-view", ChatView).update_team_entry_status(
+            entry_id, status
+        )
+        if updated:
+            self._persist_current_session(refresh_sidebar=False)
 
     def finish_team_entry(self, entry_id: str, status: str, result: str = "") -> None:
         self._call_ui(self._finish_team_entry, entry_id, status, result)
