@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .persistence import atomic_write_text
 from .paths import APP_HOME
+from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, normalize_language
 
 from .search import (
     DEFAULT_WEB_SEARCH_DEPTH,
@@ -118,6 +119,7 @@ GLOBAL_FIELD_KEYS = {
     "compaction_compact_model",
     "memory_model",
     "render_markdown",
+    "language",
     "web_search_enable",
     "web_search_provider",
     "web_search_api_key",
@@ -183,6 +185,7 @@ class AppConfig:
     compaction_compact_model: str = DEFAULT_COMPACTION_COMPACT_MODEL
     memory_model: str = DEFAULT_MEMORY_MODEL
     render_markdown: bool = DEFAULT_RENDER_MARKDOWN
+    language: str = DEFAULT_LANGUAGE
     web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
     web_search_provider: str = DEFAULT_WEB_SEARCH_PROVIDER
     web_search_api_key: str = ""
@@ -278,6 +281,7 @@ class AppConfig:
     def to_dict(self):
         return {
             "general": {
+                "language": self.language,
                 "render_markdown": self.render_markdown,
             },
             "model_list": self._nested_model_list(),
@@ -340,6 +344,7 @@ class AppConfig:
             "compaction_compact_model": self.compaction_compact_model,
             "memory_model": self.memory_model,
             "render_markdown": self.render_markdown,
+            "language": self.language,
             "web_search_enable": self.web_search_enable,
             "web_search_provider": self.web_search_provider,
             "web_search_api_key": self.web_search_api_key,
@@ -612,6 +617,16 @@ def parse_web_search_topic(value):
     if topic not in TAVILY_TOPICS:
         raise ValueError("Web search topic must be general, news, or finance.")
     return topic
+
+
+def parse_language(value):
+    if value is None:
+        return DEFAULT_LANGUAGE
+    if isinstance(value, bool):
+        raise ValueError(
+            "Language must be one of: " + ", ".join(SUPPORTED_LANGUAGES) + "."
+        )
+    return normalize_language(value)
 
 
 def parse_agent_approval_mode(value):
@@ -904,6 +919,7 @@ def _sanitize_config(data):
         render_markdown=_parse_bool(
             general_config.get("render_markdown"), DEFAULT_RENDER_MARKDOWN
         ),
+        language=normalize_language(general_config.get("language")),
         web_search_enable=_parse_bool(
             web_search.get("enable"), DEFAULT_WEB_SEARCH_ENABLE
         ),
@@ -1133,6 +1149,8 @@ def save_config_fields(fields, model_name=None):
                 raise ValueError(f"Unknown model profile: {value}")
         elif key == "render_markdown":
             config.render_markdown = _parse_bool(value, config.render_markdown)
+        elif key == "language":
+            config.language = parse_language(value)
         elif key == "web_search_enable":
             config.web_search_enable = _parse_bool(value, config.web_search_enable)
         elif key == "web_search_provider":

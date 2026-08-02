@@ -7,6 +7,7 @@ from textual.events import Key
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
+from ...i18n import display_width, t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -233,7 +234,9 @@ class ProjectModal(ModalScreen[dict | None]):
                     yield HalfRowSpacer(id="project-top-edge")
                     with Vertical(id="project-dialog"):
                         with Horizontal(id="project-header"):
-                            yield Static("New project", id="project-title")
+                            yield Static(
+                                t("modal.project.title"), id="project-title"
+                            )
                             yield Static("esc", id="project-close-hint")
                         with Vertical(id="project-body"):
                             yield Static(classes="project-gap")
@@ -241,7 +244,10 @@ class ProjectModal(ModalScreen[dict | None]):
                                 with Horizontal(
                                     id="project-name-row", classes="project-row"
                                 ):
-                                    yield Static("Project name", classes="project-name")
+                                    yield Static(
+                                        t("modal.project.name"),
+                                        classes="project-name",
+                                    )
                                     yield _ProjectValueTrigger(
                                         self._draft.get("name", ""),
                                         id="project-trigger-name",
@@ -250,7 +256,10 @@ class ProjectModal(ModalScreen[dict | None]):
                                 with Horizontal(
                                     id="project-path-row", classes="project-row"
                                 ):
-                                    yield Static("Project path", classes="project-name")
+                                    yield Static(
+                                        t("modal.project.path"),
+                                        classes="project-name",
+                                    )
                                     yield _ProjectValueTrigger(
                                         self._draft.get("path", ""),
                                         id="project-trigger-path",
@@ -263,7 +272,7 @@ class ProjectModal(ModalScreen[dict | None]):
                                 ):
                                     yield Static("", classes="project-name")
                                     yield _ProjectAction(
-                                        "Add",
+                                        t("modal.add"),
                                         id="project-add-action",
                                         classes="project-action",
                                     )
@@ -347,7 +356,7 @@ class ProjectModal(ModalScreen[dict | None]):
 
         current_value = str(self._draft.get(key) or "")
         input_widget = Input(value=current_value, id="project-edit-input")
-        input_widget.styles.width = max(len(current_value) + 3, 12)
+        input_widget.styles.width = max(display_width(current_value) + 3, 12)
         row.mount(input_widget)
         input_widget.focus()
 

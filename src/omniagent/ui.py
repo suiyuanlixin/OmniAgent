@@ -4,6 +4,7 @@ import threading
 
 from rich.console import Console
 
+from .i18n import t
 from .tui.runtime import get_bridge
 
 
@@ -88,11 +89,13 @@ def _tool_error_summary(tool_name, tool_input):
     if name == "update_todo":
         items = arguments.get("items")
         if isinstance(items, list):
-            return f"{len(items)} todo item{'s' if len(items) != 1 else ''}"
+            key = "cli.todo_item_count" if len(items) == 1 else "cli.todo_item_count_plural"
+            return t(key, count=len(items))
     if name == "dispatch_subagent":
         tasks = arguments.get("tasks")
         if isinstance(tasks, list):
-            return f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}"
+            key = "cli.task_count" if len(tasks) == 1 else "cli.task_count_plural"
+            return t(key, count=len(tasks))
     if name == "ask_user":
         question = arguments.get("question")
         questions = arguments.get("questions")
@@ -162,7 +165,7 @@ def _tool_error_message(tool_name, error):
     if body == "(no output)":
         body = ""
     details = "\n\n".join(part for part in (body, metadata_details) if part)
-    message = f"Command exited with code {exit_code}."
+    message = t("cli.command_exit_code", code=exit_code)
     return f"{message}\n\n{details}" if details else message
 
 
@@ -172,7 +175,7 @@ def build_tool_error_display(tool_name, tool_input, error):
         "kind": "tool_error",
         "tool_name": str(tool_name or "").strip(),
         "summary": _tool_error_summary(tool_name, tool_input),
-        "error": error_text or "Tool call failed.",
+        "error": error_text or t("chat.tool_call_failed"),
     }
 
 
@@ -483,7 +486,7 @@ def get_user_input(prompt_text, multiline=False):
 def get_continue_confirmation():
     bridge = get_bridge()
     if bridge is not None:
-        return bridge.request_confirmation("Continue?", "")
+        return bridge.request_confirmation(t("cli.continue_question"), "")
     return False
 
 
@@ -538,7 +541,7 @@ def get_agent_todo_confirmation(todos, next_tool=""):
     bridge = get_bridge()
     if bridge is not None:
         return bridge.request_confirmation(
-            "Approve current agent todo list?", next_tool
+            t("cli.approve_todo_list"), next_tool
         )
     return False
 
@@ -547,8 +550,8 @@ def get_agent_edit_confirmation(file_path, occurrences, old_content, new_content
     bridge = get_bridge()
     if bridge is not None:
         return bridge.request_confirmation(
-            f"Allow agent to edit file? ({file_path})",
-            f"Occurrences to replace: {occurrences}",
+            t("cli.allow_edit_file", file_path=file_path),
+            t("cli.occurrences_to_replace", occurrences=occurrences),
         )
     return False
 
@@ -559,7 +562,12 @@ def get_agent_patch_confirmation(
     bridge = get_bridge()
     if bridge is not None:
         return bridge.request_confirmation(
-            f"Allow agent to patch file? ({file_path}:{start_line}-{end_line})",
+            t(
+                "cli.allow_patch_file",
+                file_path=file_path,
+                start_line=start_line,
+                end_line=end_line,
+            ),
             "",
         )
     return False

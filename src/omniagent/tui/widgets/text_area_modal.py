@@ -6,6 +6,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static, TextArea
 
+from ...i18n import t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -13,7 +14,7 @@ from ..widgets.chat_input import HalfRowSpacer
 class TextAreaModal(ModalScreen[str | None]):
     def __init__(self, title: str, value: str = ""):
         super().__init__()
-        self.title = str(title or "Edit")
+        self.title = str(title or "") or t("common.edit")
         self.value = str(value or "")
 
     DEFAULT_CSS = render_css(
@@ -168,7 +169,9 @@ class TextAreaModal(ModalScreen[str | None]):
                             yield Static(classes="text-area-gap")
                             yield TextArea(self.value, id="text-area-modal-field")
                         with Horizontal(id="text-area-modal-footer"):
-                            yield Static("Save", id="text-area-modal-save")
+                            yield Static(
+                                t("common.save"), id="text-area-modal-save"
+                            )
                     yield HalfRowSpacer(id="text-area-modal-bottom-edge")
                 yield Static(
                     "", id="text-area-outer-gap-bottom", classes="text-area-outer-gap"
@@ -250,7 +253,7 @@ class TextAreaModal(ModalScreen[str | None]):
 class PromptFileModal(ModalScreen[str | None]):
     def __init__(self, title: str, value: str = ""):
         super().__init__()
-        self.title = str(title or "System prompt")
+        self.title = str(title or "") or t("settings.page.system_prompt")
         self.value = str(value or "")
 
     DEFAULT_CSS = render_css(
@@ -392,7 +395,7 @@ class PromptFileModal(ModalScreen[str | None]):
                             yield TextArea(self.value, id="prompt-file-field")
                         yield Static(classes="prompt-file-gap")
                         with Horizontal(id="prompt-file-footer"):
-                            yield Static("Save", id="prompt-file-save")
+                            yield Static(t("common.save"), id="prompt-file-save")
                     yield HalfRowSpacer(id="prompt-file-bottom-edge")
 
     def on_mount(self) -> None:

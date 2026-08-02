@@ -5,6 +5,7 @@ from textual.containers import Horizontal, Container
 from textual.widgets import Button, Input, Label
 from textual.screen import ModalScreen
 
+from ...i18n import t
 from ..theme import render_css
 
 
@@ -43,7 +44,8 @@ class FileInputModal(ModalScreen[str | None]):
     }
 
     FileInputModal #file-submit-btn {
-        width: 10;
+        width: auto;
+        min-width: 10;
         margin-right: 1;
         background: transparent;
         color: $FULL_ACCESS;
@@ -51,7 +53,8 @@ class FileInputModal(ModalScreen[str | None]):
     }
 
     FileInputModal #file-cancel-btn {
-        width: 8;
+        width: auto;
+        min-width: 8;
         border: none;
     }
     """
@@ -65,11 +68,11 @@ class FileInputModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Container():
-            yield Label("Enter file path", id="file-modal-title")
+            yield Label(t("modal.file.title"), id="file-modal-title")
             yield Input(placeholder="/path/to/file.py", id="file-path-input")
             with Horizontal(id="file-modal-buttons"):
-                yield Button("Submit", id="file-submit-btn")
-                yield Button("Cancel", id="file-cancel-btn")
+                yield Button(t("common.submit"), id="file-submit-btn")
+                yield Button(t("common.cancel"), id="file-cancel-btn")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "file-submit-btn":

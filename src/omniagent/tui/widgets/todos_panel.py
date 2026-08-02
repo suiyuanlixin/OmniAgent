@@ -8,6 +8,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 from textual.widget import Widget
 
+from ...i18n import t
 from ..theme import (
     SURFACE_BACKGROUND,
     TEXT_MUTED,
@@ -236,7 +237,9 @@ class TodosPanel(Widget):
             if str(item.get("status") or "").strip().lower() == "completed"
         )
         total_count = len(self.items)
-        summary.update(f"{completed_count} of {total_count} todos completed")
+        summary.update(
+            t("todo.progress", completed=completed_count, total=total_count)
+        )
         toggle.update("=")
 
         active = next(

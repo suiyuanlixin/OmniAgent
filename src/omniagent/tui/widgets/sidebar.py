@@ -6,6 +6,7 @@ from textual.widgets import Button, Input, Static
 from textual import events
 from textual.message import Message
 
+from ...i18n import display_width, t
 from ..theme import render_css
 
 
@@ -333,23 +334,55 @@ class Sidebar(Vertical):
 
     def compose(self) -> ComposeResult:
         new_chat = SidebarActionButton(
-            "New Chat", id="side-new-chat", classes="sidebar-action"
+            t("sidebar.new_chat"), id="side-new-chat", classes="sidebar-action"
         )
         yield new_chat
         with Vertical(id="sidebar-content"):
-            yield Static("Pinned", id="pinned-title", classes="sidebar-section-title")
+            yield Static(
+                t("sidebar.pinned"), id="pinned-title", classes="sidebar-section-title"
+            )
             yield Vertical(id="pinned-list", classes="sidebar-list")
             yield Static(
-                "Projects", id="projects-title", classes="sidebar-section-title"
+                t("sidebar.projects"),
+                id="projects-title",
+                classes="sidebar-section-title",
             )
             yield Vertical(id="projects-list", classes="sidebar-list")
-            yield Static("Chats", id="chats-title", classes="sidebar-section-title")
+            yield Static(
+                t("sidebar.chats"), id="chats-title", classes="sidebar-section-title"
+            )
             yield Vertical(id="chats-list", classes="sidebar-list")
 
         settings = SidebarActionButton(
-            "= Settings", id="side-settings", classes="sidebar-action"
+            f"= {t('sidebar.settings')}", id="side-settings", classes="sidebar-action"
         )
         yield settings
+
+    def relabel_for_language(self) -> None:
+        """Re-resolve the static labels compose() baked in at mount time."""
+        if not self.is_mounted:
+            return
+        labels = {
+            "#side-new-chat": t("sidebar.new_chat"),
+            "#pinned-title": t("sidebar.pinned"),
+            "#projects-title": t("sidebar.projects"),
+            "#chats-title": t("sidebar.chats"),
+        }
+        for selector, label in labels.items():
+            try:
+                widget = self.query_one(selector)
+            except Exception:
+                continue
+            if isinstance(widget, SidebarActionButton):
+                widget.label = label
+            else:
+                widget.update(label)
+        try:
+            self.query_one("#side-settings", SidebarActionButton).label = (
+                f"= {t('sidebar.settings')}"
+            )
+        except Exception:
+            pass
 
     def on_click(self, event: events.Click) -> None:
         if not event.control or not event.control.id:
@@ -628,9 +661,9 @@ class Sidebar(Vertical):
                 value=title,
                 id="sidebar-edit-input",
                 classes=input_classes,
-                placeholder="Chat title",
+                placeholder=t("sidebar.chat_title_placeholder"),
             )
-            title_widget.styles.width = max(len(title) + 3, 8)
+            title_widget.styles.width = max(display_width(title) + 3, 8)
             title_widget.data_item_kind = "session"
             title_widget.data_original_value = title
             title_widget.data_path = session_path
@@ -666,11 +699,13 @@ class Sidebar(Vertical):
         item_id: str,
         chat_item: bool = False,
     ) -> None:
-        title = str(session.get("title") or "New Chat")
+        title = str(session.get("title") or t("sidebar.new_chat"))
         session_path = str(session.get("session_path") or "")
         is_pinned = bool(session.get("_pinned"))
         action_name = "unpin" if is_pinned else "pin"
-        action_label = "Unpin chat" if is_pinned else "Pin chat"
+        action_label = (
+            t("sidebar.unpin_chat") if is_pinned else t("sidebar.pin_chat")
+        )
         menu_item_classes = "sidebar-action-menu-item"
         if chat_item:
             menu_item_classes += " sidebar-chat-item"
@@ -686,7 +721,7 @@ class Sidebar(Vertical):
         pin_item.data_path = session_path
 
         rename_item = Static(
-            "Rename chat",
+            t("sidebar.rename_chat"),
             id=f"session-action-rename-{item_id}",
             classes=menu_item_classes,
         )
@@ -694,7 +729,7 @@ class Sidebar(Vertical):
         rename_item.data_path = session_path
 
         delete_item = Static(
-            "Archive chat",
+            t("sidebar.archive_chat"),
             id=f"session-action-archive-{item_id}",
             classes=menu_item_classes,
         )
@@ -725,7 +760,9 @@ class Sidebar(Vertical):
         sessions = list(project.get("sessions") or [])
         is_pinned = bool(project.get("_pinned"))
         action_name = "unpin" if is_pinned else "pin"
-        action_label = "Unpin project" if is_pinned else "Pin project"
+        action_label = (
+            t("sidebar.unpin_project") if is_pinned else t("sidebar.pin_project")
+        )
         menu_id = f"project-menu-{item_id}"
         group_id = f"project-chats-{item_id}"
         group_key = f"project:{slug}"
@@ -736,9 +773,9 @@ class Sidebar(Vertical):
                 value=name,
                 id="sidebar-edit-input",
                 classes=input_classes,
-                placeholder="Project name",
+                placeholder=t("sidebar.project_name_placeholder"),
             )
-            title_widget.styles.width = max(len(name) + 3, 8)
+            title_widget.styles.width = max(display_width(name) + 3, 8)
             title_widget.data_item_kind = "project"
             title_widget.data_original_value = name
             title_widget.data_slug = slug
@@ -775,7 +812,7 @@ class Sidebar(Vertical):
         pin_item.data_name = name
 
         rename_item = Static(
-            "Rename project",
+            t("sidebar.rename_project"),
             id=f"project-action-rename-{item_id}",
             classes="sidebar-action-menu-item",
         )
@@ -784,7 +821,7 @@ class Sidebar(Vertical):
         rename_item.data_name = name
 
         archive_item = Static(
-            "Archive chats",
+            t("sidebar.archive_chats"),
             id=f"project-action-archive-{item_id}",
             classes="sidebar-action-menu-item",
         )
@@ -793,7 +830,7 @@ class Sidebar(Vertical):
         archive_item.data_name = name
 
         remove_item = Static(
-            "Remove",
+            t("common.remove"),
             id=f"project-action-remove-{item_id}",
             classes="sidebar-action-menu-item",
         )
@@ -826,7 +863,7 @@ class Sidebar(Vertical):
         container.mount(session_group)
         if not sessions:
             no_chats = Static(
-                "No Chats",
+                t("sidebar.no_chats"),
                 id=f"project-empty-{item_id}",
                 classes="sidebar-item sidebar-chat-item sidebar-empty-item",
             )

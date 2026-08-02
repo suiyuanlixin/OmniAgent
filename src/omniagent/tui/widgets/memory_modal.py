@@ -6,6 +6,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
+from ...i18n import t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 from ..widgets.chat_view import MarkdownMessageStatic
@@ -108,7 +109,8 @@ class MemoryModal(ModalScreen[None]):
     }
 
     #memory-sidebar {
-        width: 24;
+        width: auto;
+        min-width: 24;
         height: auto;
         padding: 0 1 0 0;
     }
@@ -186,10 +188,10 @@ class MemoryModal(ModalScreen[None]):
         ("ctrl+q", "quit_app", "Quit"),
     ]
 
-    def __init__(self, sections: list[dict], title: str = "Memory") -> None:
+    def __init__(self, sections: list[dict], title: str = "") -> None:
         super().__init__()
         self.sections = [dict(section) for section in sections or []]
-        self.title = str(title or "Memory")
+        self.title = str(title or "") or t("modal.memory.title")
         self._selected_section_id = str(
             (self.sections[0].get("id") if self.sections else "") or ""
         )

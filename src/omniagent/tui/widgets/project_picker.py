@@ -2,18 +2,24 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Container
-from rich.cells import cell_len
 from textual.widgets import Button, Input, Static
 from textual.widget import Widget
 from textual.message import Message
 from textual.reactive import reactive
 
+from ...i18n import display_width, t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
 OPTION_HORIZONTAL_PADDING = 1
-_MORE_LABELS = ["New project", "Without project"]
-_SEARCH_PLACEHOLDER = "Search projects"
+
+
+def _more_labels() -> list[str]:
+    return [t("picker.new_project"), t("picker.without_project")]
+
+
+def _search_placeholder() -> str:
+    return t("picker.search_placeholder")
 
 
 class ProjectOptionButton(Button, can_focus=False):
@@ -43,6 +49,9 @@ class ProjectPicker(Widget):
 
     #project-trigger {
         width: auto;
+        /* Textual's Button defaults to min-width: 16, which keeps the button
+           wider than its parent once a shorter (e.g. CJK) label is set. */
+        min-width: 0;
         height: 1;
         background: transparent;
         border: none;
@@ -183,30 +192,32 @@ class ProjectPicker(Widget):
 
     def compose(self) -> ComposeResult:
         with Container(id="project-drop"):
-            yield Button("Choose project", id="project-trigger")
+            yield Button(t("picker.choose_project"), id="project-trigger")
             with Container(id="project-options"):
                 yield HalfRowSpacer(id="project-top-edge")
-                yield Input(placeholder=_SEARCH_PLACEHOLDER, id="project-search-input")
+                yield Input(
+                    placeholder=_search_placeholder(), id="project-search-input"
+                )
                 yield Container(id="project-list")
                 with Container(id="project-separator"):
                     yield Static(
                         "\u2500" * max(1, self._measure_dropdown_width() - 2),
                         id="project-separator-line",
                     )
-                yield Static("New project", id="add-project-btn")
-                yield Static("Without project", id="no-project-btn")
+                yield Static(t("picker.new_project"), id="add-project-btn")
+                yield Static(t("picker.without_project"), id="no-project-btn")
                 yield HalfRowSpacer(id="project-bottom-edge")
 
     def _fit_trigger(self) -> None:
         drop = self.query_one("#project-drop", Container)
         trigger = self.query_one("#project-trigger", Button)
-        label_width = cell_len(str(trigger.label)) + 2
+        label_width = display_width(str(trigger.label)) + 2
         drop.styles.width = label_width
         trigger.styles.width = label_width
 
     def _measure_dropdown_width(self) -> int:
-        labels = [*_MORE_LABELS, _SEARCH_PLACEHOLDER, *self._all_projects]
-        return max(cell_len(label) for label in labels) + (
+        labels = [*_more_labels(), _search_placeholder(), *self._all_projects]
+        return max(display_width(label) for label in labels) + (
             OPTION_HORIZONTAL_PADDING * 2
         )
 
@@ -247,7 +258,7 @@ class ProjectPicker(Widget):
             self._close_dropdown()
             self.current_project = ""
             trigger = self.query_one("#project-trigger", Button)
-            trigger.label = "Choose project"
+            trigger.label = t("picker.choose_project")
             self._fit_trigger()
             self.post_message(self.NoProject())
 
@@ -294,5 +305,35 @@ class ProjectPicker(Widget):
     def set_current_project(self, project_name):
         self.current_project = str(project_name or "")
         trigger = self.query_one("#project-trigger", Button)
-        trigger.label = self.current_project or "Choose project"
+        trigger.label = self.current_project or t("picker.choose_project")
         self._fit_trigger()
+
+    def relabel_for_language(self) -> None:
+        """Re-resolve labels captured at compose time.
+
+        Dropdown metrics are recomputed too: the separator line and option
+        widths were sized for the previous language's cell counts.
+        """
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#project-search-input", Input).placeholder = (
+                _search_placeholder()
+            )
+            self.query_one("#add-project-btn", Static).update(t("picker.new_project"))
+            self.query_one("#no-project-btn", Static).update(
+                t("picker.without_project")
+            )
+        except Exception:
+            return
+        width = self._measure_dropdown_width()
+        options = self.query_one("#project-options", Container)
+        options.styles.width = width
+        options.styles.min_width = width
+        try:
+            self.query_one("#project-separator-line", Static).update(
+                "─" * max(1, width - 2)
+            )
+        except Exception:
+            pass
+        self.set_current_project(self.current_project)

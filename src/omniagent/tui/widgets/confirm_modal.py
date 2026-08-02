@@ -5,6 +5,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
+from ...i18n import t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -12,7 +13,7 @@ from ..widgets.chat_input import HalfRowSpacer
 class ConfirmModal(ModalScreen[bool]):
     def __init__(self, title: str, detail: str = ""):
         super().__init__()
-        self.title = str(title or "Confirm")
+        self.title = str(title or "") or t("common.confirm")
         self.detail = str(detail or "").strip()
 
     DEFAULT_CSS = render_css(
@@ -77,8 +78,8 @@ class ConfirmModal(ModalScreen[bool]):
                 if self.detail:
                     yield Static(self.detail, id="confirm-detail")
                 with Horizontal(id="confirm-actions"):
-                    yield Button("Cancel", id="confirm-cancel")
-                    yield Button("OK", id="confirm-ok")
+                    yield Button(t("common.cancel"), id="confirm-cancel")
+                    yield Button(t("modal.ok"), id="confirm-ok")
             yield HalfRowSpacer(id="confirm-bottom")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

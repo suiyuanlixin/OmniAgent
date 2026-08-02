@@ -7,6 +7,7 @@ from textual.events import Key
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
+from ...i18n import display_width, t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -24,7 +25,15 @@ class _ReferenceAction(Static):
 
 
 class ReferenceModal(ModalScreen[dict | None]):
-    TYPE_OPTIONS = (("File", "file"), ("Folder", "folder"))
+    TYPE_OPTION_KEYS = (
+        ("modal.reference.type_file", "file"),
+        ("modal.reference.type_folder", "folder"),
+    )
+
+    @property
+    def TYPE_OPTIONS(self) -> tuple[tuple[str, str], ...]:
+        """(label, value) pairs resolved against the active language."""
+        return tuple((t(key), value) for key, value in self.TYPE_OPTION_KEYS)
 
     DEFAULT_CSS = render_css(
         """
@@ -306,7 +315,9 @@ class ReferenceModal(ModalScreen[dict | None]):
                     yield HalfRowSpacer(id="reference-top-edge")
                     with Vertical(id="reference-dialog"):
                         with Horizontal(id="reference-header"):
-                            yield Static("Add reference", id="reference-title")
+                            yield Static(
+                                t("modal.reference.title"), id="reference-title"
+                            )
                             yield Static("esc", id="reference-close-hint")
                         with Vertical(id="reference-body"):
                             yield Static(classes="reference-gap")
@@ -314,7 +325,10 @@ class ReferenceModal(ModalScreen[dict | None]):
                                 with Horizontal(
                                     id="reference-type-row", classes="reference-row"
                                 ):
-                                    yield Static("Type", classes="reference-name")
+                                    yield Static(
+                                        t("modal.reference.type"),
+                                        classes="reference-name",
+                                    )
                                     yield Container(
                                         _ReferenceValueTrigger(
                                             self._display_type(),
@@ -339,7 +353,10 @@ class ReferenceModal(ModalScreen[dict | None]):
                                 with Horizontal(
                                     id="reference-path-row", classes="reference-row"
                                 ):
-                                    yield Static("Path", classes="reference-name")
+                                    yield Static(
+                                        t("modal.reference.path"),
+                                        classes="reference-name",
+                                    )
                                     yield _ReferenceValueTrigger(
                                         self._display_path(),
                                         markup=False,
@@ -353,7 +370,7 @@ class ReferenceModal(ModalScreen[dict | None]):
                                 ):
                                     yield Static("", classes="reference-name")
                                     yield _ReferenceAction(
-                                        "Add",
+                                        t("modal.add"),
                                         id="reference-add-action",
                                         classes="reference-action",
                                     )
@@ -438,7 +455,7 @@ class ReferenceModal(ModalScreen[dict | None]):
         for label, value in self.TYPE_OPTIONS:
             if value == current:
                 return label
-        return "File"
+        return t("modal.reference.type_file")
 
     def _display_path(self) -> str:
         value = str(self._draft.get("path") or "")
@@ -493,7 +510,7 @@ class ReferenceModal(ModalScreen[dict | None]):
         trigger.display = False
         current_value = str(self._draft.get("path") or "")
         input_widget = Input(value=current_value, id="reference-edit-input")
-        input_widget.styles.width = max(len(current_value) + 3, 20)
+        input_widget.styles.width = max(display_width(current_value) + 3, 20)
         row.mount(input_widget)
         input_widget.focus()
         self._editing_path = True
@@ -526,11 +543,14 @@ class ReferenceModal(ModalScreen[dict | None]):
         except Exception:
             return
         display_value = self._display_type()
-        trigger_width = max(len(display_value) + 2, 7)
+        trigger_width = max(display_width(display_value) + 2, 7)
         option_width = (
-            max((len(label) for label, _ in self.TYPE_OPTIONS), default=0) + 2
+            max(
+                (display_width(label) for label, _ in self.TYPE_OPTIONS), default=0
+            )
+            + 2
         )
-        option_width = max(option_width, len(display_value) + 2)
+        option_width = max(option_width, display_width(display_value) + 2)
         trigger.styles.width = trigger_width
         trigger.styles.min_width = trigger_width
         options.styles.width = option_width

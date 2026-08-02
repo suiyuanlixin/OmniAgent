@@ -5,6 +5,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static
 
+from ...i18n import t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -12,7 +13,7 @@ from ..widgets.chat_input import HalfRowSpacer
 class InputModal(ModalScreen[str | None]):
     def __init__(self, title: str, multiline: bool = False):
         super().__init__()
-        self.title = str(title or "Input")
+        self.title = str(title or "") or t("modal.input.title")
         self.multiline = bool(multiline)
 
     DEFAULT_CSS = render_css(
@@ -78,8 +79,8 @@ class InputModal(ModalScreen[str | None]):
                 yield Static(self.title, id="input-modal-title")
                 yield Input(id="input-modal-field")
                 with Horizontal(id="input-modal-actions"):
-                    yield Button("Cancel", id="input-modal-cancel")
-                    yield Button("OK", id="input-modal-ok")
+                    yield Button(t("common.cancel"), id="input-modal-cancel")
+                    yield Button(t("modal.ok"), id="input-modal-ok")
             yield HalfRowSpacer(id="input-modal-bottom")
 
     def on_mount(self) -> None:

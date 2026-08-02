@@ -21,9 +21,10 @@ from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 
+from ...i18n import display_width, fit_to_width, t
 from ...commands import COMMANDS
 from ...references import resolve_references
-from ..data import THINKING_LEVELS, APPROVAL_LEVELS
+from ..data import approval_levels, thinking_levels
 from ..theme import (
     PAGE_BACKGROUND,
     REFERENCE_BACKGROUND,
@@ -37,35 +38,71 @@ TRIGGER_HORIZONTAL_PADDING = 1
 OPTION_HORIZONTAL_PADDING = 0
 OPTION_CONTENT_GUTTER = 2
 
-PLAN_CHOICES = ("Plan", "Build")
-PLAN_OPTIONS_WIDTH = (
-    max(len(label) for label in PLAN_CHOICES)
-    + (OPTION_HORIZONTAL_PADDING * 2)
-    + OPTION_CONTENT_GUTTER
-)
 COMMAND_MENU_MAX_HEIGHT = 10
 INPUT_MAX_HEIGHT = 10
 MAX_PENDING_MESSAGES = 5
 MODIFIER_LATCH_WINDOW = 0.12
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
-COMMAND_HINTS = {
-    "/agent": "Open agent page",
-    "/clear": "Reset chat",
-    "/comp": "Compact context",
-    "/help": "Open help page",
-    "/memory": "Open memory page",
-    "/quit": "Exit app",
-    "/search": "Open web search",
-    "/skills": "Open skills page",
-    "/team": "Open team page",
+COMMAND_HINT_KEYS = {
+    "/agent": "input.cmd_hint.agent",
+    "/clear": "input.cmd_hint.clear",
+    "/comp": "input.cmd_hint.comp",
+    "/help": "input.cmd_hint.help",
+    "/memory": "input.cmd_hint.memory",
+    "/quit": "input.cmd_hint.quit",
+    "/search": "input.cmd_hint.search",
+    "/skills": "input.cmd_hint.skills",
+    "/team": "input.cmd_hint.team",
 }
-COMMAND_SUGGESTIONS = [
-    (command, COMMAND_HINTS.get(command, str(description or "").strip()))
-    for command, description in sorted(
-        COMMANDS.items(), key=lambda item: str(item[0]).lower()
+
+
+# The English defaults callers still hand us; treated as "unset" so the
+# localized label wins. An explicit, caller-authored label passes through.
+_DEFAULT_CUSTOM_LABEL = "Type your own answer"
+_DEFAULT_CUSTOM_PLACEHOLDER = "Type your own answer..."
+
+
+def prompt_custom_label(value: str = "") -> str:
+    text = str(value or "")
+    if not text or text == _DEFAULT_CUSTOM_LABEL:
+        return t("input.custom_answer_label")
+    return text
+
+
+def prompt_custom_placeholder(value: str = "") -> str:
+    text = str(value or "")
+    if not text or text == _DEFAULT_CUSTOM_PLACEHOLDER:
+        return t("input.custom_answer_placeholder")
+    return text
+
+
+def plan_choices() -> tuple[str, str]:
+    """(Plan, Build) mode labels for the active language."""
+    return (t("input.mode.plan"), t("input.mode.build"))
+
+
+def plan_options_width() -> int:
+    return (
+        max(display_width(label) for label in plan_choices())
+        + (OPTION_HORIZONTAL_PADDING * 2)
+        + OPTION_CONTENT_GUTTER
     )
-]
+
+
+def command_suggestions() -> list[tuple[str, str]]:
+    """Command menu rows resolved against the active language."""
+    return [
+        (
+            command,
+            t(COMMAND_HINT_KEYS[command])
+            if command in COMMAND_HINT_KEYS
+            else str(description or "").strip(),
+        )
+        for command, description in sorted(
+            COMMANDS.items(), key=lambda item: str(item[0]).lower()
+        )
+    ]
 
 
 @dataclass
@@ -227,7 +264,7 @@ class PromptOptionRow(Static, can_focus=False):
         marker = "●" if self.is_selected else "○"
         title = self.title
         if self.recommended:
-            title = f"{title} (Recommended)"
+            title = t("input.option_recommended", title=title)
         prefix = f"  {marker} "
         prefix_style = Style(color=TEXT_PRIMARY, bgcolor=SURFACE_BACKGROUND)
         title_style = Style(color=TEXT_PRIMARY, bgcolor=SURFACE_BACKGROUND)
@@ -573,7 +610,9 @@ class MessageTextArea(TextArea):
                 color=TEXT_MUTED,
                 bgcolor=self._placeholder_background,
             )
-            padded_hint = hint[:width].ljust(width)
+            # Must be cell-accurate: Strip below declares cell_length=width,
+            # and CJK placeholders occupy two cells per glyph.
+            padded_hint = fit_to_width(hint, width)
             theme = self._theme
             if theme:
                 theme.apply_css(self)
@@ -980,6 +1019,10 @@ class ChatInput(Widget):
     /* dropdown triggers */
     #plan-trigger, #approval-trigger, #model-trigger, #thinking-trigger {
         width: auto;
+        /* Textual's Button defaults to min-width: 16. _fit_trigger_to_label
+           computes narrower widths for short labels (common in Chinese), and
+           without this the button stays 16 cells and overflows its drop. */
+        min-width: 0;
         height: 1;
         background: transparent;
         border: none;
@@ -1111,15 +1154,17 @@ class ChatInput(Widget):
     controls_locked = reactive(False)
     prompt_active = reactive(False)
     model_options: list[tuple[str, str]] = []
-    thinking_options: list[tuple[str, str]] = THINKING_LEVELS.copy()
     selected_model_value = reactive("")
     selected_thinking_value = reactive("medium")
     selected_approval_value = reactive("confirm")
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # Resolved per instance, not at class level, so a language switch
+        # re-labels the dropdown.
+        self.thinking_options: list[tuple[str, str]] = thinking_levels()
         self._command_selection_index = 0
-        self._visible_command_suggestions = list(COMMAND_SUGGESTIONS)
+        self._visible_command_suggestions = command_suggestions()
         self._last_shift_down_at = 0.0
         self._last_ctrl_down_at = 0.0
         self._modifier_timer = None
@@ -1134,8 +1179,8 @@ class ChatInput(Widget):
         self._prompt_current_index = 1
         self._prompt_total = 1
         self._prompt_allow_custom = False
-        self._prompt_custom_label = "Type your own answer"
-        self._prompt_custom_placeholder = "Type your own answer..."
+        self._prompt_custom_label = prompt_custom_label()
+        self._prompt_custom_placeholder = prompt_custom_placeholder()
         self._prompt_selected_option_index: int | None = None
         self._prompt_custom_selected = False
         self._prompt_saved_text = ""
@@ -1196,9 +1241,9 @@ class ChatInput(Widget):
         pass
 
     def on_mount(self) -> None:
-        self._set_options_width("plan", PLAN_OPTIONS_WIDTH)
+        self._set_options_width("plan", plan_options_width())
         self._rebuild_dropdown(
-            "approval", APPROVAL_LEVELS, self.selected_approval_value
+            "approval", approval_levels(), self.selected_approval_value
         )
         self._rebuild_dropdown(
             "thinking", self.thinking_options, self.selected_thinking_value
@@ -1240,25 +1285,26 @@ class ChatInput(Widget):
             with Horizontal(id="controls-row"):
                 yield Button("+", id="add-reference")
                 # Plan/Build toggle dropdown
+                plan_label, build_label = plan_choices()
                 with Container(id="plan-drop"):
-                    yield Button("Plan", id="plan-trigger")
+                    yield Button(plan_label, id="plan-trigger")
                     with Container(id="plan-options"):
-                        yield Button("Plan", id="plan-opt-plan")
-                        yield Button("Build", id="plan-opt-build")
+                        yield Button(plan_label, id="plan-opt-plan")
+                        yield Button(build_label, id="plan-opt-build")
 
                 # Approval dropdown
                 with Container(id="approval-drop"):
-                    yield Button("Ask for approval", id="approval-trigger")
+                    yield Button(t("input.approval.confirm"), id="approval-trigger")
                     yield Container(id="approval-options")
 
                 # Model dropdown
                 with Container(id="model-drop"):
-                    yield Button("No model", id="model-trigger")
+                    yield Button(t("input.no_model"), id="model-trigger")
                     yield Container(id="model-options")
 
                 # Thinking dropdown
                 with Container(id="thinking-drop"):
-                    yield Button("Medium", id="thinking-trigger")
+                    yield Button(t("input.thinking.medium"), id="thinking-trigger")
                     yield Container(id="thinking-options")
 
         yield HalfRowSpacer(id="chat-input-bottom-edge")
@@ -1361,8 +1407,9 @@ class ChatInput(Widget):
 
     def _set_plan_mode(self, plan: bool) -> None:
         self.plan_mode = plan
+        plan_label, build_label = plan_choices()
         trigger = self.query_one("#plan-trigger", Button)
-        trigger.label = "Plan" if plan else "Build"
+        trigger.label = plan_label if plan else build_label
         trigger.remove_class("mode-plan")
         trigger.remove_class("mode-build")
         trigger.add_class("mode-plan" if plan else "mode-build")
@@ -1378,7 +1425,9 @@ class ChatInput(Widget):
     def _fit_trigger_to_label(self, prefix: str) -> None:
         drop = self.query_one(f"#{prefix}-drop", Container)
         trigger = self.query_one(f"#{prefix}-trigger", Button)
-        label_width = len(str(trigger.label)) + (TRIGGER_HORIZONTAL_PADDING * 2)
+        label_width = display_width(str(trigger.label)) + (
+            TRIGGER_HORIZONTAL_PADDING * 2
+        )
         drop.styles.width = label_width
         trigger.styles.width = label_width
 
@@ -1521,13 +1570,14 @@ class ChatInput(Widget):
                 self._close_all_dropdowns()
                 self._fit_trigger_to_label("plan")
                 return
+            plan_label, build_label = plan_choices()
             if self.plan_mode:
-                trigger.label = "Plan"
+                trigger.label = plan_label
                 trigger.remove_class("mode-build")
                 trigger.add_class("mode-plan")
                 approval.add_class("hidden")
             else:
-                trigger.label = "Build"
+                trigger.label = build_label
                 trigger.remove_class("mode-plan")
                 trigger.add_class("mode-build")
                 approval.remove_class("hidden")
@@ -1576,7 +1626,7 @@ class ChatInput(Widget):
     def set_thinking_options(self, options):
         normalized = [(str(label), str(value)) for label, value in list(options or [])]
         if not normalized:
-            normalized = THINKING_LEVELS.copy()
+            normalized = thinking_levels()
         self.thinking_options = normalized
         self.set_selected_thinking(self.selected_thinking_value)
 
@@ -1584,7 +1634,7 @@ class ChatInput(Widget):
         self.selected_approval_value = str(selected_value or "confirm")
         if self.is_mounted:
             self._rebuild_dropdown(
-                "approval", APPROVAL_LEVELS, self.selected_approval_value
+                "approval", approval_levels(), self.selected_approval_value
             )
             self._set_approval_level(self.selected_approval_value)
 
@@ -1611,6 +1661,68 @@ class ChatInput(Widget):
             self._close_all_dropdowns()
             self._hide_command_menu()
 
+    def relabel_for_language(self) -> None:
+        """Re-resolve every label this widget cached at compose time.
+
+        Trigger widths are refit because CJK labels need roughly twice the
+        cells of their English equivalents.
+        """
+        if not self.is_mounted:
+            return
+        self.thinking_options = thinking_levels()
+        self._rebuild_dropdown(
+            "approval", approval_levels(), self.selected_approval_value
+        )
+        self._rebuild_dropdown(
+            "thinking", self.thinking_options, self.selected_thinking_value
+        )
+        self._sync_thinking_trigger_label()
+        self._sync_approval_trigger_label()
+        # _update_plan_build re-resolves the Plan/Build label and refits the
+        # trigger without posting PlanModeChanged, which _set_plan_mode would.
+        self._set_options_width("plan", plan_options_width())
+        self._update_plan_build()
+        self._set_approval_level(self.selected_approval_value)
+        self._visible_command_suggestions = command_suggestions()
+        self._ensure_command_rows()
+        self._sync_command_rows()
+        try:
+            editor = self.query_one("#message-input", MessageTextArea)
+        except Exception:
+            editor = None
+        if editor is not None:
+            editor.refresh()
+
+    def _sync_thinking_trigger_label(self) -> None:
+        label = next(
+            (
+                text
+                for text, value in self.thinking_options
+                if value == self.selected_thinking_value
+            ),
+            "",
+        )
+        if not label:
+            return
+        trigger = self.query_one("#thinking-trigger", Button)
+        trigger.label = label
+        self._fit_trigger_to_label("thinking")
+
+    def _sync_approval_trigger_label(self) -> None:
+        label = next(
+            (
+                text
+                for text, value in approval_levels()
+                if value == self.selected_approval_value
+            ),
+            "",
+        )
+        if not label:
+            return
+        trigger = self.query_one("#approval-trigger", Button)
+        trigger.label = label
+        self._fit_trigger_to_label("approval")
+
     def _is_command_mode(self, value: str) -> bool:
         text = str(value or "")
         if not text.startswith("/"):
@@ -1619,14 +1731,14 @@ class ChatInput(Widget):
 
     def _refresh_command_menu(self, value: str) -> None:
         if not self.is_mounted or not self._is_command_mode(value):
-            self._visible_command_suggestions = list(COMMAND_SUGGESTIONS)
+            self._visible_command_suggestions = command_suggestions()
             self._sync_command_rows()
             self._hide_command_menu()
             return
         token = str(value or "").lower()
         self._visible_command_suggestions = [
             (command, description)
-            for command, description in COMMAND_SUGGESTIONS
+            for command, description in command_suggestions()
             if command.lower().startswith(token)
         ]
         self._ensure_command_rows()
@@ -1643,7 +1755,7 @@ class ChatInput(Widget):
         menu = self.query_one("#command-menu", VerticalScroll)
         if list(self.query("#command-menu CommandMenuRow")):
             return
-        for index, (command, description) in enumerate(COMMAND_SUGGESTIONS):
+        for index, (command, description) in enumerate(command_suggestions()):
             menu.mount(CommandMenuRow(command, description, index))
         self._set_command_selection(0, scroll=False)
 
@@ -1652,7 +1764,10 @@ class ChatInput(Widget):
             command: index
             for index, (command, _) in enumerate(self._visible_command_suggestions)
         }
+        # Descriptions are re-read so a language switch reaches mounted rows.
+        descriptions = dict(command_suggestions())
         for row in self.query("#command-menu CommandMenuRow"):
+            row.description = descriptions.get(row.command, row.description)
             visible_index = visible_commands.get(row.command)
             if visible_index is None:
                 row.index = -1
@@ -1719,7 +1834,7 @@ class ChatInput(Widget):
         command = self._visible_command_suggestions[self._command_selection_index][0]
         msg_input = self._message_input()
         msg_input.load_text("")
-        self._visible_command_suggestions = list(COMMAND_SUGGESTIONS)
+        self._visible_command_suggestions = command_suggestions()
         self._sync_command_rows()
         self._hide_command_menu()
         self.post_message(self.Send(command))
@@ -1986,11 +2101,15 @@ class ChatInput(Widget):
         existing_ids = [child.id for child in container.children]
         if not normalized:
             if prefix == "model":
-                trigger.label = "No model"
+                trigger.label = t("input.no_model")
                 self._fit_trigger_to_label(prefix)
             return
 
         if existing_ids == desired_ids:
+            # Option ids derive from values, which are language-independent, so
+            # a relabel lands here with the buttons already mounted. Their text
+            # still has to be refreshed.
+            self._sync_dropdown_option_labels(prefix, container, normalized)
             self._update_dropdown_trigger(prefix, normalized, selected_value)
             return
 
@@ -2025,7 +2144,7 @@ class ChatInput(Widget):
         selected_value: str,
     ) -> None:
         max_width = (
-            max(len(label) for label, _ in normalized)
+            max(display_width(label) for label, _ in normalized)
             + (OPTION_HORIZONTAL_PADDING * 2)
             + OPTION_CONTENT_GUTTER
         )
@@ -2076,7 +2195,7 @@ class ChatInput(Widget):
                 continue
             normalized_groups.append({
                 "provider": str(group.get("provider") or ""),
-                "title": str(group.get("title") or "") or "Other",
+                "title": str(group.get("title") or "") or t("input.model_group.other"),
                 "options": group_options,
             })
         if normalized_groups:
@@ -2089,7 +2208,7 @@ class ChatInput(Widget):
         return [
             {
                 "provider": "",
-                "title": "Models",
+                "title": t("input.model_group.models"),
                 "options": normalized_options,
             }
         ]
@@ -2102,7 +2221,7 @@ class ChatInput(Widget):
         selected_value: str,
     ) -> None:
         if not options:
-            trigger.label = "No model"
+            trigger.label = t("input.no_model")
             self._fit_trigger_to_label("model")
             return
 
@@ -2138,7 +2257,7 @@ class ChatInput(Widget):
         for group_index, group in enumerate(groups):
             if group_index > 0:
                 container.mount(Static("", classes="model-group-gap"))
-            title = str(group.get("title") or "") or "Other"
+            title = str(group.get("title") or "") or t("input.model_group.other")
             group_key = str(group.get("provider") or "")
             button_id = f"model-group-toggle-{serial}-{group_index}"
             list_id = f"model-group-list-{serial}-{group_index}"
@@ -2166,6 +2285,15 @@ class ChatInput(Widget):
         trigger.label = selected_label
         self._fit_trigger_to_label("model")
 
+    @staticmethod
+    def _sync_dropdown_option_labels(prefix, container, normalized) -> None:
+        """Refresh mounted option labels in place, matching on widget id."""
+        by_id = {str(child.id): child for child in container.children if child.id}
+        for label, value in normalized:
+            child = by_id.get(f"{prefix}-{value}")
+            if child is not None and str(getattr(child, "label", "")) != label:
+                child.label = label
+
     def _update_dropdown_trigger(self, prefix, options, selected_value, empty_label=""):
         trigger = self.query_one(f"#{prefix}-trigger", Button)
         normalized = [(str(label), str(value)) for label, value in options or []]
@@ -2185,7 +2313,7 @@ class ChatInput(Widget):
     def input_placeholder(self, text_area: MessageTextArea | None = None) -> str:
         if self.prompt_active and self._prompt_allow_custom:
             return self._prompt_custom_placeholder
-        return "Type a message"
+        return t("input.placeholder")
 
     def set_chat_busy(self, busy: bool) -> None:
         if not self._ensure_ui_thread(self.set_chat_busy, busy):
@@ -2265,7 +2393,7 @@ class ChatInput(Widget):
         try:
             self.app.add_status_message(
                 "[!]",
-                f"最多只能追加 {MAX_PENDING_MESSAGES} 条消息。",
+                t("input.pending_limit", limit=MAX_PENDING_MESSAGES),
             )
         except Exception:
             pass
@@ -2283,8 +2411,8 @@ class ChatInput(Widget):
         selected_option_index: int | None = None,
         custom_selected: bool = False,
         custom_value: str = "",
-        custom_label: str = "Type your own answer",
-        custom_placeholder: str = "Type your own answer...",
+        custom_label: str = "",
+        custom_placeholder: str = "",
     ) -> None:
         msg_input = self._message_input()
         if active and not self.prompt_active:
@@ -2326,10 +2454,8 @@ class ChatInput(Widget):
             for title, detail, recommended in (options or [])
         ]
         self._prompt_allow_custom = bool(allow_custom)
-        self._prompt_custom_label = str(custom_label or "Type your own answer")
-        self._prompt_custom_placeholder = str(
-            custom_placeholder or "Type your own answer..."
-        )
+        self._prompt_custom_label = prompt_custom_label(custom_label)
+        self._prompt_custom_placeholder = prompt_custom_placeholder(custom_placeholder)
         recommended_index = next(
             (
                 index
@@ -2354,7 +2480,11 @@ class ChatInput(Widget):
             )
 
         self.query_one("#prompt-progress", Static).update(
-            f"{self._prompt_current_index} of {self._prompt_total} questions"
+            t(
+                "input.prompt_progress",
+                current=self._prompt_current_index,
+                total=self._prompt_total,
+            )
         )
         self.query_one("#prompt-question", Static).update(self._prompt_question)
         self._rebuild_prompt_options()

@@ -5,6 +5,7 @@ from textual.containers import Container, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
+from ...i18n import t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -12,7 +13,7 @@ from ..widgets.chat_input import HalfRowSpacer
 class ChoiceModal(ModalScreen[int]):
     def __init__(self, question: str, options):
         super().__init__()
-        self.question = str(question or "Choose one")
+        self.question = str(question or "") or t("modal.choose_one")
         self.options = [str(option) for option in options or []]
 
     DEFAULT_CSS = render_css(

@@ -24,6 +24,7 @@ from ...config import (
     normalize_reasoning_effort_for_api,
     supported_reasoning_efforts,
 )
+from ...i18n import display_width, t
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -253,7 +254,7 @@ class SettingsModal(ModalScreen[None]):
     #settings-header-select-trigger:focus,
     #settings-header-select-trigger.-active {
         width: auto;
-        min-width: 12;
+        min-width: 0;
         height: 1;
         background: $SURFACE_BACKGROUND;
         background-tint: $SURFACE_BACKGROUND;
@@ -718,7 +719,9 @@ class SettingsModal(ModalScreen[None]):
     }
 
     #settings-model-sidebar {
-        width: 24;
+        width: auto;
+        min-width: 24;
+        max-width: 40;
         height: auto;
         padding: 0 1 0 0;
     }
@@ -919,15 +922,27 @@ class SettingsModal(ModalScreen[None]):
         self._archived_bulk_paths: list[str] = []
         self._list_content_rows: int = 0
 
-        self.pages.setdefault(
-            "add_model",
-            {
-                "title": "Add model",
-                "layout": "list",
-                "show_search": False,
-                "rows": self._add_model_rows,
-            },
-        )
+        self._install_builtin_pages()
+
+    def _install_builtin_pages(self) -> None:
+        self.pages["add_model"] = {
+            "title": t("settings.add_model"),
+            "layout": "list",
+            "show_search": False,
+            "rows": self._add_model_rows,
+        }
+
+    def retarget_pages(self, pages) -> None:
+        """Swap in freshly built page definitions, keeping the current stack.
+
+        Page chrome is read out of this dict on every render, so replacing it
+        is what makes a language switch reach titles and placeholders.
+        """
+        self.pages = dict(pages or {})
+        self._install_builtin_pages()
+        self._page_stack = [
+            page_id for page_id in self._page_stack if page_id in self.pages
+        ] or [next(iter(self.pages.keys()), "root")]
 
     def compose(self) -> ComposeResult:
         with Container(id="settings-frame"):
@@ -939,14 +954,18 @@ class SettingsModal(ModalScreen[None]):
                     yield HalfRowSpacer(id="settings-top-edge")
                     with Vertical(id="settings-dialog"):
                         with Horizontal(id="settings-header"):
-                            yield Static("<", id="settings-back-btn", classes="hidden")
-                            yield Static("Settings", id="settings-title")
-                            yield Static("esc", id="settings-close-btn")
+                            yield Static(
+                                t("settings.back"),
+                                id="settings-back-btn",
+                                classes="hidden",
+                            )
+                            yield Static(t("settings.title"), id="settings-title")
+                            yield Static(t("settings.close"), id="settings-close-btn")
                         with Vertical(id="settings-body"):
                             yield Static(classes="settings-gap")
                             with Horizontal(id="settings-search-row"):
                                 yield Input(
-                                    placeholder="Search settings",
+                                    placeholder=t("settings.search_placeholder"),
                                     id="settings-search",
                                 )
                                 with Container(id="settings-header-select-wrap"):
@@ -1373,12 +1392,12 @@ class SettingsModal(ModalScreen[None]):
             "#settings-archived-bulk-action", _ArchivedBulkAction
         )
 
-        title.update(str(page.get("title") or "Settings"))
+        title.update(str(page.get("title") or t("settings.title")))
         back_button.add_class("hidden")
-        close_button.update("esc")
-        add_button.update(str(page.get("add_label") or "Add model"))
+        close_button.update(t("settings.close"))
+        add_button.update(str(page.get("add_label") or t("settings.add_model")))
         search_input.placeholder = str(
-            page.get("search_placeholder") or "Search settings"
+            page.get("search_placeholder") or t("settings.search_placeholder")
         )
 
         show_search = bool(page.get("show_search", True)) and (
@@ -1608,18 +1627,18 @@ class SettingsModal(ModalScreen[None]):
         options_container = self.query_one("#settings-header-select-options", Vertical)
         self._header_select_options = [dict(option) for option in list(options or [])]
         wrap.add_class("visible")
-        trigger_label = str(label or "").strip() or "All project"
+        trigger_label = str(label or "").strip() or t("app.archived.all_projects")
         trigger.update(trigger_label)
-        trigger_width = max(12, len(trigger_label) + 2)
+        trigger_width = max(1, display_width(trigger_label) + 2)
         drop.styles.width = trigger_width
         drop.styles.min_width = trigger_width
         trigger.styles.width = trigger_width
         trigger.styles.min_width = trigger_width
 
         longest_label = max([
-            len(trigger_label),
+            display_width(trigger_label),
             *[
-                len(str(option.get("label") or ""))
+                display_width(str(option.get("label") or ""))
                 for option in self._header_select_options
                 if str(option.get("type") or "") != "separator"
             ],
@@ -1751,8 +1770,10 @@ class SettingsModal(ModalScreen[None]):
         return str(value or "").strip().lower() in {"true", "on", "yes", "1"}
 
     def _toggle_display_value(self, row: dict) -> str:
-        return (
-            "true" if self._is_toggle_enabled(str(row.get("value") or "")) else "false"
+        return t(
+            "common.true"
+            if self._is_toggle_enabled(str(row.get("value") or ""))
+            else "common.false"
         )
 
     def _toggle_next_value(self, row: dict) -> str:
@@ -1904,24 +1925,24 @@ class SettingsModal(ModalScreen[None]):
             if str(path or "").strip()
         ]
         self._set_header_select_state(
-            label=str(state.get("filter_label") or "All project"),
+            label=str(state.get("filter_label") or t("app.archived.all_projects")),
             options=list(state.get("filter_options") or []),
             selected_value=str(state.get("filter_value") or ""),
         )
         bulk_action = self.query_one(
             "#settings-archived-bulk-action", _ArchivedBulkAction
         )
-        bulk_label = str(state.get("bulk_remove_label") or "Remove all")
+        bulk_label = str(state.get("bulk_remove_label") or t("common.remove_all"))
         bulk_action.update(bulk_label)
-        bulk_action.styles.width = max(10, len(bulk_label) + 2)
-        bulk_action.styles.min_width = max(10, len(bulk_label) + 2)
+        bulk_action.styles.width = max(10, display_width(bulk_label) + 2)
+        bulk_action.styles.min_width = max(10, display_width(bulk_label) + 2)
         bulk_action.set_class(not self._archived_bulk_paths, "disabled")
 
         groups = list(state.get("groups") or [])
         if not groups:
             settings_list.mount(
                 Static(
-                    str(state.get("empty_label") or "No archived chats"),
+                    str(state.get("empty_label") or t("app.archived.empty")),
                     classes="settings-name",
                 )
             )
@@ -1957,12 +1978,12 @@ class SettingsModal(ModalScreen[None]):
                             classes="settings-archived-title",
                         ),
                         _ArchivedChatAction(
-                            "Remove",
+                            t("common.remove"),
                             id=self._archived_action_id(remove_index),
                             classes="settings-archived-action",
                         ),
                         _ArchivedChatAction(
-                            "Unarchive",
+                            t("common.unarchive"),
                             id=self._archived_action_id(unarchive_index),
                             classes="settings-archived-action",
                         ),
@@ -2128,9 +2149,12 @@ class SettingsModal(ModalScreen[None]):
                 (label for label, value in options if value == selected),
                 selected.title(),
             )
-            trigger_width = max(len(selected_label) + 1, 6)
+            trigger_width = max(display_width(selected_label) + 1, 1)
             option_width = max(
-                max((len(label) for label, _value in options), default=0) + 2,
+                max(
+                    (display_width(label) for label, _value in options), default=0
+                )
+                + 2,
                 trigger_width,
             )
             option_widgets = [
@@ -2171,7 +2195,7 @@ class SettingsModal(ModalScreen[None]):
             header_children.append(
                 Horizontal(
                     selector_drop,
-                    Static("limit", markup=False, classes="settings-limit-label"),
+                    Static(name, markup=False, classes="settings-limit-label"),
                     classes="settings-limit-name",
                 )
             )
@@ -2196,7 +2220,7 @@ class SettingsModal(ModalScreen[None]):
             option_widgets = []
             display_value = self._display_value(row)
             disabled_options = self._disabled_option_values(row)
-            trigger_width = max(len(display_value) + 2, 7)
+            trigger_width = max(display_width(display_value) + 2, 7)
             select_groups = self._select_groups(row)
             grouped_select = bool(row.get("option_groups"))
             selected_value = str(row.get("value") or "")
@@ -2215,7 +2239,7 @@ class SettingsModal(ModalScreen[None]):
                 self._set_collapsed_select_group_keys(row, collapsed_group_keys)
             option_width = max(
                 (
-                    len(str(label))
+                    display_width(str(label))
                     for group in select_groups
                     for label, _ in list(group.get("options") or [])
                 ),
@@ -2224,11 +2248,14 @@ class SettingsModal(ModalScreen[None]):
             option_width = max(
                 option_width,
                 max(
-                    (len(str(group.get("title") or "")) for group in select_groups),
+                    (
+                        display_width(str(group.get("title") or ""))
+                        for group in select_groups
+                    ),
                     default=0,
                 ),
             )
-            option_width = max(option_width, len(display_value)) + 2
+            option_width = max(option_width, display_width(display_value)) + 2
             flat_option_index = 0
             self._select_group_toggle_keys = {
                 key: value
@@ -2346,8 +2373,9 @@ class SettingsModal(ModalScreen[None]):
                 id=self._trigger_id(row_index),
                 classes="settings-control-trigger settings-toggle-trigger",
             )
-            trigger.styles.width = max(len(display_value) + 2, 7)
-            trigger.styles.min_width = max(len(display_value) + 2, 7)
+            trigger_width = display_width(display_value) + 2
+            trigger.styles.width = trigger_width
+            trigger.styles.min_width = trigger_width
             if self._is_toggle_enabled(str(row.get("value") or "")):
                 trigger.add_class("toggle-on")
             else:
@@ -2360,24 +2388,37 @@ class SettingsModal(ModalScreen[None]):
                 self._modalities_from_value(str(row.get("value") or ""))
             )
             remaining_modalities = self._remaining_modalities(row)
+            modality_labels = {
+                str(value): str(label)
+                for label, value in self._select_options(row)
+            }
+            remaining_options = [
+                (modality, modality_labels.get(modality, str(modality).title()))
+                for modality in remaining_modalities
+            ]
             option_width = (
-                max((len(item) for item in remaining_modalities), default=0) + 2
+                max(
+                    (display_width(label) for _modality, label in remaining_options),
+                    default=0,
+                )
+                + 2
             )
-            option_width = max(option_width, 7)
+            option_width = max(option_width, 1)
             option_buttons = [
                 _OptionItem(
-                    str(modality).title(),
+                    label,
                     id=self._modalities_option_id(row_index, option_index),
                     classes="settings-option-btn",
                 )
-                for option_index, modality in enumerate(remaining_modalities)
+                for option_index, (_modality, label) in enumerate(remaining_options)
             ]
             options_container = Vertical(
                 *option_buttons,
                 id=self._options_id(row_index),
                 classes="settings-options",
             )
-            add_width = 5
+            add_label = t("modal.add")
+            add_width = display_width(add_label) + 2
             options_container.styles.width = option_width
             options_container.styles.min_width = option_width
             options_container.styles.offset = (add_width - option_width, 0)
@@ -2385,7 +2426,7 @@ class SettingsModal(ModalScreen[None]):
             for modality in selected_modalities:
                 controls.append(
                     _ModalitiesChip(
-                        f"\u00d7 {str(modality).title()}",
+                        f"\u00d7 {modality_labels.get(modality, str(modality).title())}",
                         markup=False,
                         id=self._modalities_remove_id(row_index, modality),
                         classes="settings-modalities-chip",
@@ -2395,7 +2436,7 @@ class SettingsModal(ModalScreen[None]):
             if not remaining_modalities:
                 add_classes += " disabled"
             add_trigger = _ModalitiesAddTrigger(
-                "Add",
+                add_label,
                 markup=False,
                 id=self._modalities_add_id(row_index),
                 classes=add_classes,
@@ -2543,7 +2584,7 @@ class SettingsModal(ModalScreen[None]):
         input_widget = Input(**input_kwargs)
         if row.get("unit"):
             input_widget.add_class("settings-edit-input-unit")
-        input_width = max(len(current_value or placeholder_value) + 3, 8)
+        input_width = max(display_width(current_value or placeholder_value) + 3, 8)
         input_widget.styles.width = input_width
         if row.get("edit_type") == _EDIT_AUTOCOMPLETE:
             options = self._autocomplete_options(row)
@@ -2566,7 +2607,7 @@ class SettingsModal(ModalScreen[None]):
                     )
                     for option_index, option in enumerate(filtered)
                 )
-                longest_label = max(len(option) for option in filtered)
+                longest_label = max(display_width(option) for option in filtered)
             else:
                 longest_label = input_width
             option_classes = "settings-options settings-autocomplete-options"
@@ -2638,7 +2679,7 @@ class SettingsModal(ModalScreen[None]):
         for child in list(options_container.children):
             child.remove()
 
-        input_width = max(len(str(query or "")) + 3, 8)
+        input_width = max(display_width(str(query or "")) + 3, 8)
         input_widget.styles.width = input_width
         drop_container.styles.width = input_width
         drop_container.styles.min_width = input_width
@@ -2661,7 +2702,7 @@ class SettingsModal(ModalScreen[None]):
                     classes="settings-option-btn",
                 )
             )
-        longest_label = max(len(option) for option in filtered)
+        longest_label = max(display_width(option) for option in filtered)
 
         option_width = max(input_width, longest_label + 2)
         options_container.styles.width = option_width
@@ -2776,7 +2817,7 @@ class SettingsModal(ModalScreen[None]):
 
     def _add_model_rows(self) -> list[dict]:
         draft = dict(self._add_model_draft or {})
-        bool_choices = [("true", "true"), ("false", "false")]
+        bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         api_type_choices = [
             ("Ollama", API_TYPE_OLLAMA),
             ("OpenAI", API_TYPE_OPENAI),
@@ -2880,16 +2921,16 @@ class SettingsModal(ModalScreen[None]):
                 "keywords": "extra_modalities modalities audio image video",
                 "edit_type": "modalities",
                 "options": [
-                    ("audio", "audio"),
-                    ("image", "image"),
-                    ("video", "video"),
+                    (t("app.model.modality.audio"), "audio"),
+                    (t("app.model.modality.image"), "image"),
+                    (t("app.model.modality.video"), "video"),
                 ],
                 "on_change": lambda v: self._set_add_model_field(
                     "extra_modalities", str(v)
                 ),
             },
             {
-                "name": "Limit",
+                "name": t("app.model.limit"),
                 "keywords": "extra_modalities multimodal_limit upload size total",
                 "edit_type": "input",
                 "unit": "MB",
@@ -2912,17 +2953,19 @@ class SettingsModal(ModalScreen[None]):
         )
         if selected_modalities:
             limit_options = [
-                (modality.title(), modality)
+                (t(f"app.model.modality.{modality}"), modality)
                 for modality in SUPPORTED_EXTRA_MODALITIES
                 if modality in selected_modalities
             ]
-            limit_options.append(("Total", "total"))
+            limit_options.append((t("app.value.total"), "total"))
             available_limit_keys = {value for _label, value in limit_options}
             selected_limit = str(draft.get("selected_limit") or "total")
             if selected_limit not in available_limit_keys:
                 selected_limit = limit_options[0][1]
                 self._add_model_draft["selected_limit"] = selected_limit
-            limit_row = next(row for row in rows if row.get("name") == "Limit")
+            limit_row = next(
+                row for row in rows if row.get("name") == t("app.model.limit")
+            )
             limit_row.update(
                 {
                     "limit_key": selected_limit,
@@ -3040,7 +3083,9 @@ class SettingsModal(ModalScreen[None]):
         try:
             created = add_model_profile_with_config(name, payload)
         except Exception as error:
-            self.app_ref.add_status_message("[✗]", f"新增模型失败: {error}")
+            self.app_ref.add_status_message(
+                "[✗]", t("settings.add_model_failed", error=error)
+            )
             return ""
         self.app_ref._reload_config()
         self.app_ref._sync_chat_from_active_model()

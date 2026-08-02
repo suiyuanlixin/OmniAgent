@@ -42,6 +42,12 @@ from ..config import (
     save_model_profile_field,
     supported_reasoning_efforts,
 )
+from ..i18n import (
+    display_width,
+    language_options,
+    set_language,
+    t,
+)
 from ..installer import PROVIDERS, install_registry_skill
 from ..memory import MemoryStore
 from ..main import attach_external_file_references_with_media
@@ -156,6 +162,11 @@ Toast.-error .toast--title {
     color: $foreground;
 }
 """
+
+# Reasoning-effort values that have a translated label. "none" maps to "off".
+REASONING_LABEL_KEYS = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 
 
 @dataclass
@@ -458,6 +469,8 @@ class AgentTUIApp(App):
     def __init__(self) -> None:
         super().__init__()
         self._config_cache = load_config()
+        # Must precede compose(): static labels are translated at build time.
+        set_language(self._config_cache.language)
         self.chat: OmniAgent | None = None
         self.chat_busy = False
         self.current_session_record: dict | None = None
@@ -496,9 +509,9 @@ class AgentTUIApp(App):
         groups = [
             {
                 "provider": "auto",
-                "title": "Auto",
+                "title": t("common.auto"),
                 "models": [AUTO_MODEL_SELECTION],
-                "options": [(AUTO_MODEL_SELECTION, AUTO_MODEL_SELECTION)],
+                "options": [(t("common.auto"), AUTO_MODEL_SELECTION)],
             }
         ]
         groups.extend(self._grouped_model_choices())
@@ -558,12 +571,18 @@ class AgentTUIApp(App):
                             yield ProjectPicker(id="project-picker")
                             with Horizontal(id="interrupt-hint"):
                                 yield Label("esc", id="interrupt-key")
-                                yield Label("interrupt", id="interrupt-text")
-                            yield Button("Dismiss", id="prompt-dismiss")
+                                yield Label(
+                                    t("app.info.interrupt_text"), id="interrupt-text"
+                                )
+                            yield Button(
+                                t("app.info.dismiss"), id="prompt-dismiss"
+                            )
                             with Horizontal(id="prompt-nav"):
-                                yield Button("Back", id="prompt-back")
-                                yield Button("Next", id="prompt-next")
-                            yield Label("Context: 0.0k (0%)", id="context-label")
+                                yield Button(t("app.info.back"), id="prompt-back")
+                                yield Button(t("app.info.next"), id="prompt-next")
+                            yield Label(
+                                t("app.info.context_initial"), id="context-label"
+                            )
                         yield HalfRowSpacer(id="info-bar-bottom")
 
     def on_mount(self) -> None:
@@ -656,7 +675,9 @@ class AgentTUIApp(App):
             try:
                 self._ensure_ready_for_message()
             except Exception as error:
-                self.add_status_message("[✗]", f"初始化对话失败: {error}")
+                self.add_status_message(
+                    "[✗]", t("app.toast.chat_init_failed", error=error)
+                )
                 return
 
         chat_view = self.query_one("#messages-view", ChatView)
@@ -699,7 +720,7 @@ class AgentTUIApp(App):
             str(result.get("type") or ""), str(result.get("path") or "")
         )
         if not inserted:
-            self.add_status_message("[✗]", "引用路径不存在或类型不匹配。")
+            self.add_status_message("[✗]", t("app.toast.reference_invalid"))
 
     def on_chat_input_model_changed(self, event: ChatInput.ModelChanged) -> None:
         save_config_field("current_model", event.value)
@@ -790,11 +811,11 @@ class AgentTUIApp(App):
 
     def on_sidebar_session_selected(self, event: Sidebar.SessionSelected) -> None:
         if self.chat_busy:
-            self.add_status_message("[!]", "当前正在处理中，暂时不能切换会话。")
+            self.add_status_message("[!]", t("app.toast.busy_switch_session"))
             return
         record = load_session(event.session_path)
         if not record:
-            self.add_status_message("[✗]", "无法读取所选会话。")
+            self.add_status_message("[✗]", t("app.toast.session_read_failed"))
             return
         self._load_session_record(record)
 
@@ -802,7 +823,7 @@ class AgentTUIApp(App):
         self, event: Sidebar.SessionActionRequested
     ) -> None:
         if self.chat_busy:
-            self.add_status_message("[!]", "当前正在处理中，暂时不能操作会话。")
+            self.add_status_message("[!]", t("app.toast.busy_session_action"))
             return
         session_path = str(event.session_path or "").strip()
         action = str(event.action or "").strip().lower()
@@ -818,13 +839,13 @@ class AgentTUIApp(App):
         try:
             if action == "pin":
                 pin_session(session_path)
-                self.add_status_message("[✓]", "已置顶对话。")
+                self.add_status_message("[✓]", t("app.toast.session_pinned"))
             elif action == "unpin":
                 unpin_session(session_path)
-                self.add_status_message("[✓]", "已取消置顶。")
+                self.add_status_message("[✓]", t("app.toast.session_unpinned"))
             elif action == "archive":
                 self._archive_session_record(session_path)
-                self.add_status_message("[✓]", "已归档对话。")
+                self.add_status_message("[✓]", t("app.toast.session_archived"))
             elif action == "rename":
                 renamed = rename_session(session_path, value)
                 if (
@@ -835,16 +856,18 @@ class AgentTUIApp(App):
                     == session_path
                 ):
                     self.current_session_record = renamed
-                self.add_status_message("[✓]", "已重命名对话。")
+                self.add_status_message("[✓]", t("app.toast.session_renamed"))
             elif action == "load":
                 record = load_session(session_path)
                 if not record:
-                    self.add_status_message("[✗]", "无法读取所选会话。")
+                    self.add_status_message("[✗]", t("app.toast.session_read_failed"))
                     return
                 self._load_session_record(record)
                 return
         except Exception as error:
-            self.add_status_message("[✗]", f"会话操作失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.session_action_failed", error=error)
+            )
             return
         self._refresh_project_views()
 
@@ -852,7 +875,7 @@ class AgentTUIApp(App):
         self, event: Sidebar.ProjectActionRequested
     ) -> None:
         if self.chat_busy:
-            self.add_status_message("[!]", "当前正在处理中，暂时不能操作项目。")
+            self.add_status_message("[!]", t("app.toast.busy_project_action"))
             return
         project_slug = str(event.project_slug or "").strip()
         action = str(event.action or "").strip().lower()
@@ -874,10 +897,10 @@ class AgentTUIApp(App):
         try:
             if action == "pin":
                 pin_project(project_slug)
-                self.add_status_message("[✓]", "已置顶项目。")
+                self.add_status_message("[✓]", t("app.toast.project_pinned"))
             elif action == "unpin":
                 unpin_project(project_slug)
-                self.add_status_message("[✓]", "已取消置顶项目。")
+                self.add_status_message("[✓]", t("app.toast.project_unpinned"))
             elif action == "rename":
                 updated = rename_project(project_slug, value)
                 if (
@@ -891,7 +914,7 @@ class AgentTUIApp(App):
                     and self.current_session_record is not None
                 ):
                     self.current_session_record["project"] = updated.to_dict()
-                self.add_status_message("[✓]", "已重命名项目。")
+                self.add_status_message("[✓]", t("app.toast.project_renamed"))
             elif action == "archive":
                 archived_count = archive_project_sessions(project_slug)
                 if (
@@ -900,7 +923,7 @@ class AgentTUIApp(App):
                 ):
                     self._clear_loaded_session_state(refresh_sidebar=False)
                 self.add_status_message(
-                    "[✓]", f"已归档项目对话，共归档 {archived_count} 个对话。"
+                    "[✓]", t("app.toast.project_archived", count=archived_count)
                 )
             elif action == "remove":
                 removed = remove_project(project_slug)
@@ -914,9 +937,13 @@ class AgentTUIApp(App):
                     and current_session_project.slug == project_slug
                 ):
                     self._clear_loaded_session_state(refresh_sidebar=False)
-                self.add_status_message("[✓]", f"已移除项目 {removed.name}。")
+                self.add_status_message(
+                    "[✓]", t("app.toast.project_removed", name=removed.name)
+                )
         except Exception as error:
-            self.add_status_message("[✗]", f"项目操作失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.project_action_failed", error=error)
+            )
             return
         self._refresh_project_views()
 
@@ -935,7 +962,7 @@ class AgentTUIApp(App):
             main_area.add_class("sidebar-visible")
             sidebar.remove_class("sidebar-hidden")
             sidebar.add_class("sidebar-visible")
-            toggle.update("= Sessions")
+            toggle.update(f"= {t('app.info.sessions')}")
         else:
             left_edge.remove_class("sidebar-visible")
             left_edge.add_class("sidebar-hidden")
@@ -956,7 +983,9 @@ class AgentTUIApp(App):
             self.pop_screen()
 
     def action_quit_attempt(self) -> None:
-        self.notify("Press Ctrl+Q to quit", title="Quit", severity="information")
+        self.notify(
+            t("app.quit.hint"), title=t("app.quit.title"), severity="information"
+        )
 
     def action_quit_app(self) -> None:
         self.exit()
@@ -1423,12 +1452,17 @@ class AgentTUIApp(App):
             prompt_nav.remove_class("visible")
             back_button.remove_class("hidden")
             context_label.remove_class("hidden")
-            dismiss_button.styles.width = 9
-            dismiss_button.styles.min_width = 9
-            back_button.styles.width = 6
-            back_button.styles.min_width = 6
-            next_button.styles.width = 6
-            next_button.styles.min_width = 6
+            # Widths follow the resolved labels: CJK needs about twice the
+            # cells of the English defaults these used to be sized for.
+            idle_dismiss = display_width(t("app.info.dismiss")) + 2
+            idle_back = display_width(t("app.info.back")) + 2
+            idle_next = display_width(t("app.info.next")) + 2
+            dismiss_button.styles.width = idle_dismiss
+            dismiss_button.styles.min_width = idle_dismiss
+            back_button.styles.width = idle_back
+            back_button.styles.min_width = idle_back
+            next_button.styles.width = idle_next
+            next_button.styles.min_width = idle_next
             back_button.styles.margin_right = 1
             if chat_input.chat_active:
                 project_picker.add_class("hidden")
@@ -1452,13 +1486,13 @@ class AgentTUIApp(App):
             back_button.remove_class("hidden")
             back_button.styles.margin_right = 1
         next_button.label = (
-            "Submit"
+            t("common.submit")
             if current_index >= len(self._prompt_request.questions) - 1
-            else "Next"
+            else t("common.next")
         )
-        dismiss_width = len(str(dismiss_button.label or "")) + 2
-        back_width = len(str(back_button.label or "")) + 2
-        next_width = len(str(next_button.label or "")) + 2
+        dismiss_width = display_width(str(dismiss_button.label or "")) + 2
+        back_width = display_width(str(back_button.label or "")) + 2
+        next_width = display_width(str(next_button.label or "")) + 2
         dismiss_button.styles.width = dismiss_width
         dismiss_button.styles.min_width = dismiss_width
         back_button.styles.width = back_width
@@ -1788,11 +1822,12 @@ class AgentTUIApp(App):
         value = f"{input_tokens / 1000:.1f}k"
         percent = (input_tokens / context_window_tokens) * 100
         self.query_one("#context-label", Label).update(
-            f"Context: {value} ({percent:.0f}%)"
+            t("app.info.context", value=value, percent=f"{percent:.0f}")
         )
 
     def _reload_config(self) -> None:
         self.config = load_config()
+        set_language(self.config.language)
 
     def _apply_config_to_controls(self) -> None:
         try:
@@ -1828,12 +1863,18 @@ class AgentTUIApp(App):
 
     @staticmethod
     def _reasoning_label(value: str, title_case: bool = False) -> str:
+        """Display label for a reasoning-effort value.
+
+        ``title_case`` only affects English: the chat-input selector wants
+        "Medium" while the settings row wants "medium". CJK labels have no
+        case, so the flag is a no-op there and callers keep working unchanged.
+        """
         text = str(value or "").strip().lower()
-        if text == "none":
-            return "Off" if title_case else "off"
-        if text == "xhigh":
-            return "XHigh" if title_case else "xhigh"
-        return text.capitalize() if title_case else text
+        key = "off" if text == "none" else text
+        label = t(f"app.reasoning.{key}") if key in REASONING_LABEL_KEYS else text
+        if title_case or not label.isascii():
+            return label
+        return label.lower()
 
     def _reasoning_choices_for_api(
         self,
@@ -1999,15 +2040,25 @@ class AgentTUIApp(App):
             try:
                 prompt_path.write_text(USER_PROMPT_TEMPLATE, encoding="utf-8")
             except OSError as error:
-                self.add_status_message("[✗]", f"创建 {USER_PROMPT_FILE} 失败: {error}")
+                self.add_status_message(
+                    "[✗]",
+                    t(
+                        "app.toast.prompt_create_failed",
+                        file=USER_PROMPT_FILE,
+                        error=error,
+                    ),
+                )
                 return
         try:
             value = prompt_path.read_text(encoding="utf-8")
         except OSError as error:
-            self.add_status_message("[✗]", f"读取 {USER_PROMPT_FILE} 失败: {error}")
+            self.add_status_message(
+                "[✗]",
+                t("app.toast.prompt_read_failed", file=USER_PROMPT_FILE, error=error),
+            )
             return
         self.push_screen(
-            PromptFileModal("System prompt", value=value),
+            PromptFileModal(t("settings.page.system_prompt"), value=value),
             callback=self._handle_user_prompt_result,
         )
 
@@ -2017,9 +2068,14 @@ class AgentTUIApp(App):
         try:
             Path(USER_PROMPT_FILE).write_text(str(result), encoding="utf-8")
         except OSError as error:
-            self.add_status_message("[✗]", f"保存 {USER_PROMPT_FILE} 失败: {error}")
+            self.add_status_message(
+                "[✗]",
+                t("app.toast.prompt_save_failed", file=USER_PROMPT_FILE, error=error),
+            )
             return
-        self.add_status_message("[✓]", f"已保存 {USER_PROMPT_FILE}")
+        self.add_status_message(
+            "[✓]", t("app.toast.prompt_saved", file=USER_PROMPT_FILE)
+        )
 
     def _normalize_archived_project_filter(self, value: str) -> str:
         filter_value = str(value or "").strip()
@@ -2032,13 +2088,15 @@ class AgentTUIApp(App):
 
     def _archived_project_filter_options(self) -> list[dict]:
         projects = load_projects()
-        options = [{"label": "All project", "value": "__all__"}]
+        options = [{"label": t("app.archived.all_projects"), "value": "__all__"}]
         options.append({"type": "separator"})
         options.extend(
             {"label": project.name, "value": project.slug} for project in projects
         )
         options.append({"type": "separator"})
-        options.append({"label": "Without project", "value": "__none__"})
+        options.append(
+            {"label": t("app.archived.without_project"), "value": "__none__"}
+        )
         return options
 
     def _archived_project_filter_label(self) -> str:
@@ -2046,13 +2104,13 @@ class AgentTUIApp(App):
             self._archived_project_filter
         )
         if filter_value == "__none__":
-            return "Without project"
+            return t("app.archived.without_project")
         if filter_value == "__all__":
-            return "All project"
+            return t("app.archived.all_projects")
         for project in load_projects():
             if project.slug == filter_value:
                 return project.name
-        return "All project"
+        return t("app.archived.all_projects")
 
     def _on_archived_project_filter_changed(self, value: str) -> None:
         self._archived_project_filter = self._normalize_archived_project_filter(value)
@@ -2064,10 +2122,10 @@ class AgentTUIApp(App):
             return
         if action_name == "unarchive":
             self._unarchive_session_record(session_path)
-            self.add_status_message("[✓]", "已取消归档对话。")
+            self.add_status_message("[✓]", t("app.toast.chat_unarchived"))
         elif action_name == "remove":
             self._delete_session_record(session_path)
-            self.add_status_message("[✓]", "已永久删除对话。")
+            self.add_status_message("[✓]", t("app.toast.chat_deleted"))
         else:
             return
         self._refresh_project_views()
@@ -2083,7 +2141,7 @@ class AgentTUIApp(App):
         for session_path in paths:
             self._delete_session_record(session_path)
         self._refresh_project_views()
-        self.add_status_message("[✓]", f"已永久删除 {len(paths)} 个对话。")
+        self.add_status_message("[✓]", t("app.toast.chats_deleted", count=len(paths)))
 
     def _settings_archived_chats_state(self, query: str = "") -> dict:
         self._archived_project_filter = self._normalize_archived_project_filter(
@@ -2129,7 +2187,7 @@ class AgentTUIApp(App):
                     group_title = project_name
                 else:
                     order = (2, 0, "")
-                    group_title = "Without project"
+                    group_title = t("app.archived.without_project")
                 groups_by_key[group_value] = {
                     "title": group_title,
                     "order": order,
@@ -2146,89 +2204,89 @@ class AgentTUIApp(App):
             "filter_label": self._archived_project_filter_label(),
             "filter_value": selected_filter,
             "filter_options": self._archived_project_filter_options(),
-            "bulk_remove_label": "Remove all",
+            "bulk_remove_label": t("common.remove_all"),
             "bulk_remove_paths": filtered_session_paths,
             "groups": groups,
-            "empty_label": "No archived chats",
+            "empty_label": t("app.archived.empty"),
         }
 
     def _settings_pages(self) -> dict[str, dict]:
         return {
             "root": {
-                "title": "Settings",
+                "title": t("settings.title"),
                 "layout": "list",
                 "rows": self._settings_home_rows,
             },
             "general": {
-                "title": "General",
+                "title": t("settings.page.general"),
                 "layout": "list",
                 "rows": self._settings_general_rows,
             },
             "archived_chats": {
-                "title": "Archived chats",
+                "title": t("settings.page.archived_chats"),
                 "layout": "archived_chats",
-                "search_placeholder": "Search archived chats",
+                "search_placeholder": t("settings.search_archived"),
                 "state": self._settings_archived_chats_state,
                 "on_header_select_change": self._on_archived_project_filter_changed,
                 "on_archived_bulk_remove": self._on_archived_bulk_remove,
                 "on_archived_action": self._on_archived_chat_action,
             },
             "model_list": {
-                "title": "Model list",
+                "title": t("settings.page.model_list"),
                 "layout": "model_list",
                 "show_search": False,
                 "state": self._settings_model_page_state,
             },
             "agent_mode": {
-                "title": "Agent mode",
+                "title": t("settings.page.agent_mode"),
                 "layout": "list",
                 "rows": self._settings_agent_mode_rows,
             },
             "skills": {
-                "title": "Skills",
+                "title": t("settings.page.skills"),
                 "layout": "list",
                 "rows": self._settings_skills_rows,
             },
             "installed_skills": {
-                "title": "Installed skills",
+                "title": t("settings.page.installed_skills"),
                 "layout": "model_list",
                 "show_search": False,
-                "add_label": "Install skill",
+                "add_label": t("settings.install_skill"),
                 "add_page": "add_skill",
                 "state": self._settings_installed_skills_state,
             },
             "add_skill": {
-                "title": "Install skill",
+                "title": t("settings.page.add_skill"),
                 "layout": "list",
                 "show_search": False,
                 "rows": self._settings_add_skill_rows,
             },
             "auto_compact": {
-                "title": "Auto compact",
+                "title": t("settings.page.auto_compact"),
                 "layout": "list",
                 "rows": self._settings_auto_compact_rows,
             },
             "memory_system": {
-                "title": "Memory system",
+                "title": t("settings.page.memory_system"),
                 "layout": "list",
                 "rows": self._settings_memory_rows,
             },
             "web_search": {
-                "title": "Web search",
+                "title": t("settings.page.web_search"),
                 "layout": "list",
                 "rows": self._settings_web_search_rows,
             },
             "help": {
-                "title": "Commands",
+                "title": t("settings.page.help"),
                 "layout": "list",
                 "show_search": False,
                 "rows": self._help_command_rows,
             },
             "team": {
-                "title": "Agent team",
+                "title": t("settings.page.team"),
                 "layout": "model_list",
                 "show_search": False,
-                "add_label": "Add member",
+                "add_label": t("settings.add_member"),
                 "state": self._settings_team_page_state,
                 "on_add_item": self._on_setting_add_team_member,
             },
@@ -2237,75 +2295,83 @@ class AgentTUIApp(App):
     def _settings_home_rows(self) -> list[dict]:
         return [
             {
-                "name": "General",
+                "name": t("settings.page.general"),
                 "value": ">",
-                "keywords": "general markdown",
+                "keywords": "general markdown language 通用 语言",
                 "edit_type": "nav",
                 "target_page": "general",
             },
             {
-                "name": "Model list",
+                "name": t("settings.page.model_list"),
                 "value": ">",
-                "keywords": "model list model_list current_model",
+                "keywords": "model list model_list current_model 模型",
                 "edit_type": "nav",
                 "target_page": "model_list",
             },
             {
-                "name": "Agent mode",
+                "name": t("settings.page.agent_mode"),
                 "value": ">",
-                "keywords": "agent mode agent_mode",
+                "keywords": "agent mode agent_mode 模式",
                 "edit_type": "nav",
                 "target_page": "agent_mode",
             },
             {
-                "name": "Skills",
+                "name": t("settings.page.skills"),
                 "value": ">",
-                "keywords": "skills",
+                "keywords": "skills 技能",
                 "edit_type": "nav",
                 "target_page": "skills",
             },
             {
-                "name": "Auto compact",
+                "name": t("settings.page.auto_compact"),
                 "value": ">",
-                "keywords": "auto compact auto_compact",
+                "keywords": "auto compact auto_compact 压缩",
                 "edit_type": "nav",
                 "target_page": "auto_compact",
             },
             {
-                "name": "Memory system",
+                "name": t("settings.page.memory_system"),
                 "value": ">",
-                "keywords": "memory system memory_system",
+                "keywords": "memory system memory_system 记忆",
                 "edit_type": "nav",
                 "target_page": "memory_system",
             },
             {
-                "name": "System prompt",
+                "name": t("settings.page.system_prompt"),
                 "value": "",
-                "keywords": "system prompt prompt.md edit",
+                "keywords": "system prompt prompt.md edit 提示词",
                 "edit_type": "action",
                 "on_activate": self._open_user_prompt_editor,
             },
             {
-                "name": "Web search",
+                "name": t("settings.page.web_search"),
                 "value": ">",
-                "keywords": "web search web_search",
+                "keywords": "web search web_search 搜索 网络",
                 "edit_type": "nav",
                 "target_page": "web_search",
             },
             {
-                "name": "Archived chats",
+                "name": t("settings.page.archived_chats"),
                 "value": ">",
-                "keywords": "archived chats archive chat history",
+                "keywords": "archived chats archive chat history 归档 会话",
                 "edit_type": "nav",
                 "target_page": "archived_chats",
             },
         ]
 
     def _settings_general_rows(self) -> list[dict]:
-        bool_choices = [("true", "true"), ("false", "false")]
+        bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         return [
             {
-                "name": "Use markdown",
+                "name": t("settings.language"),
+                "value": self.config.language,
+                "keywords": "language lang i18n locale english chinese 语言 中文 英文",
+                "edit_type": "select",
+                "options": language_options(),
+                "on_change": lambda v: self._on_setting_language_changed(v),
+            },
+            {
+                "name": t("settings.use_markdown"),
                 "value": "true" if self.config.render_markdown else "false",
                 "keywords": "markdown render_markdown",
                 "edit_type": "toggle",
@@ -2363,7 +2429,7 @@ class AgentTUIApp(App):
             "rows": self._settings_model_rows(selected_model),
             "footer_actions": [
                 {
-                    "label": "Delete",
+                    "label": t("common.delete"),
                     "disabled": not bool(selected_model),
                     "on_activate": lambda key=selected_model: (
                         self._on_setting_delete_model(key)
@@ -2380,7 +2446,7 @@ class AgentTUIApp(App):
             model_key if model_key in config.model_list else config.active_model_name
         )
         active_model = config.model_list.get(selected_key, config.active_model)
-        bool_choices = [("true", "true"), ("false", "false")]
+        bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         reasoning_choices = self._reasoning_choices_for_api(active_model.api_type)
         current_effort = normalize_reasoning_effort_for_api(
             active_model.api_type,
@@ -2391,15 +2457,17 @@ class AgentTUIApp(App):
 
         rows = [
             {
-                "name": "Provider",
+                "name": t("app.row.provider"),
+                "row_id": "provider",
                 "value": active_model.provider,
-                "keywords": "provider",
+                "keywords": "provider 服务商",
                 "edit_type": "none",
             },
             {
-                "name": "API type",
+                "name": t("app.model.api_type"),
+                "row_id": "api_type",
                 "value": active_model.api_type,
-                "keywords": "api_type",
+                "keywords": "api_type 类型",
                 "edit_type": "select",
                 "options": [
                     ("Ollama", API_TYPE_OLLAMA),
@@ -2411,106 +2479,117 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_model_api_type_changed(v),
             },
             {
-                "name": "Model name",
+                "name": t("app.model.name"),
+                "row_id": "profile_name",
                 "value": active_model.profile_name,
-                "keywords": "model name rename",
+                "keywords": "model name rename 名称 重命名",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_model_name_changed(v),
             },
             {
-                "name": "Base URL",
+                "name": t("app.model.base_url"),
+                "row_id": "base_url",
                 "value": active_model.base_url,
-                "keywords": "base_url",
+                "keywords": "base_url 地址",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_model_base_url_changed(v),
             },
             {
-                "name": "Model",
+                "name": t("app.model.model"),
+                "row_id": "model",
                 "value": active_model.model,
-                "keywords": "model backend",
+                "keywords": "model backend 模型",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_model_id_changed(v),
             },
             {
-                "name": "API key",
+                "name": t("app.row.api_key"),
+                "row_id": "api_key",
                 "value": active_model.api_key,
-                "keywords": "api_key",
+                "keywords": "api_key 密钥",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_model_api_key_changed(v),
             },
             {
-                "name": "Max tokens",
+                "name": t("app.model.max_tokens"),
+                "row_id": "max_tokens",
                 "value": str(active_model.max_tokens),
-                "keywords": "max_tokens",
+                "keywords": "max_tokens token",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_token_changed(v),
             },
             {
-                "name": "Temperature",
+                "name": t("app.model.temperature"),
+                "row_id": "temperature",
                 "value": str(active_model.temperature),
-                "keywords": "temperature",
+                "keywords": "temperature 温度",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_temp_changed(v),
             },
             {
-                "name": "Stream",
+                "name": t("app.model.stream"),
+                "row_id": "stream_mode",
                 "value": "true" if active_model.stream_mode else "false",
-                "keywords": "stream_mode stream",
+                "keywords": "stream_mode stream 流式",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_stream_changed(v),
             },
             {
-                "name": "Thinking",
+                "name": t("app.model.thinking"),
+                "row_id": "thinking_mode",
                 "value": "true" if active_model.thinking_mode else "false",
-                "keywords": "thinking_mode thinking",
+                "keywords": "thinking_mode thinking 思考",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_model_thinking_changed(v),
             },
             {
-                "name": "Extra modalities",
+                "name": t("app.model.extra_modalities"),
+                "row_id": "extra_modalities",
                 "value": format_extra_modalities(active_model.extra_modalities),
-                "keywords": "extra_modalities modalities audio image video",
+                "keywords": "extra_modalities modalities audio image video 模态",
                 "edit_type": "modalities",
                 "options": [
-                    ("audio", "audio"),
-                    ("image", "image"),
-                    ("video", "video"),
+                    (t("app.model.modality.audio"), "audio"),
+                    (t("app.model.modality.image"), "image"),
+                    (t("app.model.modality.video"), "video"),
                 ],
                 "on_change": lambda v: self._on_setting_model_extra_modalities_changed(
                     v
                 ),
             },
             {
-                "name": "Limit",
-                "keywords": "extra_modalities multimodal_limit upload size total",
+                "name": t("app.model.limit"),
+                "row_id": "limit",
+                "keywords": "extra_modalities multimodal_limit upload size total 上限",
                 "edit_type": "input",
                 "unit": "MB",
                 "limit_selector": True,
             },
             {
-                "name": "Context",
+                "name": t("app.model.context"),
+                "row_id": "context_window_tokens",
                 "value": str(active_model.context_window_tokens),
-                "keywords": "context_window_tokens context",
+                "keywords": "context_window_tokens context 上下文",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_model_context_changed(v),
             },
         ]
         if active_model.api_type == API_TYPE_GLM:
-            rows = [row for row in rows if row.get("name") != "Base URL"]
+            rows = [row for row in rows if row.get("row_id") != "base_url"]
         if active_model.extra_modalities:
             limit_options = [
-                (modality.title(), modality)
+                (t(f"app.model.modality.{modality}"), modality)
                 for modality in SUPPORTED_EXTRA_MODALITIES
                 if modality in active_model.extra_modalities
             ]
-            limit_options.append(("Total", "total"))
+            limit_options.append((t("app.value.total"), "total"))
             available_limit_keys = {value for _label, value in limit_options}
             if self._settings_model_limit_key not in available_limit_keys:
                 self._settings_model_limit_key = limit_options[0][1]
             selected_limit_key = self._settings_model_limit_key
-            limit_row = next(row for row in rows if row.get("name") == "Limit")
+            limit_row = next(row for row in rows if row.get("row_id") == "limit")
             limit_row.update(
                 {
                     "limit_key": selected_limit_key,
@@ -2527,19 +2606,20 @@ class AgentTUIApp(App):
                 }
             )
         else:
-            rows = [row for row in rows if row.get("name") != "Limit"]
+            rows = [row for row in rows if row.get("row_id") != "limit"]
 
         if active_model.thinking_mode:
             rows.insert(
                 next(
                     index
                     for index, row in enumerate(rows)
-                    if row.get("name") == "Extra modalities"
+                    if row.get("row_id") == "extra_modalities"
                 ),
                 {
-                    "name": "Reasoning effort",
+                    "name": t("app.model.reasoning_effort"),
+                    "row_id": "reasoning_effort",
                     "value": current_effort,
-                    "keywords": "reasoning_effort",
+                    "keywords": "reasoning_effort 推理 强度",
                     "edit_type": "select",
                     "options": reasoning_choices,
                     "on_change": lambda v: (
@@ -2560,7 +2640,9 @@ class AgentTUIApp(App):
         try:
             renamed = rename_model_profile(old_name, new_name)
         except Exception as error:
-            self.add_status_message("[✗]", f"模型重命名失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.model_rename_failed", error=error)
+            )
             return
         self._settings_model_profile_key = renamed
         self._reload_config()
@@ -2569,78 +2651,83 @@ class AgentTUIApp(App):
         self._apply_config_to_controls()
 
     def _settings_agent_mode_rows(self) -> list[dict]:
-        bool_choices = [("true", "true"), ("false", "false")]
+        bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         return [
             {
-                "name": "Max rounds",
+                "name": t("app.agent.max_rounds"),
                 "value": str(self.config.max_agent_rounds),
-                "keywords": "max_rounds",
+                "keywords": "max_rounds 轮数",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_rounds_changed(v),
             },
             {
-                "name": "Max tool calls",
+                "name": t("app.agent.max_tool_calls"),
                 "value": str(self.config.max_agent_tool_calls),
-                "keywords": "max_tool_calls",
+                "keywords": "max_tool_calls 工具 调用",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_tool_calls_changed(v),
             },
             {
-                "name": "File inline chars",
+                "name": t("app.agent.file_inline_chars"),
                 "value": str(self.config.file_inline_chars),
-                "keywords": "file_inline_chars file attachment upload reference characters",
+                "keywords": (
+                    "file_inline_chars file attachment upload reference characters"
+                    " 文件 内联 字符"
+                ),
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_file_inline_chars_changed(v),
             },
             {
-                "name": "Agent team",
+                "name": t("settings.page.team"),
                 "value": "true" if self.config.agent_team_enable else "false",
-                "keywords": "agent_team enable",
+                "keywords": "agent_team enable 团队",
                 "edit_type": "toggle",
                 "options": bool_choices,
-                "accessory_label": "config" if self.config.agent_team_enable else "",
+                "accessory_label": (
+                    t("app.agent.team_config") if self.config.agent_team_enable else ""
+                ),
                 "accessory_target_page": "team",
                 "on_change": lambda v: self._on_setting_agent_team_changed(v),
             },
         ]
 
     def _settings_skills_rows(self) -> list[dict]:
-        bool_choices = [("true", "true"), ("false", "false")]
+        bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         rows = [
             {
-                "name": "Enable",
+                "name": t("app.row.enable"),
                 "value": "true" if self.config.skills_enable else "false",
-                "keywords": "enable skills",
+                "keywords": "enable skills 启用",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_skills_changed(v),
             },
             {
-                "name": "Installed skills",
+                "name": t("settings.page.installed_skills"),
                 "value": ">",
-                "keywords": "installed skills browser",
+                "keywords": "installed skills browser 已安装",
                 "edit_type": "nav",
                 "target_page": "installed_skills",
             },
             {
-                "name": "Sources",
+                "name": t("app.skills.sources"),
                 "value": "",
-                "keywords": "sources app workspace",
+                "keywords": "sources app workspace 来源",
                 "edit_type": "none",
             },
             {
-                "name": "App",
+                "name": t("app.skills.app"),
                 "value": "true" if self.config.skills_source_app else "false",
-                "keywords": "sources app",
+                "keywords": "sources app 应用",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "indented": True,
                 "on_change": lambda v: self._on_setting_skills_source_app_changed(v),
             },
             {
-                "name": "Workspace",
+                "name": t("app.skills.workspace"),
                 "value": "true" if self.config.skills_source_workspace else "false",
-                "keywords": "sources workspace",
+                "keywords": "sources workspace 工作区",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "indented": True,
@@ -2649,9 +2736,9 @@ class AgentTUIApp(App):
                 ),
             },
             {
-                "name": "Auto catalog",
+                "name": t("app.skills.auto_catalog"),
                 "value": "true" if self.config.skills_auto_catalog else "false",
-                "keywords": "auto_catalog",
+                "keywords": "auto_catalog 编目",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_skills_auto_catalog_changed(v),
@@ -2733,7 +2820,11 @@ class AgentTUIApp(App):
                 continue
             groups.append({
                 "api_type": source,
-                "title": "App" if source == "app" else "Workspace",
+                "title": (
+                    t("app.skills.app")
+                    if source == "app"
+                    else t("app.skills.workspace")
+                ),
                 "models": names,
             })
         return {
@@ -2749,7 +2840,7 @@ class AgentTUIApp(App):
             "rows": self._settings_installed_skill_rows(selected_key),
             "footer_actions": [
                 {
-                    "label": "Delete",
+                    "label": t("common.delete"),
                     "disabled": not bool(selected_key),
                     "on_activate": (
                         lambda current=selected_key: self._on_setting_skill_deleted(
@@ -2758,7 +2849,7 @@ class AgentTUIApp(App):
                     ),
                 }
             ],
-            "empty_list_label": "No skills",
+            "empty_list_label": t("app.skills.empty"),
             "blank_detail_when_empty": True,
         }
 
@@ -2768,7 +2859,9 @@ class AgentTUIApp(App):
             return []
 
         source = str(record.get("source") or "")
-        source_label = "App" if source == "app" else "Workspace"
+        source_label = (
+            t("app.skills.app") if source == "app" else t("app.skills.workspace")
+        )
         source_enabled = (
             self.config.skills_source_app
             if source == "app"
@@ -2778,120 +2871,130 @@ class AgentTUIApp(App):
         provider_label = {
             "clawhub": "ClawHub",
             "skillhub": "SkillHub",
-        }.get(provider, "Local")
+        }.get(provider, t("app.value.local_plain"))
         triggers_text = "\n".join(
             str(item)
             for item in list(record.get("triggers") or [])
             if str(item).strip()
         )
         if not triggers_text:
-            triggers_text = "(empty)"
+            triggers_text = t("app.value.empty")
         files_text = "\n".join(
             str(item) for item in list(record.get("files") or []) if str(item).strip()
         )
         if not files_text:
-            files_text = "(empty)"
-        skill_md_text = str(record.get("skill_md") or "").strip() or "(empty)"
-        description_text = str(record.get("description") or "").strip() or "(empty)"
-        version_text = str(record.get("version") or "").strip() or "Local"
-        slug_text = str(record.get("slug") or "").strip() or "(local)"
+            files_text = t("app.value.empty")
+        skill_md_text = (
+            str(record.get("skill_md") or "").strip() or t("app.value.empty")
+        )
+        description_text = (
+            str(record.get("description") or "").strip() or t("app.value.empty")
+        )
+        version_text = (
+            str(record.get("version") or "").strip() or t("app.value.local_plain")
+        )
+        slug_text = str(record.get("slug") or "").strip() or t("app.value.local")
         target_text = str(record.get("target") or "").strip()
         target_label = {
-            "app": "App",
-            "workspace": "Workspace",
+            "app": t("app.skills.app"),
+            "workspace": t("app.skills.workspace"),
         }.get(target_text, source_label)
-        registry_text = str(record.get("registry") or "").strip() or "(local)"
-        installed_at = str(record.get("installed_at") or "").strip() or "(unknown)"
+        registry_text = (
+            str(record.get("registry") or "").strip() or t("app.value.local")
+        )
+        installed_at = (
+            str(record.get("installed_at") or "").strip() or t("app.value.unknown")
+        )
         return [
             {
-                "name": "Name",
+                "name": t("app.row.name"),
                 "value": str(record.get("name") or ""),
-                "keywords": "name",
+                "keywords": "name 名称",
                 "edit_type": "none",
             },
             {
-                "name": "Source",
+                "name": t("app.row.source"),
                 "value": source_label,
-                "keywords": "source",
+                "keywords": "source 来源",
                 "edit_type": "none",
             },
             {
-                "name": "Loaded",
+                "name": t("app.skills.loaded"),
                 "value": (
                     "true" if self.config.skills_enable and source_enabled else "false"
                 ),
-                "keywords": "loaded enabled",
+                "keywords": "loaded enabled 已加载",
                 "edit_type": "none",
             },
             {
-                "name": "Installed via",
+                "name": t("app.skills.installed_via"),
                 "value": provider_label,
-                "keywords": "provider clawhub skillhub",
+                "keywords": "provider clawhub skillhub 安装方式",
                 "edit_type": "none",
             },
             {
-                "name": "Slug",
+                "name": t("app.skills.slug"),
                 "value": slug_text,
                 "keywords": "slug",
                 "edit_type": "none",
             },
             {
-                "name": "Version",
+                "name": t("app.row.version"),
                 "value": version_text,
-                "keywords": "version",
+                "keywords": "version 版本",
                 "edit_type": "none",
             },
             {
-                "name": "Target",
+                "name": t("app.row.target"),
                 "value": target_label,
-                "keywords": "target app workspace",
+                "keywords": "target app workspace 目标",
                 "edit_type": "none",
             },
             {
-                "name": "Installed at",
+                "name": t("app.skills.installed_at"),
                 "value": installed_at,
-                "keywords": "installed at time",
+                "keywords": "installed at time 安装时间",
                 "edit_type": "none",
             },
             {
-                "name": "Registry",
+                "name": t("app.row.registry"),
                 "value": "",
-                "keywords": "registry",
+                "keywords": "registry 仓库",
                 "edit_type": "none",
                 "long_value": registry_text,
             },
             {
-                "name": "Path",
+                "name": t("app.row.path"),
                 "value": "",
-                "keywords": "path",
+                "keywords": "path 路径",
                 "edit_type": "none",
                 "long_value": str(record.get("path") or ""),
             },
             {
-                "name": "Description",
+                "name": t("app.row.description"),
                 "value": "",
-                "keywords": "description",
+                "keywords": "description 描述",
                 "edit_type": "none",
                 "long_value": description_text,
             },
             {
-                "name": "Triggers",
+                "name": t("app.skills.triggers"),
                 "value": "",
-                "keywords": "triggers",
+                "keywords": "triggers 触发",
                 "edit_type": "none",
                 "long_value": triggers_text,
             },
             {
-                "name": "Files",
+                "name": t("app.skills.files"),
                 "value": "",
-                "keywords": "files",
+                "keywords": "files 文件",
                 "edit_type": "none",
                 "long_value": files_text,
             },
             {
-                "name": "SKILL.md",
+                "name": t("app.skills.skill_md"),
                 "value": "",
-                "keywords": "skill instructions markdown",
+                "keywords": "skill instructions markdown 说明",
                 "edit_type": "none",
                 "long_value": skill_md_text,
             },
@@ -2935,30 +3038,33 @@ class AgentTUIApp(App):
         draft = dict(self._ensure_skill_install_draft())
         registry = self._skills_registry_for_page()
         provider = str(draft.get("provider") or "clawhub").strip().lower()
-        target_choices = [("App", "app"), ("Workspace", "workspace")]
+        target_choices = [
+            (t("app.skills.app"), "app"),
+            (t("app.skills.workspace"), "workspace"),
+        ]
         disabled_targets = (
             ["workspace"] if registry.workspace_skills_dir is None else []
         )
         rows = [
             {
-                "name": "Name",
+                "name": t("app.row.name"),
                 "value": str(draft.get("name") or ""),
-                "keywords": "name local directory",
+                "keywords": "name local directory 名称",
                 "edit_type": "input",
                 "on_change": lambda v: self._set_add_skill_field("name", v),
             },
             {
-                "name": "Provider",
+                "name": t("app.row.provider"),
                 "value": str(draft.get("provider") or "clawhub"),
-                "keywords": "provider clawhub skillhub",
+                "keywords": "provider clawhub skillhub 服务商",
                 "edit_type": "select",
                 "options": [("ClawHub", "clawhub"), ("SkillHub", "skillhub")],
                 "on_change": lambda v: self._set_add_skill_field("provider", v),
             },
             {
-                "name": "Slug",
+                "name": t("app.skills.slug"),
                 "value": str(draft.get("slug") or ""),
-                "keywords": "slug name owner",
+                "keywords": "slug name owner 名称",
                 "edit_type": "input",
                 "placeholder_value": (
                     "@owner/skill-name" if provider == "clawhub" else "skill-name"
@@ -2966,26 +3072,26 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._set_add_skill_field("slug", v),
             },
             {
-                "name": "Target",
+                "name": t("app.row.target"),
                 "value": str(draft.get("target") or "app"),
-                "keywords": "target app workspace",
+                "keywords": "target app workspace 目标",
                 "edit_type": "select",
                 "options": target_choices,
                 "disabled_options": disabled_targets,
                 "on_change": lambda v: self._set_add_skill_field("target", v),
             },
             {
-                "name": "Version",
+                "name": t("app.row.version"),
                 "value": str(draft.get("version") or ""),
-                "keywords": "version latest",
+                "keywords": "version latest 版本",
                 "edit_type": "input",
-                "placeholder_value": "Latest",
+                "placeholder_value": t("app.skills.version_placeholder"),
                 "on_change": lambda v: self._set_add_skill_field("version", v),
             },
             {
-                "name": "Registry",
+                "name": t("app.row.registry"),
                 "value": str(draft.get("registry") or ""),
-                "keywords": "registry url",
+                "keywords": "registry url 仓库",
                 "edit_type": "input",
                 "placeholder_value": str(
                     PROVIDERS.get(provider, {}).get("default_registry") or ""
@@ -2993,19 +3099,19 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._set_add_skill_field("registry", v),
             },
             {
-                "name": "Force",
+                "name": t("app.skills.force"),
                 "value": str(draft.get("force") or "false"),
-                "keywords": "force overwrite",
+                "keywords": "force overwrite 强制 覆盖",
                 "edit_type": "toggle",
-                "options": [("true", "true"), ("false", "false")],
+                "options": [(t("common.true"), "true"), (t("common.false"), "false")],
                 "on_change": lambda v: self._set_add_skill_field("force", v),
             },
         ]
         rows.append({"name": "", "value": "", "edit_type": "none"})
         rows.append({
             "name": "",
-            "value": "Install",
-            "keywords": "install add skill",
+            "value": t("app.skills.install"),
+            "keywords": "install add skill 安装",
             "edit_type": "action",
             "show_value": True,
             "on_activate": self._install_skill_from_draft,
@@ -3029,7 +3135,7 @@ class AgentTUIApp(App):
         local_name = display_name or None
         slug = str(draft.get("slug") or "").strip()
         if not slug:
-            self.add_status_message("[!]", "Skill slug 不能为空。")
+            self.add_status_message("[!]", t("app.toast.skill_slug_required"))
             return ""
         target = str(draft.get("target") or "app").strip().lower()
         registry = str(draft.get("registry") or "").strip() or None
@@ -3044,7 +3150,7 @@ class AgentTUIApp(App):
         if target == "workspace":
             skills_dir = page_registry.workspace_skills_dir
             if skills_dir is None:
-                self.add_status_message("[!]", "请先选择项目后再安装到 Workspace。")
+                self.add_status_message("[!]", t("app.toast.skill_needs_project"))
                 return ""
         else:
             skills_dir = APP_SKILLS_DIR.resolve()
@@ -3063,7 +3169,9 @@ class AgentTUIApp(App):
                 display_name=display_name,
             )
         except Exception as error:
-            self.add_status_message("[✗]", f"安装 Skill 失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.skill_install_failed", error=error)
+            )
             return ""
         self._skill_install_draft = {
             **draft,
@@ -3078,20 +3186,24 @@ class AgentTUIApp(App):
         if selected_key:
             self._set_settings_selected_item(selected_key)
         self.add_status_message(
-            "[✓]", f"已安装 Skill: {display_name or result.install_dir.name}"
+            "[✓]",
+            t(
+                "app.toast.skill_installed",
+                name=display_name or result.install_dir.name,
+            ),
         )
         return "installed_skills"
 
     def _on_setting_skill_deleted(self, skill_name: str) -> None:
         record = self._skill_record_for_page(skill_name)
         if record is None:
-            self.add_status_message("[!]", "未找到可删除的 Skill。")
+            self.add_status_message("[!]", t("app.toast.skill_not_found"))
             return
         registry = self._skills_registry_for_page()
         try:
             skill_path = Path(str(record.get("path") or "")).resolve()
         except OSError:
-            self.add_status_message("[✗]", "Skill 路径无效，无法删除。")
+            self.add_status_message("[✗]", t("app.toast.skill_path_invalid"))
             return
         allowed_roots = [registry.app_skills_dir.resolve()]
         if registry.workspace_skills_dir is not None:
@@ -3100,15 +3212,19 @@ class AgentTUIApp(App):
             self._path_within_root(skill_path, root) and skill_path.parent == root
             for root in allowed_roots
         ):
-            self.add_status_message("[✗]", "Skill 不在允许删除的目录中。")
+            self.add_status_message("[✗]", t("app.toast.skill_path_forbidden"))
             return
         if not skill_path.exists():
-            self.add_status_message("[!]", f"Skill 已不存在: {skill_path.name}")
+            self.add_status_message(
+                "[!]", t("app.toast.skill_missing", name=skill_path.name)
+            )
             return
         try:
             shutil.rmtree(skill_path)
         except OSError as error:
-            self.add_status_message("[✗]", f"删除 Skill 失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.skill_delete_failed", error=error)
+            )
             return
         self._refresh_chat_skills_registry()
         remaining = self._skill_records_for_page()
@@ -3120,7 +3236,9 @@ class AgentTUIApp(App):
                 next_key = candidate_key
                 break
         self._set_settings_selected_item(next_key)
-        self.add_status_message("[✓]", f"已删除 Skill: {record.get('name')}")
+        self.add_status_message(
+            "[✓]", t("app.toast.skill_deleted", name=record.get("name"))
+        )
 
     def _path_within_root(self, path: Path, root: Path) -> bool:
         try:
@@ -3130,23 +3248,23 @@ class AgentTUIApp(App):
             return False
 
     def _settings_auto_compact_rows(self) -> list[dict]:
-        bool_choices = [("true", "true"), ("false", "false")]
+        bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         model_choice_groups = self._optional_model_choice_groups()
         return [
             {
-                "name": "Enable",
+                "name": t("app.row.enable"),
                 "value": "true" if self.config.compaction_enable else "false",
-                "keywords": "enable compact",
+                "keywords": "enable compact 启用 压缩",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_compact_changed(v),
             },
             {
-                "name": "Compact model",
+                "name": t("app.compact.model"),
                 "value": self._valid_optional_model_selection(
                     self.config.compaction_compact_model
                 ),
-                "keywords": "compact_model",
+                "keywords": "compact_model 压缩 模型",
                 "edit_type": "select",
                 "option_groups": model_choice_groups,
                 "on_change": lambda v: self._on_setting_compact_model_changed(v),
@@ -3157,9 +3275,9 @@ class AgentTUIApp(App):
         model_choice_groups = self._optional_model_choice_groups()
         return [
             {
-                "name": "Memory model",
+                "name": t("app.memory.model"),
                 "value": self._valid_optional_model_selection(self.config.memory_model),
-                "keywords": "memory_model",
+                "keywords": "memory_model 记忆 模型",
                 "edit_type": "select",
                 "option_groups": model_choice_groups,
                 "on_change": lambda v: self._on_setting_memory_model_changed(v),
@@ -3167,63 +3285,74 @@ class AgentTUIApp(App):
         ]
 
     def _settings_web_search_rows(self) -> list[dict]:
-        bool_choices = [("true", "true"), ("false", "false")]
+        bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         provider_choices = [
             (provider, provider) for provider in sorted(WEB_SEARCH_PROVIDERS)
         ]
+        depth_labels = {
+            "basic": t("app.web.depth.basic"),
+            "fast": t("app.web.depth.fast"),
+            "ultra-fast": t("app.web.depth.ultra_fast"),
+            "advanced": t("app.web.depth.advanced"),
+        }
         search_depth_choices = [
-            (depth, depth)
+            (depth_labels.get(depth, depth), depth)
             for depth in ("basic", "fast", "ultra-fast", "advanced")
             if depth in TAVILY_SEARCH_DEPTHS
         ]
+        topic_labels = {
+            "general": t("app.web.topic.general"),
+            "news": t("app.web.topic.news"),
+            "finance": t("app.web.topic.finance"),
+        }
         topic_choices = [
-            (topic, topic)
+            (topic_labels.get(topic, topic), topic)
             for topic in ("general", "news", "finance")
             if topic in TAVILY_TOPICS
         ]
         return [
             {
-                "name": "Enable",
+                "name": t("app.row.enable"),
                 "value": "true" if self.config.web_search_enable else "false",
-                "keywords": "enable web_search",
+                "keywords": "enable web_search 启用 搜索",
                 "edit_type": "toggle",
                 "options": bool_choices,
                 "on_change": lambda v: self._on_setting_search_changed(v),
             },
             {
-                "name": "Provider",
+                "name": t("app.row.provider"),
                 "value": self.config.web_search_provider,
-                "keywords": "provider",
+                "keywords": "provider 服务商",
                 "edit_type": "select",
                 "options": provider_choices,
                 "on_change": lambda v: self._on_setting_search_provider_changed(v),
             },
             {
-                "name": "API key",
+                "name": t("app.row.api_key"),
                 "value": self.config.web_search_api_key,
-                "keywords": "api_key",
+                "keywords": "api_key 密钥",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_search_api_key_changed(v),
             },
             {
-                "name": "Max results",
+                "name": t("app.web.max_results"),
                 "value": str(self.config.web_search_max_results),
-                "keywords": "max_results",
+                "keywords": "max_results 结果",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_search_max_changed(v),
             },
             {
-                "name": "Search depth",
+                "name": t("app.web.search_depth"),
                 "value": self.config.web_search_depth,
-                "keywords": "search_depth",
+                "keywords": "search_depth 深度",
                 "edit_type": "select",
                 "options": search_depth_choices,
                 "on_change": lambda v: self._on_setting_search_depth_changed(v),
             },
             {
-                "name": "Topic",
+                "name": t("app.web.topic"),
                 "value": self.config.web_search_topic,
-                "keywords": "topic",
+                "keywords": "topic 主题",
                 "edit_type": "select",
                 "options": topic_choices,
                 "on_change": lambda v: self._on_setting_search_topic_changed(v),
@@ -3303,7 +3432,7 @@ class AgentTUIApp(App):
             "rows": self._settings_team_member_rows(selected_name),
             "footer_actions": [
                 {
-                    "label": "Delete",
+                    "label": t("common.delete"),
                     "disabled": not selected_key or not can_delete,
                     "on_activate": (
                         lambda current=selected_key: (
@@ -3312,7 +3441,7 @@ class AgentTUIApp(App):
                     ),
                 },
                 {
-                    "label": "Reset",
+                    "label": t("app.row.reset"),
                     "disabled": not selected_key or not can_reset,
                     "on_activate": (
                         lambda current=selected_key: self._on_setting_team_member_reset(
@@ -3333,51 +3462,53 @@ class AgentTUIApp(App):
         record_key = str((record or {}).get("key") or "")
         teammate = roster_by_name.get(record_key)
         if record is None:
-            return [{"name": "No members", "value": "", "edit_type": "none"}]
+            return [{"name": t("app.team.empty"), "value": "", "edit_type": "none"}]
         can_rename = not bool(record.get("builtin"))
         source = str(record.get("source") or "builtin")
         source_label = {
-            "builtin": "Builtin",
-            "override": "Override",
-            "custom": "Custom",
+            "builtin": t("app.team.source.builtin"),
+            "override": t("app.team.source.override"),
+            "custom": t("app.team.source.custom"),
         }.get(source, source.title())
-        description_text = str(record.get("description") or "").strip() or "(empty)"
+        description_text = (
+            str(record.get("description") or "").strip() or t("app.value.empty")
+        )
         tools_text = "\n".join(
             str(tool) for tool in list(record.get("tool_names") or [])
         )
         if not tools_text:
-            tools_text = "(empty)"
+            tools_text = t("app.value.empty")
         rows = [
             {
-                "name": "Enable",
+                "name": t("app.row.enable"),
                 "value": "true" if self.config.agent_team_enable else "false",
-                "keywords": "team enable",
+                "keywords": "team enable 启用 团队",
                 "edit_type": "toggle",
-                "options": [("true", "true"), ("false", "false")],
+                "options": [(t("common.true"), "true"), (t("common.false"), "false")],
                 "on_change": lambda v: self._on_setting_team_enabled_changed(v),
             },
             {
-                "name": "Name",
+                "name": t("app.row.name"),
                 "value": str(record.get("name") or ""),
-                "keywords": "name teammate name",
+                "keywords": "name teammate name 名称",
                 "edit_type": "input" if can_rename else "none",
                 "on_change": lambda v, current=record_key: (
                     self._on_setting_team_member_name_changed(current, v)
                 ),
             },
             {
-                "name": "Role",
+                "name": t("app.row.role"),
                 "value": str(record.get("role") or ""),
-                "keywords": "role",
+                "keywords": "role 角色",
                 "edit_type": "input",
                 "on_change": lambda v, current=record_key: (
                     self._on_setting_team_member_field_changed(current, "role", v)
                 ),
             },
             {
-                "name": "Description",
-                "value": "Edit",
-                "keywords": "description",
+                "name": t("app.row.description"),
+                "value": t("common.edit"),
+                "keywords": "description 描述",
                 "edit_type": "action",
                 "show_value": True,
                 "long_value": description_text,
@@ -3386,18 +3517,18 @@ class AgentTUIApp(App):
                 ),
             },
             {
-                "name": "Max turns",
+                "name": t("app.team.max_turns"),
                 "value": str(record.get("max_turns") or ""),
-                "keywords": "max turns rounds",
+                "keywords": "max turns rounds 轮次",
                 "edit_type": "input",
                 "on_change": lambda v, current=record_key: (
                     self._on_setting_team_member_field_changed(current, "max_turns", v)
                 ),
             },
             {
-                "name": "Tools",
-                "value": "Edit",
-                "keywords": "tools tool names",
+                "name": t("app.row.tools"),
+                "value": t("common.edit"),
+                "keywords": "tools tool names 工具",
                 "edit_type": "action",
                 "show_value": True,
                 "long_value": tools_text,
@@ -3406,9 +3537,9 @@ class AgentTUIApp(App):
                 ),
             },
             {
-                "name": "System prompt",
-                "value": "Edit",
-                "keywords": "system prompt edit",
+                "name": t("app.team.system_prompt"),
+                "value": t("common.edit"),
+                "keywords": "system prompt edit 提示词",
                 "edit_type": "action",
                 "show_value": True,
                 "on_activate": lambda current=record_key: self._open_team_prompt_editor(
@@ -3416,35 +3547,35 @@ class AgentTUIApp(App):
                 ),
             },
             {
-                "name": "Source",
+                "name": t("app.row.source"),
                 "value": source_label,
-                "keywords": "source builtin custom override",
+                "keywords": "source builtin custom override 来源",
                 "edit_type": "none",
             },
             {
-                "name": "Active",
+                "name": t("app.team.active"),
                 "value": "true" if teammate else "false",
-                "keywords": "active running spawned",
+                "keywords": "active running spawned 运行",
                 "edit_type": "none",
             },
             {
-                "name": "Task count",
+                "name": t("app.team.task_count"),
                 "value": str((teammate or {}).get("task_count") or 0),
-                "keywords": "task count",
+                "keywords": "task count 任务",
                 "edit_type": "none",
             },
         ]
         if teammate:
             rows.append({
-                "name": "Runtime status",
+                "name": t("app.team.runtime_status"),
                 "value": str(teammate.get("status") or "active"),
-                "keywords": "runtime status",
+                "keywords": "runtime status 状态",
                 "edit_type": "none",
             })
             rows.append({
-                "name": "Runtime",
-                "value": "Shutdown",
-                "keywords": "shutdown stop teammate",
+                "name": t("app.team.runtime"),
+                "value": t("app.team.shutdown"),
+                "keywords": "shutdown stop teammate 关闭",
                 "edit_type": "action",
                 "show_value": True,
                 "on_activate": lambda current=record_key: (
@@ -3472,12 +3603,14 @@ class AgentTUIApp(App):
     def _on_setting_add_team_member(self, _selected_name: str = "") -> str:
         store = self._sync_team_store_from_page()
         if store is None or store.config_path is None:
-            self.add_status_message("[!]", "请先选择项目后再创建 team 成员。")
+            self.add_status_message("[!]", t("app.toast.team_needs_project_create"))
             return ""
         try:
             created = store.create_default_member("member")
         except Exception as error:
-            self.add_status_message("[✗]", f"新增成员失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.team_member_add_failed", error=error)
+            )
             return ""
         record = store.get_spec_record(created)
         selected_name = str(
@@ -3489,7 +3622,7 @@ class AgentTUIApp(App):
     def _save_team_member_record(self, current_name: str, **changes) -> str:
         store = self._sync_team_store_from_page()
         if store is None or store.config_path is None:
-            raise ValueError("请先选择项目后再编辑 team 成员。")
+            raise ValueError(t("app.toast.team_needs_project_edit"))
         record = store.get_spec_record(current_name)
         if record is None:
             raise ValueError(f"Unknown teammate: {current_name}")
@@ -3522,7 +3655,9 @@ class AgentTUIApp(App):
         try:
             self._save_team_member_record(current_name, name=new_name)
         except Exception as error:
-            self.add_status_message("[✗]", f"重命名成员失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.team_member_rename_failed", error=error)
+            )
 
     def _on_setting_team_member_field_changed(
         self, current_name: str, field: str, value: str
@@ -3532,7 +3667,7 @@ class AgentTUIApp(App):
             try:
                 payload[field] = max(1, int(str(value or "").strip()))
             except (TypeError, ValueError):
-                self.add_status_message("[!]", "Max turns 必须是正整数。")
+                self.add_status_message("[!]", t("app.toast.team_max_turns_invalid"))
                 return
         elif field == "tool_names":
             payload[field] = [
@@ -3543,7 +3678,9 @@ class AgentTUIApp(App):
         try:
             self._save_team_member_record(current_name, **payload)
         except Exception as error:
-            self.add_status_message("[✗]", f"更新成员失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.team_member_update_failed", error=error)
+            )
 
     def _open_team_prompt_editor(self, teammate_name: str) -> None:
         record = self._team_record_for_page(teammate_name)
@@ -3551,7 +3688,7 @@ class AgentTUIApp(App):
             return
         self.push_screen(
             TextAreaModal(
-                f"Edit prompt: {record.get('name')}",
+                t("app.team.edit_prompt_title", name=record.get("name")),
                 value=str(record.get("system_prompt") or ""),
             ),
             callback=lambda result, current=teammate_name: (
@@ -3565,7 +3702,7 @@ class AgentTUIApp(App):
             return
         self.push_screen(
             TextAreaModal(
-                f"Edit description: {record.get('name')}",
+                t("app.team.edit_description_title", name=record.get("name")),
                 value=str(record.get("description") or ""),
             ),
             callback=lambda result, current=teammate_name: (
@@ -3583,7 +3720,9 @@ class AgentTUIApp(App):
                 teammate_name, description=str(result).strip()
             )
         except Exception as error:
-            self.add_status_message("[✗]", f"保存 description 失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.team_description_save_failed", error=error)
+            )
             return
         self._refresh_settings_modal()
 
@@ -3594,7 +3733,7 @@ class AgentTUIApp(App):
         value = "\n".join(str(tool) for tool in list(record.get("tool_names") or []))
         self.push_screen(
             TextAreaModal(
-                f"Edit tools: {record.get('name')}",
+                t("app.team.edit_tools_title", name=record.get("name")),
                 value=value,
             ),
             callback=lambda result, current=teammate_name: (
@@ -3614,7 +3753,9 @@ class AgentTUIApp(App):
         try:
             self._save_team_member_record(teammate_name, tool_names=tool_names)
         except Exception as error:
-            self.add_status_message("[✗]", f"保存 tools 失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.team_tools_save_failed", error=error)
+            )
             return
         self._refresh_settings_modal()
 
@@ -3626,7 +3767,9 @@ class AgentTUIApp(App):
         try:
             self._save_team_member_record(teammate_name, system_prompt=str(result))
         except Exception as error:
-            self.add_status_message("[✗]", f"保存 prompt 失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.team_prompt_save_failed", error=error)
+            )
             return
         self._refresh_settings_modal()
 
@@ -3637,13 +3780,20 @@ class AgentTUIApp(App):
         removed = store.delete_spec(name)
         if not removed:
             self.add_status_message(
-                "[!]", f"未找到可删除的成员定义: {display_teammate_name(name)}"
+                "[!]",
+                t(
+                    "app.toast.team_member_def_not_found",
+                    name=display_teammate_name(name),
+                ),
             )
             return
         records = store.spec_records()
         next_name = str((records[0].get("name") if records else "") or "")
         self._set_settings_selected_item(next_name)
-        self.add_status_message("[✓]", f"已删除成员定义: {display_teammate_name(name)}")
+        self.add_status_message(
+            "[✓]",
+            t("app.toast.team_member_def_deleted", name=display_teammate_name(name)),
+        )
 
     def _on_setting_team_member_reset(self, name: str) -> None:
         store = self._sync_team_store_from_page()
@@ -3654,23 +3804,33 @@ class AgentTUIApp(App):
             return
         if not bool(record.get("builtin")):
             self.add_status_message(
-                "[!]", f"仅内置成员支持重置: {display_teammate_name(name)}"
+                "[!]",
+                t(
+                    "app.toast.team_reset_builtin_only",
+                    name=display_teammate_name(name),
+                ),
             )
             return
         if not bool(record.get("customized")):
             self.add_status_message(
-                "[!]", f"成员未被修改，无需重置: {display_teammate_name(name)}"
+                "[!]",
+                t("app.toast.team_reset_unchanged", name=display_teammate_name(name)),
             )
             return
         removed = store.delete_spec(name)
         if not removed:
-            self.add_status_message("[!]", f"重置失败: {display_teammate_name(name)}")
+            self.add_status_message(
+                "[!]", t("app.toast.team_reset_failed", name=display_teammate_name(name))
+            )
             return
         refreshed = store.get_spec_record(name)
         self._set_settings_selected_item(
             str((refreshed or {}).get("name") or display_teammate_name(name))
         )
-        self.add_status_message("[✓]", f"已重置成员定义: {display_teammate_name(name)}")
+        self.add_status_message(
+            "[✓]",
+            t("app.toast.team_member_def_reset", name=display_teammate_name(name)),
+        )
 
     def _on_setting_team_shutdown(self, name: str) -> None:
         removed = False
@@ -3689,11 +3849,13 @@ class AgentTUIApp(App):
                     removed = False
         if removed:
             self.add_status_message(
-                "[✓]", f"已关闭 teammate: {display_teammate_name(name)}"
+                "[✓]",
+                t("app.toast.teammate_shutdown", name=display_teammate_name(name)),
             )
         else:
             self.add_status_message(
-                "[!]", f"未找到 teammate: {display_teammate_name(name)}"
+                "[!]",
+                t("app.toast.teammate_not_found", name=display_teammate_name(name)),
             )
 
     def _memory_store_for_page(self) -> MemoryStore:
@@ -3716,15 +3878,19 @@ class AgentTUIApp(App):
             if body:
                 episodic_blocks.append(f"## {path.stem}\n\n{body}")
         return [
-            {"id": "core", "label": "Core memory", "content": store.read_core_body()},
+            {
+                "id": "core",
+                "label": t("app.memory.core"),
+                "content": store.read_core_body(),
+            },
             {
                 "id": "prefs",
-                "label": "Preference memory",
+                "label": t("app.memory.preference"),
                 "content": store.read_preference_body(),
             },
             {
                 "id": "episodic",
-                "label": "Episodic memory",
+                "label": t("app.memory.episodic"),
                 "content": "\n\n".join(episodic_blocks),
             },
         ]
@@ -3759,7 +3925,9 @@ class AgentTUIApp(App):
         try:
             delete_model_profile(target)
         except Exception as error:
-            self.add_status_message("[✗]", f"删除模型失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.model_delete_failed", error=error)
+            )
             return
         self._reload_config()
         config = self.config
@@ -4051,13 +4219,69 @@ class AgentTUIApp(App):
         self._reload_config()
         self._apply_config_to_controls()
 
+    def _on_setting_language_changed(self, value: str) -> None:
+        save_config_field("language", value)
+        self._reload_config()
+        set_language(self.config.language)
+        self._apply_language_to_ui()
+
+    def _apply_language_to_ui(self) -> None:
+        """Re-render every surface that caches translated text.
+
+        Three kinds of staleness have to be handled. Settings rows regenerate
+        on each render because they are callables, but page chrome (titles,
+        placeholders) is snapshotted into the modal at construction time, so
+        the pages dict has to be rebuilt. Widgets that resolved labels in
+        compose() keep them until told otherwise, hence relabel_for_language.
+        And the info bar holds plain Labels this class owns directly.
+        """
+        self._apply_config_to_controls()
+        self._refresh_project_views()
+        self._relabel_info_bar()
+        for widget_id, widget_type in (
+            ("#messages-view", ChatView),
+            ("#chat-input", ChatInput),
+            ("#project-picker", ProjectPicker),
+            ("#sidebar", Sidebar),
+        ):
+            try:
+                self.query_one(widget_id, widget_type).relabel_for_language()
+            except NoMatches:
+                pass
+        modal = self._current_settings_modal()
+        if modal is not None:
+            modal.retarget_pages(self._settings_pages())
+        self._refresh_settings_modal()
+
+    def _relabel_info_bar(self) -> None:
+        """Refresh the info-bar labels this screen composed directly."""
+        try:
+            self.query_one("#interrupt-key", Label).update(t("app.info.interrupt_key"))
+            self.query_one("#interrupt-text", Label).update(t("app.info.interrupt_text"))
+            self.query_one("#prompt-dismiss", Button).label = t("app.info.dismiss")
+            self.query_one("#prompt-back", Button).label = t("app.info.back")
+        except NoMatches:
+            return
+        if self.sidebar_visible:
+            try:
+                self.query_one("#sidebar-toggle", Static).update(
+                    f"= {t('app.info.sessions')}"
+                )
+            except NoMatches:
+                pass
+        # Rewrites #prompt-next, the context label, and every button width.
+        self._sync_prompt_actions()
+        self._refresh_context_label_for_active_model()
+
     def _handle_project_modal_result(self, result: dict | None) -> None:
         if not result:
             return
         try:
             project = add_project(result.get("name"), result.get("path"))
         except Exception as error:
-            self.add_status_message("[✗]", f"新建项目失败: {error}")
+            self.add_status_message(
+                "[✗]", t("app.toast.project_create_failed", error=error)
+            )
             return
         self._set_current_project(project.name)
         self._refresh_project_views()
@@ -4297,7 +4521,7 @@ class AgentTUIApp(App):
             return
         if base == "/clear":
             self._reset_chat_state()
-            self.add_status_message("[✓]", "对话历史已清空。")
+            self.add_status_message("[✓]", t("app.toast.history_cleared"))
             return
         self._persist_current_session()
         self._maybe_dispatch_pending_message()
@@ -4342,7 +4566,7 @@ class AgentTUIApp(App):
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
-        self.add_status_message("[✗]", f"处理消息失败: {error}")
+        self.add_status_message("[✗]", t("app.toast.message_failed", error=error))
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
@@ -4350,7 +4574,7 @@ class AgentTUIApp(App):
 
     def _display_response(self, response) -> None:
         if not response:
-            self.add_status_message("[✗]", "请求失败，请检查模型配置和网络连接。")
+            self.add_status_message("[✗]", t("app.toast.request_failed"))
             return
         if response.get("agent_stopped"):
             return

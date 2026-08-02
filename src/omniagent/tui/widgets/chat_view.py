@@ -27,6 +27,7 @@ from textual.strip import Strip
 from textual.widgets import Static
 from textual.widget import Widget
 
+from ...i18n import t
 from ...references import resolve_references
 from ...ui import clean_thinking_text
 from ..theme import (
@@ -106,6 +107,61 @@ _SHELL_ERROR_TOOLS = frozenset({
     "git_diff",
 })
 _WEB_ERROR_TOOLS = frozenset({"web_fetch", "web_search"})
+# Display verbs for tool names. The tool names themselves stay untranslated:
+# they are protocol identifiers, only the label a human reads is localized.
+_TOOL_LABEL_KEYS = {
+    "read_file": "chat.tool.read_file",
+    "read_program_docs": "chat.tool.read_program_docs",
+    "read_skill": "chat.tool.read_skill",
+    "grep": "chat.tool.grep",
+    "glob": "chat.tool.glob",
+    "list_dir": "chat.tool.list_dir",
+    "list_skills": "chat.tool.list_skills",
+    "update_todo": "chat.tool.update_todo",
+    "ask_user": "chat.tool.ask_user",
+    "submit_plan": "chat.tool.submit_plan",
+    "web_fetch": "chat.tool.web_fetch",
+    "web_search": "chat.tool.web_search",
+    "write_file": "chat.tool.write_file",
+    "edit_file": "chat.tool.edit_file",
+    "apply_patch": "chat.tool.edit_file",
+    "apply_unified_patch": "chat.tool.edit_file",
+    "bash": "chat.tool.bash",
+    "local_http_check": "chat.tool.local_http_check",
+    "git_status": "chat.tool.git_status",
+    "git_diff": "chat.tool.git_diff",
+    "dispatch_subagent": "chat.tool.dispatch_subagent",
+    "report_to_lead": "chat.tool.report_to_lead",
+    "spawn_teammate": "chat.tool.spawn_teammate",
+    "list_teammates": "chat.tool.list_teammates",
+    "send_message": "chat.tool.send_message",
+    "read_inbox": "chat.tool.read_inbox",
+    "broadcast": "chat.tool.broadcast",
+    "shutdown_teammate": "chat.tool.shutdown_teammate",
+}
+
+
+def _tool_label(tool_name: str, fallback: str = "") -> str:
+    """Localized display label for ``tool_name``."""
+    name = str(tool_name or "")
+    key = _TOOL_LABEL_KEYS.get(name)
+    if key:
+        return t(key)
+    return fallback or name.replace("_", " ").strip().title()
+
+
+def _relabel_tool_description(tool_name: str, description: str) -> str:
+    """Replace an explored entry's rendered tool label for the active language."""
+    text = str(description or "")
+    label = _escape_markup(_tool_label(tool_name))
+    if not label:
+        return text
+    replacement = f"[white]{label}[/white]"
+    if re.match(r"^\[white\].*?\[/white\]", text):
+        return re.sub(r"^\[white\].*?\[/white\]", replacement, text, count=1)
+    return replacement if not text else f"{replacement} {text}"
+
+
 _TEAM_ACTION_ERROR_TOOLS = frozenset({
     "report_to_lead",
     "spawn_teammate",
@@ -124,7 +180,7 @@ def _tool_error_shell_command(tool_name: str, summary: str) -> str:
     if tool_name == "git_diff":
         return "git diff" + (f" {summary}" if summary else "")
     if tool_name == "local_http_check":
-        return "HTTP check" + (f" {summary}" if summary else "")
+        return t("chat.tool.local_http_check") + (f" {summary}" if summary else "")
     return summary or str(tool_name or "shell").replace("_", " ")
 
 
@@ -973,7 +1029,7 @@ class ChatView(Widget):
         self._stream_role = None
         self._stream_content = ""
         self._stream_transcript_index = None
-        content = f"Plan\n\n{str(plan or '').strip()}"
+        content = f"{t('chat.plan_header')}\n\n{str(plan or '').strip()}"
         if self._user_spacer:
             self.query_one("#chat-log", VerticalScroll).mount(
                 Static("", classes="message-spacer")
@@ -1457,7 +1513,7 @@ class ChatView(Widget):
         tool_name = str(tool_name or "")
         summary = str(summary or "")
         error = _sentence_case_tool_error(
-            str(error or "") or "Tool call failed."
+            str(error or "") or t("chat.tool_call_failed")
         )
         if ExploredBlock.handles_tool(tool_name):
             self.add_explored_entry(
@@ -1752,14 +1808,24 @@ class ChatView(Widget):
         parts: list[str] = []
         if message_match:
             parts.append(
-                f"Message: {message_match.group(1)} -> {message_match.group(2)}"
+                t(
+                    "chat.compaction.messages",
+                    before=message_match.group(1),
+                    after=message_match.group(2),
+                )
             )
         if char_match:
-            parts.append(f"Chars: {char_match.group(1)} -> {char_match.group(2)}")
+            parts.append(
+                t(
+                    "chat.compaction.chars",
+                    before=char_match.group(1),
+                    after=char_match.group(2),
+                )
+            )
         if model_match:
             model = str(model_match.group(1) or "").strip()
             if model:
-                parts.append(f"Compact model: {model}")
+                parts.append(t("chat.compaction.model", model=model))
         return "\n".join(parts) if parts else ""
 
     def _discard_empty_assistant_stream(self) -> None:
@@ -1822,6 +1888,19 @@ class ChatView(Widget):
         transcript = self.get_transcript()
         self._assistant_markdown_enabled = enabled
         self.load_transcript(transcript)
+
+    def relabel_for_language(self) -> None:
+        """Rebuild persisted output so every tool card resolves current labels."""
+        transcript = self.get_transcript()
+        for entry in transcript:
+            if str(entry.get("kind") or "") != "explored_entry":
+                continue
+            entry["description"] = _relabel_tool_description(
+                str(entry.get("tool_name") or ""),
+                str(entry.get("description") or ""),
+            )
+        self.load_transcript(transcript)
+        self.call_after_refresh(self._scroll_end)
 
     def _append_transcript_entry(self, entry: dict) -> None:
         self._transcript.append(deepcopy(entry))
@@ -1978,11 +2057,14 @@ class ChatView(Widget):
     def add_web_fetch_entry(self, url: str, status: str = "") -> None:
         self._activate_aux_output("web_fetch")
         failed = (
-            f" [{STATUS_ERROR}]failed[/]"
+            f" [{STATUS_ERROR}]{t('chat.status.failed')}[/]"
             if str(status or "").strip().lower() == "failed"
             else ""
         )
-        content = f"→ [white]Webfetch[/white] [gray]{_escape_markup(url)}[/gray]{failed}"
+        label = _escape_markup(t("chat.tool.web_fetch"))
+        content = (
+            f"→ [white]{label}[/white] [gray]{_escape_markup(url)}[/gray]{failed}"
+        )
         self.query_one("#chat-log", VerticalScroll).mount(
             Static(content, classes="web-summary-entry", markup=True)
         )
@@ -1997,13 +2079,14 @@ class ChatView(Widget):
         self._activate_aux_output("web_search")
         summary = _escape_markup(content)
         failed = (
-            f" [{STATUS_ERROR}]failed[/]"
+            f" [{STATUS_ERROR}]{t('chat.status.failed')}[/]"
             if str(status or "").strip().lower() == "failed"
             else ""
         )
+        label = _escape_markup(t("chat.tool.web_search"))
         self.query_one("#chat-log", VerticalScroll).mount(
             Static(
-                f"→ [white]Websearch[/white] [gray]{summary}[/gray]{failed}",
+                f"→ [white]{label}[/white] [gray]{summary}[/gray]{failed}",
                 classes="web-summary-entry",
                 markup=True,
             )
@@ -2050,13 +2133,13 @@ class ChatView(Widget):
 
 
 class CompactionBlock(Vertical):
-    LABELS = {
-        ("auto", "running"): "Auto context compaction",
-        ("auto", "done"): "Context compact complete",
-        ("auto", "failed"): "Context compact failed",
-        ("manual", "running"): "Manual context compaction",
-        ("manual", "done"): "Context compact complete",
-        ("manual", "failed"): "Context compact failed",
+    LABEL_KEYS = {
+        ("auto", "running"): "chat.compaction.auto_running",
+        ("auto", "done"): "chat.compaction.done",
+        ("auto", "failed"): "chat.compaction.failed",
+        ("manual", "running"): "chat.compaction.manual_running",
+        ("manual", "done"): "chat.compaction.done",
+        ("manual", "failed"): "chat.compaction.failed",
     }
 
     def __init__(self, status: str = "running", mode: str = "auto", details: str = ""):
@@ -2105,9 +2188,11 @@ class CompactionBlock(Vertical):
         self._refresh()
 
     def _label(self) -> str:
-        return self.LABELS.get(
-            (self.mode, self.status),
-            self.LABELS[("auto", "running")],
+        return t(
+            self.LABEL_KEYS.get(
+                (self.mode, self.status),
+                self.LABEL_KEYS[("auto", "running")],
+            )
         )
 
     def _refresh(self) -> None:
@@ -2976,7 +3061,11 @@ class ThoughtBlock(Vertical):
 
     def _header_label(self) -> str:
         marker = "+" if not self.expanded else "-"
-        return f"{marker} Thought: {self.elapsed_seconds:.1f}s"
+        return t(
+            "chat.thought_header",
+            marker=marker,
+            seconds=f"{self.elapsed_seconds:.1f}",
+        )
 
     def _refresh(self) -> None:
         toggle = self._toggle_widget
@@ -2998,15 +3087,6 @@ class ExploredBlock(Vertical):
         "read_skill",
     })
     SEARCH_TOOLS = frozenset({"grep", "glob", "list_dir", "list_skills"})
-    TOOL_LABELS = {
-        "read_file": "Read",
-        "read_program_docs": "Read program docs",
-        "read_skill": "Read skill",
-        "grep": "Grep",
-        "glob": "Glob",
-        "list_dir": "List dir",
-        "list_skills": "List skills",
-    }
 
     def __init__(self):
         super().__init__()
@@ -3046,7 +3126,7 @@ class ExploredBlock(Vertical):
     @classmethod
     def error_description(cls, tool_name: str, summary: str) -> str:
         name = str(tool_name or "")
-        label = cls.TOOL_LABELS.get(name, name.replace("_", " ").title()) or "Tool"
+        label = _tool_label(name) or t("chat.tool.generic")
         description = f"[white]{_escape_markup(label)}[/white]"
         summary = str(summary or "").strip()
         if summary:
@@ -3068,22 +3148,23 @@ class ExploredBlock(Vertical):
         )
         parts = []
         if reads:
-            parts.append(f"{reads} read" if reads == 1 else f"{reads} reads")
+            key = "chat.read_count" if reads == 1 else "chat.read_count_plural"
+            parts.append(t(key, count=reads))
         if searches:
-            parts.append(
-                f"{searches} search" if searches == 1 else f"{searches} searches"
-            )
+            key = "chat.search_count" if searches == 1 else "chat.search_count_plural"
+            parts.append(t(key, count=searches))
         if not parts:
-            parts.append("0 reads, 0 searches")
-        counts = ", ".join(parts)
-        return f"→ [white]Explored[/white] [gray]{counts}[/gray]"
+            parts.append(t("chat.explored_empty"))
+        counts = t("chat.count_separator").join(parts)
+        label = _escape_markup(t("chat.explored"))
+        return f"→ [white]{label}[/white] [gray]{counts}[/gray]"
 
     def _content_text(self) -> str:
         lines: list[str] = []
         for tool_name, description, error in self.entries:
             description = description or self.error_description(tool_name, "")
             if error:
-                description += f" [{STATUS_ERROR}]failed[/]"
+                description += f" [{STATUS_ERROR}]{t('chat.status.failed')}[/]"
             lines.append(description)
         return "\n".join(lines)
 
@@ -3138,14 +3219,21 @@ class QuestionsBlock(Vertical):
         self._refresh()
 
     def add_error(self, error: str) -> None:
-        self.errors.append(str(error or "") or "Tool call failed.")
+        self.errors.append(str(error or "") or t("chat.tool_call_failed"))
         self._refresh()
 
     def _header_label(self) -> str:
         count = len(self.entries)
-        count_label = f" [gray]{count} answered[/gray]" if count else ""
-        failed = f" [{STATUS_ERROR}]failed[/]" if self.errors else ""
-        return f"[gray]#[/] [white]Questions[/white]{count_label}{failed}"
+        count_label = (
+            f" [gray]{_escape_markup(t('chat.answered_count', count=count))}[/gray]"
+            if count
+            else ""
+        )
+        failed = (
+            f" [{STATUS_ERROR}]{t('chat.status.failed')}[/]" if self.errors else ""
+        )
+        label = _escape_markup(t("chat.tool.ask_user"))
+        return f"[gray]#[/] [white]{label}[/white]{count_label}{failed}"
 
     def _content_text(self) -> str:
         parts = []
@@ -3175,42 +3263,12 @@ class QuestionsBlock(Vertical):
 
 class ToolErrorBlock(Vertical):
     EXPANDABLE_TOOLS = frozenset({"dispatch_subagent"})
-    LABELS = {
-        "update_todo": "Todos",
-        "ask_user": "Questions",
-        "submit_plan": "Plan",
-        "read_file": "Read",
-        "read_program_docs": "Read program docs",
-        "web_fetch": "Webfetch",
-        "list_dir": "List dir",
-        "write_file": "Write",
-        "edit_file": "Edit",
-        "apply_patch": "Edit",
-        "apply_unified_patch": "Edit",
-        "bash": "Shell",
-        "local_http_check": "HTTP check",
-        "git_status": "Git status",
-        "git_diff": "Git diff",
-        "grep": "Grep",
-        "glob": "Glob",
-        "list_skills": "List skills",
-        "read_skill": "Read skill",
-        "web_search": "Websearch",
-        "dispatch_subagent": "Subagent",
-        "report_to_lead": "Report to Lead",
-        "spawn_teammate": "Spawn teammate",
-        "list_teammates": "List teammates",
-        "send_message": "Send message",
-        "read_inbox": "Read inbox",
-        "broadcast": "Broadcast",
-        "shutdown_teammate": "Shutdown teammate",
-    }
 
     def __init__(self, tool_name: str, summary: str, error: str):
         super().__init__()
         self.tool_name = str(tool_name or "")
         self.summary = str(summary or "").strip()
-        self.error = str(error or "").strip() or "Tool call failed."
+        self.error = str(error or "").strip() or t("chat.tool_call_failed")
         self.expandable = self.tool_name in self.EXPANDABLE_TOOLS
         self.expanded = False
         self._toggle_widget: Static | None = None
@@ -3243,9 +3301,7 @@ class ToolErrorBlock(Vertical):
             event.stop()
 
     def _header_label(self) -> str:
-        label = self.LABELS.get(
-            self.tool_name, self.tool_name.replace("_", " ").strip().title()
-        ) or "Tool"
+        label = _tool_label(self.tool_name) or t("chat.tool.generic")
         prefix = "$" if self.tool_name in {
             "bash",
             "local_http_check",
@@ -3255,7 +3311,7 @@ class ToolErrorBlock(Vertical):
         header = f"[gray]{prefix}[/] [white]{_escape_markup(label)}[/white]"
         if self.summary:
             header += f" [gray]{_escape_markup(self.summary)}[/gray]"
-        return f"{header} [{STATUS_ERROR}]failed[/]"
+        return f"{header} [{STATUS_ERROR}]{t('chat.status.failed')}[/]"
 
     def _refresh(self) -> None:
         if self._toggle_widget is not None:
@@ -3312,14 +3368,18 @@ class TodosBlock(Vertical):
     def _header_label(self) -> str:
         total = int(self.summary.get("total", len(self.items)) or 0)
         completed = int(self.summary.get("completed", 0) or 0)
+        label = _escape_markup(t("chat.tool.update_todo"))
         if self.error:
-            return f"[gray]#[/] [white]Todos[/white] [{STATUS_ERROR}]failed[/]"
+            return (
+                f"[gray]#[/] [white]{label}[/white] "
+                f"[{STATUS_ERROR}]{t('chat.status.failed')}[/]"
+            )
         if self.expanded:
-            return "[gray]#[/] [white]Todos[/white]"
-        return (
-            f"[gray]#[/] [white]Todos[/white] "
-            f"[gray]{completed} of {total} todos completed[/gray]"
+            return f"[gray]#[/] [white]{label}[/white]"
+        progress = _escape_markup(
+            t("todo.progress", completed=completed, total=total)
         )
+        return f"[gray]#[/] [white]{label}[/white] [gray]{progress}[/gray]"
 
     def _refresh(self) -> None:
         toggle = self._toggle_widget
@@ -3336,7 +3396,7 @@ class TodosBlock(Vertical):
                 f"[{STATUS_ERROR}]{_escape_markup(self.error)}[/]"
             )
         else:
-            summary.update(f"{completed} of {total} todos completed")
+            summary.update(t("todo.progress", completed=completed, total=total))
         existing = list(rows.children)
         target = len(self.items)
         while len(existing) > target:
@@ -3354,20 +3414,26 @@ class TodosBlock(Vertical):
             content.add_class("hidden")
 
 
+_TEAM_STATUS_KEYS = {
+    "active": "chat.team_status.active",
+    "starting": "chat.team_status.starting",
+    "waiting": "chat.team_status.waiting",
+    "running": "chat.team_status.running",
+    "completed": "chat.team_status.completed",
+    "failed": "chat.team_status.failed",
+    "cancelling": "chat.team_status.cancelling",
+    "cancelled": "chat.team_status.cancelled",
+    "interrupted": "chat.team_status.interrupted",
+    "unknown": "chat.team_status.unknown",
+}
+
+
 def _friendly_team_status(status: str) -> str:
     normalized = str(status or "").strip().lower()
-    return {
-        "active": "Ready",
-        "starting": "Starting",
-        "waiting": "Waiting",
-        "running": "Working",
-        "completed": "Done",
-        "failed": "Failed",
-        "cancelling": "Stopping",
-        "cancelled": "Cancelled",
-        "interrupted": "Interrupted",
-        "unknown": "Unknown",
-    }.get(normalized, normalized.replace("_", " ").title() or "Unknown")
+    key = _TEAM_STATUS_KEYS.get(normalized)
+    if key:
+        return t(key)
+    return normalized.replace("_", " ").title() or t("chat.team_status.unknown")
 
 
 def _team_status_color(status: str) -> str:
@@ -3394,15 +3460,6 @@ def _compact_team_text(text: str, limit: int = 160) -> str:
 
 
 class TeamActionBlock(Vertical):
-    _ACTION_LABELS = {
-        "list_teammates": "List Teammates",
-        "send_message": "Send Message",
-        "read_inbox": "Read Inbox",
-        "broadcast": "Broadcast",
-        "report_to_lead": "Report to Lead",
-        "shutdown_teammate": "Shutdown Teammate",
-    }
-
     def __init__(
         self,
         action: str,
@@ -3463,14 +3520,11 @@ class TeamActionBlock(Vertical):
 
     def _header_label(self) -> str:
         marker = self._marker()
-        action = self._ACTION_LABELS.get(
-            self.action, self.action.replace("_", " ").title()
-        )
-        action = _escape_markup(action)
+        action = _escape_markup(_tool_label(self.action))
         summary = _escape_markup(self.summary)
         suffix = f" [gray]{summary}[/gray]" if summary else ""
         if self.status.strip().lower() in {"error", "failed"}:
-            suffix += f" [{STATUS_ERROR}]failed[/]"
+            suffix += f" [{STATUS_ERROR}]{t('chat.status.failed')}[/]"
         return f"{marker} [white]{action}[/white]{suffix}"
 
     def _content_with_half_row_gaps(self) -> list[Widget]:
@@ -3513,7 +3567,9 @@ class TeamActionBlock(Vertical):
         for teammate in self.metadata.get("roster") or []:
             if not isinstance(teammate, dict):
                 continue
-            name = _escape_markup(str(teammate.get("name") or "Teammate"))
+            name = _escape_markup(
+                str(teammate.get("name") or t("chat.team.teammate"))
+            )
             role = _escape_markup(str(teammate.get("role") or ""))
             status = _escape_markup(
                 _friendly_team_status(str(teammate.get("status") or "unknown"))
@@ -3522,14 +3578,17 @@ class TeamActionBlock(Vertical):
                 task_count = int(teammate.get("task_count") or 0)
             except (TypeError, ValueError):
                 task_count = 0
-            task_label = "task" if task_count == 1 else "tasks"
+            task_key = (
+                "chat.task_count" if task_count == 1 else "chat.task_count_plural"
+            )
+            task_label = _escape_markup(t(task_key, count=task_count))
             title = f"[white]{name}[/white]"
             if role:
                 title += f" [gray]({role})[/gray]"
             lines = [
                 title,
-                f"[gray]Status[/gray]  {status}    "
-                f"[gray]Tasks[/gray]  {task_count} {task_label}",
+                f"[gray]{_escape_markup(t('chat.team.status'))}[/gray]  {status}    "
+                f"[gray]{_escape_markup(t('chat.team.tasks'))}[/gray]  {task_label}",
             ]
             write_scope = [
                 _compact_team_text(str(item), 80)
@@ -3538,12 +3597,14 @@ class TeamActionBlock(Vertical):
             ]
             if write_scope:
                 lines.append(
-                    f"[gray]Scope[/gray]  {_escape_markup(', '.join(write_scope))}"
+                    f"[gray]{_escape_markup(t('chat.team.scope'))}[/gray]  "
+                    f"{_escape_markup(', '.join(write_scope))}"
                 )
             current_task = _compact_team_text(str(teammate.get("task") or ""), 160)
             if current_task:
                 lines.append(
-                    f"[gray]Current[/gray] {_escape_markup(current_task)}"
+                    f"[gray]{_escape_markup(t('chat.team.current'))}[/gray] "
+                    f"{_escape_markup(current_task)}"
                 )
             children.append(
                 Static("\n".join(lines), classes="team-roster-card", markup=True)
@@ -3557,9 +3618,9 @@ class TeamActionBlock(Vertical):
                 continue
             sender_value = str(message.get("from") or "lead")
             sender = (
-                "Lead"
+                t("chat.team.lead")
                 if sender_value.lower() == "lead"
-                else str(message.get("from") or "Teammate")
+                else str(message.get("from") or t("chat.team.teammate"))
             )
             status_value = str(message.get("status") or "")
             status = _friendly_team_status(status_value) if status_value else ""
@@ -3642,7 +3703,11 @@ class SubagentBlock(Vertical):
 
     def _header_label(self) -> str:
         marker = "»" if not self.expanded else "«"
-        return f"{marker} [white]Subagent[/white] [gray]{_escape_markup(self.agent_type)}[/gray]"
+        label = _escape_markup(t("chat.tool.dispatch_subagent"))
+        return (
+            f"{marker} [white]{label}[/white] "
+            f"[gray]{_escape_markup(self.agent_type)}[/gray]"
+        )
 
     def _refresh(self) -> None:
         if self._toggle_widget is not None:
@@ -3658,9 +3723,16 @@ class SubagentBlock(Vertical):
         return _subagent_chat_transcript(transcript)
 
     def _load_transcript(self) -> None:
-        if self._chat_view is not None:
+        if self._chat_view is None or self._loaded:
+            return
+        try:
             self._chat_view.load_transcript(self._chat_transcript(self.transcript))
-            self._loaded = True
+        except NoMatches:
+            # The parent mounts before the nested ChatView composes #chat-log.
+            # Defer the initial replay until that child is ready.
+            self.call_after_refresh(self._load_transcript)
+            return
+        self._loaded = True
 
     def add_event(self, event: dict) -> None:
         self.transcript.append(deepcopy(event))
@@ -3742,7 +3814,7 @@ class TeamRunBlock(SubagentBlock):
         purpose = _escape_markup(self.purpose)
         status = _escape_markup(_friendly_team_status(self.status))
         status_color = _team_status_color(self.status)
-        title = f"@ [white]Teammate {name}[/white]"
+        title = f"@ [white]{_escape_markup(t('chat.team.teammate'))} {name}[/white]"
         if role:
             title += f" [gray]({role})[/gray]"
         title += f" [gray]\u00b7[/gray] [{status_color}]{status}[/]"
@@ -3850,7 +3922,7 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
                 summary = str(display.get("summary") or "")
                 error = str(
                     display.get("error", entry.get("content", ""))
-                    or "Tool call failed."
+                    or t("chat.tool_call_failed")
                 )
                 if ExploredBlock.handles_tool(tool_name):
                     apply_explored_error(
@@ -3904,7 +3976,7 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
                 report_label = (
                     report_kind.replace("_", " ").title()
                     if report_kind
-                    else "Report"
+                    else t("chat.team.report")
                 )
                 message = str(display.get("message") or "").strip()
                 entries.append({
@@ -3923,7 +3995,7 @@ def _subagent_chat_transcript(transcript: list[dict]) -> list[dict]:
         if bool(entry.get("is_error")) or content.startswith("ERROR:"):
             error = content[6:].lstrip() if content.startswith("ERROR:") else content
             tool_name = str(entry.get("name") or "")
-            error = error or "Tool call failed."
+            error = error or t("chat.tool_call_failed")
             if ExploredBlock.handles_tool(tool_name):
                 apply_explored_error(
                     tool_name, "", error, explored_entry_index
@@ -3942,7 +4014,7 @@ def _subagent_explored_description(name: str, arguments) -> str:
     if not isinstance(arguments, dict):
         return ""
     if name == "read_file":
-        parts = ["[white]Read[/white]"]
+        parts = [f"[white]{_escape_markup(t('chat.tool.read_file'))}[/white]"]
         file_path = _escape_markup(arguments.get("file_path") or "")
         if file_path:
             parts.append(f"[gray]{file_path}[/gray]")
@@ -3954,17 +4026,17 @@ def _subagent_explored_description(name: str, arguments) -> str:
             parts.append(f"[gray]limit={limit}[/gray]")
         return " ".join(parts)
     if name == "read_program_docs":
-        return "[white]Read program docs[/white]"
+        return f"[white]{_escape_markup(t('chat.tool.read_program_docs'))}[/white]"
     if name == "list_skills":
-        return "[white]List skills[/white]"
+        return f"[white]{_escape_markup(t('chat.tool.list_skills'))}[/white]"
     if name == "read_skill":
-        parts = ["[white]Read skill[/white]"]
+        parts = [f"[white]{_escape_markup(t('chat.tool.read_skill'))}[/white]"]
         skill_name = _escape_markup(arguments.get("name") or "")
         if skill_name:
             parts.append(f"[gray]{skill_name}[/gray]")
         return " ".join(parts)
     if name == "grep":
-        parts = ["[white]Grep[/white]"]
+        parts = [f"[white]{_escape_markup(t('chat.tool.grep'))}[/white]"]
         pattern = _escape_markup(arguments.get("pattern") or "")
         if pattern:
             parts.append(f"[gray]{pattern}[/gray]")
@@ -3974,9 +4046,15 @@ def _subagent_explored_description(name: str, arguments) -> str:
             parts.append(f"[gray]path={_escape_markup(arguments['path'])}[/gray]")
         return " ".join(parts)
     if name == "glob":
-        return f"[white]Glob[/white] [gray]{_escape_markup(arguments.get('pattern') or '')}[/gray]"
+        return (
+            f"[white]{_escape_markup(t('chat.tool.glob'))}[/white] "
+            f"[gray]{_escape_markup(arguments.get('pattern') or '')}[/gray]"
+        )
     if name == "list_dir":
-        return f"[white]List dir[/white] [gray]{_escape_markup(arguments.get('path') or '.')}[/gray]"
+        return (
+            f"[white]{_escape_markup(t('chat.tool.list_dir'))}[/white] "
+            f"[gray]{_escape_markup(arguments.get('path') or '.')}[/gray]"
+        )
     return ""
 
 
@@ -3993,7 +4071,7 @@ class EditedBlock(Vertical):
         status: str = "",
     ) -> None:
         row = DiffFileRow(
-            "[gray]#[/] Edit",
+            f"[gray]#[/] {_escape_markup(t('chat.tool.edit_file'))}",
             file_path,
             additions,
             deletions,
@@ -4017,7 +4095,7 @@ class WrittenBlock(Vertical):
         status: str = "",
     ) -> None:
         row = DiffFileRow(
-            "[gray]#[/] Write",
+            f"[gray]#[/] {_escape_markup(t('chat.tool.write_file'))}",
             file_path,
             additions,
             deletions,
@@ -4058,7 +4136,10 @@ class ShellRow(Vertical):
         with Horizontal(classes="shell-row-header"):
             yield Static("$", classes="shell-row-label", markup=True, expand=False)
             yield Static(
-                "Shell", classes="shell-row-shell-label", markup=True, expand=False
+                _escape_markup(t("chat.tool.bash")),
+                classes="shell-row-shell-label",
+                markup=True,
+                expand=False,
             )
             self._header_command = Static(
                 "",
@@ -4139,9 +4220,10 @@ class ShellRow(Vertical):
         hc = self._header_command
         if hc is None:
             return
+        failed_label = t("chat.status.failed")
         if self._expanded:
             hc.update(
-                f"[{STATUS_ERROR}]failed[/]"
+                f"[{STATUS_ERROR}]{failed_label}[/]"
                 if self.status == "failed"
                 else ""
             )
@@ -4150,7 +4232,10 @@ class ShellRow(Vertical):
         if width <= 0:
             return
         failed = self.status == "failed"
-        command_width = max(0, width - (7 if failed else 0))
+        # Reserve the label's own cell width plus one separating space; a CJK
+        # label is narrower in characters but wider in cells than "failed".
+        reserved = (cell_len(failed_label) + 1) if failed else 0
+        command_width = max(0, width - reserved)
         command = self._truncate_command_for_width(
             self.command, command_width
         )
@@ -4158,7 +4243,7 @@ class ShellRow(Vertical):
         if failed:
             if content:
                 content += " "
-            content += f"[{STATUS_ERROR}]failed[/]"
+            content += f"[{STATUS_ERROR}]{failed_label}[/]"
         hc.update(content)
 
 
@@ -4207,7 +4292,7 @@ class DiffFileRow(Vertical):
             )
             if self.status == "failed":
                 yield Static(
-                    f"[{STATUS_ERROR}]failed[/]",
+                    f"[{STATUS_ERROR}]{t('chat.status.failed')}[/]",
                     classes="diff-row-status",
                     markup=True,
                     expand=False,
@@ -4274,7 +4359,8 @@ class DiffFileRow(Vertical):
 
     def _label_markup(self) -> str:
         if self.status == "rejected":
-            return f"{self.label} [gray](rejected)[/]"
+            rejected = _escape_markup(t("chat.status.rejected"))
+            return f"{self.label} [gray]({rejected})[/]"
         return self.label
 
 
@@ -4295,7 +4381,12 @@ class ChangedFilesBlock(Vertical):
         count = len(self.files)
         total_add = sum(int(f.get("additions", 0) or 0) for f in self.files)
         total_del = sum(int(f.get("deletions", 0) or 0) for f in self.files)
-        label = f"{count} Changed file" if count == 1 else f"{count} Changed files"
+        key = (
+            "chat.changed_files_count"
+            if count == 1
+            else "chat.changed_files_count_plural"
+        )
+        label = _escape_markup(t(key, count=count))
         return (
             f"[white]{label}[/white] [{DIFF_ADD_FG}]+{total_add}[/] "
             f"[{DIFF_DEL_FG}]-{total_del}[/]"
