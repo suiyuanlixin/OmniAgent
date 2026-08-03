@@ -528,7 +528,10 @@ class AgentTUIApp(App):
     def _grouped_model_choices(self) -> list[dict]:
         grouped: dict[str, list[tuple[str, str]]] = {}
         for model_key, profile in self.config.model_list.items():
-            provider = str(getattr(profile, "provider", "") or "").strip() or "Other"
+            provider = (
+                str(getattr(profile, "provider", "") or "").strip()
+                or t("input.model_group.other")
+            )
             grouped.setdefault(provider, []).append(
                 (str(profile.profile_name), str(model_key))
             )
@@ -2464,6 +2467,14 @@ class AgentTUIApp(App):
                 "edit_type": "none",
             },
             {
+                "name": t("app.row.name"),
+                "row_id": "profile_name",
+                "value": active_model.profile_name,
+                "keywords": "model name rename 名称 重命名",
+                "edit_type": "input",
+                "on_change": lambda v: self._on_setting_model_name_changed(v),
+            },
+            {
                 "name": t("app.model.api_type"),
                 "row_id": "api_type",
                 "value": active_model.api_type,
@@ -2479,14 +2490,6 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_model_api_type_changed(v),
             },
             {
-                "name": t("app.model.name"),
-                "row_id": "profile_name",
-                "value": active_model.profile_name,
-                "keywords": "model name rename 名称 重命名",
-                "edit_type": "input",
-                "on_change": lambda v: self._on_setting_model_name_changed(v),
-            },
-            {
                 "name": t("app.model.base_url"),
                 "row_id": "base_url",
                 "value": active_model.base_url,
@@ -2499,6 +2502,7 @@ class AgentTUIApp(App):
                 "row_id": "model",
                 "value": active_model.model,
                 "keywords": "model backend 模型",
+                "model_discovery": True,
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_model_id_changed(v),
             },

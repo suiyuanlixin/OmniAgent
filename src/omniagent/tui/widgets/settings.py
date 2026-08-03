@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -25,6 +27,7 @@ from ...config import (
     supported_reasoning_efforts,
 )
 from ...i18n import display_width, t
+from ...model_discovery import fetch_available_models
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -464,6 +467,22 @@ class SettingsModal(ModalScreen[None]):
         min-width: 8;
         color: $TEXT_MUTED;
         padding: 0 0 0 1;
+    }
+
+    .settings-name-with-action {
+        width: 1fr;
+        height: 1;
+        align: left middle;
+    }
+    .settings-name-with-action .settings-name {
+        width: auto;
+    }
+    .settings-title-action,
+    .settings-title-action:hover,
+    .settings-title-action:focus,
+    .settings-title-action.-active {
+        width: auto;
+        min-width: 5;
     }
 
     .settings-toggle-trigger.toggle-off,
@@ -911,6 +930,13 @@ class SettingsModal(ModalScreen[None]):
         self._editing_row_index: int | None = None
         self._autocomplete_filtered_options: list[str] = []
         self._autocomplete_render_generation: int = 0
+        self._available_model_names: list[str] = []
+        self._model_fetching: bool = False
+        self._model_fetch_request_id: int = 0
+        self._model_list_available_names: list[str] = []
+        self._model_list_fetching: bool = False
+        self._model_list_fetch_request_id: int = 0
+        self._model_list_fetch_signature: tuple[str, str, str, str] | None = None
         self._select_open_index: int | None = None
         self._select_group_toggle_keys: dict[str, str] = {}
         self._select_group_toggle_list_ids: dict[str, str] = {}
@@ -993,7 +1019,7 @@ class SettingsModal(ModalScreen[None]):
                             ):
                                 with Vertical(id="settings-model-sidebar"):
                                     yield _ModelAction(
-                                        "Add model",
+                                        t("settings.add_model"),
                                         id="settings-model-add-top",
                                         classes="settings-model-add",
                                     )
@@ -2007,7 +2033,7 @@ class SettingsModal(ModalScreen[None]):
         empty_list_label = (
             str(state.get("empty_list_label"))
             if "empty_list_label" in state
-            else "No items"
+            else t("settings.no_items")
         )
         blank_detail_when_empty = bool(state.get("blank_detail_when_empty", False))
         self._show_model_group_titles = show_group_titles
@@ -2018,6 +2044,7 @@ class SettingsModal(ModalScreen[None]):
             self._selected_model_name = all_model_names[0]
         else:
             self._selected_model_name = ""
+        self._decorate_model_list_discovery_rows()
 
         model_items = self.query_one("#settings-model-items", Vertical)
         detail_list = self.query_one("#settings-model-detail-list", Vertical)
@@ -2032,7 +2059,13 @@ class SettingsModal(ModalScreen[None]):
             child.remove()
 
         if not groups and all_model_names:
-            groups = [{"provider": "", "title": "Models", "models": all_model_names}]
+            groups = [
+                {
+                    "provider": "",
+                    "title": t("input.model_group.models"),
+                    "models": all_model_names,
+                }
+            ]
 
         selected_group_key = ""
         for group in groups:
@@ -2050,7 +2083,9 @@ class SettingsModal(ModalScreen[None]):
 
         for group_index, group in enumerate(groups):
             group_key = str(group.get("provider") or "")
-            title = str(group.get("title") or "") or (group_key or "Other")
+            title = str(group.get("title") or "") or (
+                group_key or t("input.model_group.other")
+            )
             group_models = [str(name) for name in list(group.get("models") or [])]
             if show_group_titles:
                 header_count += 1
@@ -2118,7 +2153,9 @@ class SettingsModal(ModalScreen[None]):
             detail_list.mount(self._build_row_widget(row, row_index))
 
         if not self._current_rows and not blank_detail_when_empty:
-            detail_list.mount(Static("No model settings", classes="settings-name"))
+            detail_list.mount(
+                Static(t("settings.no_model_settings"), classes="settings-name")
+            )
 
         if self._current_footer_actions:
             detail_footer.add_class("open")
@@ -2200,14 +2237,28 @@ class SettingsModal(ModalScreen[None]):
                 )
             )
         accessory_label = str(row.get("accessory_label") or "").strip()
+        accessory_beside_name = bool(row.get("accessory_beside_name"))
         accessory_widget = None
         if accessory_label:
+            accessory_classes = "settings-control-trigger settings-inline-action"
+            if accessory_beside_name:
+                accessory_classes += " settings-title-action"
             accessory_widget = _ValueTrigger(
                 accessory_label,
                 markup=False,
                 id=self._accessory_id(row_index),
-                classes="settings-control-trigger settings-inline-action",
+                classes=accessory_classes,
             )
+        if accessory_widget is not None and accessory_beside_name and not limit_selector:
+            name_widget = header_children.pop()
+            header_children.append(
+                Horizontal(
+                    name_widget,
+                    accessory_widget,
+                    classes="settings-name-with-action",
+                )
+            )
+            accessory_widget = None
 
         if edit_type == _EDIT_NONE:
             header_children.append(
@@ -2756,6 +2807,11 @@ class SettingsModal(ModalScreen[None]):
         self._render_current_page(self._current_query())
 
     def _select_model(self, model_name: str) -> None:
+        if model_name != self._selected_model_name:
+            self._model_list_fetch_request_id += 1
+            self._model_list_fetching = False
+            self._model_list_available_names = []
+            self._model_list_fetch_signature = None
         callback = self._current_page().get("on_select_model")
         if callable(callback):
             callback(model_name)
@@ -2763,6 +2819,11 @@ class SettingsModal(ModalScreen[None]):
         self._render_current_page("")
 
     def _begin_add_model(self, source_name: str = "") -> None:
+        self._model_list_fetch_request_id += 1
+        self._model_list_fetching = False
+        self._model_fetch_request_id += 1
+        self._model_fetching = False
+        self._available_model_names = []
         self._add_model_draft = {
             "provider": "",
             "name": "",
@@ -2805,6 +2866,7 @@ class SettingsModal(ModalScreen[None]):
     def _set_add_model_field(self, key: str, value: str) -> None:
         if not self._add_model_draft:
             self._add_model_draft = {}
+        previous_value = str(self._add_model_draft.get(key) or "")
         if key == "api_type":
             value = str(value or API_TYPE_OLLAMA)
             current_effort = self._add_model_draft.get("reasoning_effort") or "medium"
@@ -2814,6 +2876,286 @@ class SettingsModal(ModalScreen[None]):
             if value == API_TYPE_GLM:
                 self._add_model_draft.pop("base_url", None)
         self._add_model_draft[key] = value
+        if key in {"api_type", "base_url", "api_key"} and str(value) != previous_value:
+            self._model_fetch_request_id += 1
+            self._model_fetching = False
+            self._available_model_names = []
+
+    def _sync_active_add_model_input(self) -> None:
+        if self._page_stack[-1] != "add_model" or self._editing_row_index is None:
+            return
+        rows = self._visible_rows()
+        if not (0 <= self._editing_row_index < len(rows)):
+            return
+        row = rows[self._editing_row_index]
+        if row.get("edit_type") not in {_EDIT_INPUT, _EDIT_AUTOCOMPLETE}:
+            return
+        try:
+            input_widget = self.query_one("#settings-edit-input", Input)
+        except Exception:
+            return
+        value = str(input_widget.value or "").strip()
+        row["value"] = value
+        on_change = row.get("on_change")
+        if callable(on_change):
+            on_change(value)
+        self._finish_input_edit()
+
+    def _model_fetch_error(self, error: Exception, api_key: str) -> str:
+        message = " ".join(str(error).split()) or error.__class__.__name__
+        if api_key:
+            message = message.replace(api_key, "***")
+        if len(message) > 240:
+            message = f"{message[:237]}..."
+        return message
+
+    def _current_model_list_profile(self):
+        if self.app_ref is None:
+            return None
+        model_list = getattr(self.app_ref.config, "model_list", {}) or {}
+        selected_name = self._selected_model_name
+        profile = model_list.get(selected_name)
+        if profile is not None:
+            return profile
+        selected_name = str(
+            getattr(self.app_ref, "_settings_model_profile_key", "") or ""
+        )
+        profile = model_list.get(selected_name)
+        if profile is not None:
+            self._selected_model_name = selected_name
+        return profile
+
+    def _current_model_list_fetch_signature(
+        self,
+    ) -> tuple[str, str, str, str] | None:
+        profile = self._current_model_list_profile()
+        if profile is None:
+            return None
+        return (
+            self._selected_model_name,
+            str(getattr(profile, "api_type", API_TYPE_OLLAMA) or API_TYPE_OLLAMA),
+            str(getattr(profile, "base_url", "") or "").strip(),
+            str(getattr(profile, "api_key", "") or "").strip(),
+        )
+
+    def _decorate_model_list_discovery_rows(self) -> None:
+        discovery_rows = [
+            row for row in self._current_rows if bool(row.get("model_discovery"))
+        ]
+        if not discovery_rows:
+            return
+        signature = self._current_model_list_fetch_signature()
+        if (
+            self._model_list_fetch_signature is not None
+            and signature != self._model_list_fetch_signature
+        ):
+            self._model_list_fetch_request_id += 1
+            self._model_list_fetching = False
+            self._model_list_available_names = []
+            self._model_list_fetch_signature = None
+        for row in discovery_rows:
+            row["edit_type"] = _EDIT_AUTOCOMPLETE
+            row["suggestions"] = list(self._model_list_available_names)
+            row["accessory_label"] = t("settings.fetch_models")
+            row["accessory_beside_name"] = True
+            row["accessory_action"] = self._fetch_model_list_models
+
+    def _sync_active_model_list_input(self) -> None:
+        if self._page_stack[-1] != "model_list" or self._editing_row_index is None:
+            return
+        rows = self._visible_rows()
+        if not (0 <= self._editing_row_index < len(rows)):
+            return
+        row = rows[self._editing_row_index]
+        if row.get("edit_type") not in {_EDIT_INPUT, _EDIT_AUTOCOMPLETE}:
+            return
+        if row.get("row_id") not in {"base_url", "api_key"}:
+            self._finish_input_edit()
+            return
+        try:
+            input_widget = self.query_one("#settings-edit-input", Input)
+        except Exception:
+            return
+        value = str(input_widget.value or "").strip()
+        row["value"] = value
+        on_change = row.get("on_change")
+        if callable(on_change):
+            on_change(value)
+        self._finish_input_edit()
+
+    def _refresh_after_model_list_fetch(self, *, open_picker: bool) -> None:
+        if self._page_stack[-1] != "model_list":
+            return
+        self._render_current_page(self._current_query())
+        if open_picker:
+            self.call_after_refresh(self._open_model_list_picker)
+
+    def _open_model_list_picker(self) -> None:
+        if (
+            self._page_stack[-1] != "model_list"
+            or not self._model_list_available_names
+        ):
+            return
+        for row_index, row in enumerate(self._visible_rows()):
+            if row.get("row_id") == "model":
+                self._start_input_edit(row_index)
+                return
+
+    def _fetch_model_list_models(self) -> None:
+        if self.app_ref is None:
+            return
+        self._sync_active_model_list_input()
+        if self._model_list_fetching:
+            return
+        signature = self._current_model_list_fetch_signature()
+        if signature is None:
+            return
+        _selected_name, api_type, base_url, api_key = signature
+        if signature != self._model_list_fetch_signature:
+            self._model_list_available_names = []
+        if api_type != API_TYPE_OLLAMA and not api_key:
+            self.app_ref.add_status_message(
+                "[!]", t("settings.fetch_models_api_key_required")
+            )
+            return
+
+        self._model_list_fetch_request_id += 1
+        request_id = self._model_list_fetch_request_id
+        self._model_list_fetching = True
+        self._model_list_fetch_signature = signature
+
+        async def fetch_models() -> None:
+            try:
+                model_names = await asyncio.to_thread(
+                    fetch_available_models,
+                    api_type,
+                    base_url,
+                    api_key,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as error:
+                if request_id != self._model_list_fetch_request_id:
+                    return
+                self._model_list_fetching = False
+                self._model_list_available_names = []
+                self._model_list_fetch_signature = None
+                self.app_ref.add_status_message(
+                    "[✗]",
+                    t(
+                        "settings.fetch_models_failed",
+                        error=self._model_fetch_error(error, api_key),
+                    ),
+                )
+                self._refresh_after_model_list_fetch(open_picker=False)
+                return
+
+            if request_id != self._model_list_fetch_request_id:
+                return
+            if signature != self._current_model_list_fetch_signature():
+                self._model_list_fetching = False
+                self._model_list_available_names = []
+                self._model_list_fetch_signature = None
+                return
+            self._model_list_fetching = False
+            self._model_list_available_names = list(model_names)
+            if model_names:
+                self.app_ref.add_status_message(
+                    "[✓]", t("settings.fetch_models_loaded", count=len(model_names))
+                )
+            else:
+                self.app_ref.add_status_message(
+                    "[!]", t("settings.fetch_models_empty")
+                )
+            self._refresh_after_model_list_fetch(open_picker=bool(model_names))
+
+        self.run_worker(
+            fetch_models(),
+            name="settings-fetch-existing-models",
+            group="settings-model-discovery",
+            exclusive=True,
+        )
+
+    def _refresh_after_model_fetch(self, *, open_picker: bool) -> None:
+        if self._page_stack[-1] != "add_model":
+            return
+        self._render_current_page(self._current_query())
+        if open_picker:
+            self.call_after_refresh(self._open_add_model_picker)
+
+    def _open_add_model_picker(self) -> None:
+        if self._page_stack[-1] != "add_model" or not self._available_model_names:
+            return
+        for row_index, row in enumerate(self._visible_rows()):
+            if row.get("field_key") == "model":
+                self._start_input_edit(row_index)
+                return
+
+    def _fetch_add_model_models(self) -> None:
+        if self.app_ref is None:
+            return
+        self._sync_active_add_model_input()
+        if self._model_fetching:
+            return
+        draft = dict(self._add_model_draft or {})
+        api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
+        base_url = str(draft.get("base_url") or "").strip()
+        api_key = str(draft.get("api_key") or "").strip()
+        if api_type != API_TYPE_OLLAMA and not api_key:
+            self.app_ref.add_status_message(
+                "[!]", t("settings.fetch_models_api_key_required")
+            )
+            return
+
+        self._model_fetch_request_id += 1
+        request_id = self._model_fetch_request_id
+        self._model_fetching = True
+
+        async def fetch_models() -> None:
+            try:
+                model_names = await asyncio.to_thread(
+                    fetch_available_models,
+                    api_type,
+                    base_url,
+                    api_key,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as error:
+                if request_id != self._model_fetch_request_id:
+                    return
+                self._model_fetching = False
+                self._available_model_names = []
+                self.app_ref.add_status_message(
+                    "[✗]",
+                    t(
+                        "settings.fetch_models_failed",
+                        error=self._model_fetch_error(error, api_key),
+                    ),
+                )
+                self._refresh_after_model_fetch(open_picker=False)
+                return
+
+            if request_id != self._model_fetch_request_id:
+                return
+            self._model_fetching = False
+            self._available_model_names = list(model_names)
+            if model_names:
+                self.app_ref.add_status_message(
+                    "[✓]", t("settings.fetch_models_loaded", count=len(model_names))
+                )
+            else:
+                self.app_ref.add_status_message(
+                    "[!]", t("settings.fetch_models_empty")
+                )
+            self._refresh_after_model_fetch(open_picker=bool(model_names))
+
+        self.run_worker(
+            fetch_models(),
+            name="settings-fetch-models",
+            group="settings-model-discovery",
+            exclusive=True,
+        )
 
     def _add_model_rows(self) -> list[dict]:
         draft = dict(self._add_model_draft or {})
@@ -2840,7 +3182,8 @@ class SettingsModal(ModalScreen[None]):
             current_effort = "medium"
         rows = [
             {
-                "name": "Provider",
+                "name": t("app.row.provider"),
+                "field_key": "provider",
                 "value": str(draft.get("provider") or ""),
                 "keywords": "provider",
                 "edit_type": "autocomplete",
@@ -2848,14 +3191,16 @@ class SettingsModal(ModalScreen[None]):
                 "on_change": lambda v: self._set_add_model_field("provider", str(v)),
             },
             {
-                "name": "Name",
+                "name": t("app.row.name"),
+                "field_key": "name",
                 "value": str(draft.get("name") or ""),
                 "keywords": "name",
                 "edit_type": "input",
                 "on_change": lambda v: self._set_add_model_field("name", str(v)),
             },
             {
-                "name": "API type",
+                "name": t("app.model.api_type"),
+                "field_key": "api_type",
                 "value": str(draft.get("api_type") or API_TYPE_OLLAMA),
                 "keywords": "api_type",
                 "edit_type": "select",
@@ -2863,42 +3208,52 @@ class SettingsModal(ModalScreen[None]):
                 "on_change": lambda v: self._set_add_model_field("api_type", str(v)),
             },
             {
-                "name": "Base URL",
+                "name": t("app.model.base_url"),
+                "field_key": "base_url",
                 "value": str(draft.get("base_url") or ""),
                 "keywords": "base_url",
                 "edit_type": "input",
                 "on_change": lambda v: self._set_add_model_field("base_url", str(v)),
             },
             {
-                "name": "Model",
+                "name": t("app.model.model"),
                 "value": str(draft.get("model") or ""),
                 "keywords": "model",
-                "edit_type": "input",
+                "field_key": "model",
+                "edit_type": "autocomplete",
+                "suggestions": list(self._available_model_names),
+                "accessory_label": t("settings.fetch_models"),
+                "accessory_beside_name": True,
+                "accessory_action": self._fetch_add_model_models,
                 "on_change": lambda v: self._set_add_model_field("model", str(v)),
             },
             {
-                "name": "API key",
+                "name": t("app.row.api_key"),
+                "field_key": "api_key",
                 "value": str(draft.get("api_key") or ""),
                 "keywords": "api_key",
                 "edit_type": "input",
                 "on_change": lambda v: self._set_add_model_field("api_key", str(v)),
             },
             {
-                "name": "Max tokens",
+                "name": t("app.model.max_tokens"),
+                "field_key": "max_tokens",
                 "value": str(draft.get("max_tokens") or ""),
                 "keywords": "max_tokens",
                 "edit_type": "input",
                 "on_change": lambda v: self._set_add_model_field("max_tokens", str(v)),
             },
             {
-                "name": "Temperature",
+                "name": t("app.model.temperature"),
+                "field_key": "temperature",
                 "value": str(draft.get("temperature") or ""),
                 "keywords": "temperature",
                 "edit_type": "input",
                 "on_change": lambda v: self._set_add_model_field("temperature", str(v)),
             },
             {
-                "name": "Stream",
+                "name": t("app.model.stream"),
+                "field_key": "stream_mode",
                 "value": str(draft.get("stream_mode") or "false"),
                 "keywords": "stream_mode stream",
                 "edit_type": "toggle",
@@ -2906,7 +3261,8 @@ class SettingsModal(ModalScreen[None]):
                 "on_change": lambda v: self._set_add_model_field("stream_mode", str(v)),
             },
             {
-                "name": "Thinking",
+                "name": t("app.model.thinking"),
+                "field_key": "thinking_mode",
                 "value": str(draft.get("thinking_mode") or "false"),
                 "keywords": "thinking_mode thinking",
                 "edit_type": "toggle",
@@ -2916,7 +3272,8 @@ class SettingsModal(ModalScreen[None]):
                 ),
             },
             {
-                "name": "Extra modalities",
+                "name": t("app.model.extra_modalities"),
+                "field_key": "extra_modalities",
                 "value": str(draft.get("extra_modalities") or "none"),
                 "keywords": "extra_modalities modalities audio image video",
                 "edit_type": "modalities",
@@ -2931,13 +3288,15 @@ class SettingsModal(ModalScreen[None]):
             },
             {
                 "name": t("app.model.limit"),
+                "field_key": "limit",
                 "keywords": "extra_modalities multimodal_limit upload size total",
                 "edit_type": "input",
                 "unit": "MB",
                 "limit_selector": True,
             },
             {
-                "name": "Context",
+                "name": t("app.model.context"),
+                "field_key": "context_window_tokens",
                 "value": str(draft.get("context_window_tokens") or ""),
                 "keywords": "context_window_tokens context",
                 "edit_type": "input",
@@ -2947,7 +3306,7 @@ class SettingsModal(ModalScreen[None]):
             },
         ]
         if draft_api_type == API_TYPE_GLM:
-            rows = [row for row in rows if row.get("name") != "Base URL"]
+            rows = [row for row in rows if row.get("field_key") != "base_url"]
         selected_modalities = parse_extra_modalities_input(
             str(draft.get("extra_modalities") or "none"), required=True
         )
@@ -2964,7 +3323,7 @@ class SettingsModal(ModalScreen[None]):
                 selected_limit = limit_options[0][1]
                 self._add_model_draft["selected_limit"] = selected_limit
             limit_row = next(
-                row for row in rows if row.get("name") == t("app.model.limit")
+                row for row in rows if row.get("field_key") == "limit"
             )
             limit_row.update(
                 {
@@ -2987,17 +3346,18 @@ class SettingsModal(ModalScreen[None]):
                 }
             )
         else:
-            rows = [row for row in rows if row.get("name") != "Limit"]
+            rows = [row for row in rows if row.get("field_key") != "limit"]
 
         if thinking_enabled:
             rows.insert(
                 next(
                     index
                     for index, row in enumerate(rows)
-                    if row.get("name") == "Extra modalities"
+                    if row.get("field_key") == "extra_modalities"
                 ),
                 {
-                    "name": "Reasoning effort",
+                    "name": t("app.model.reasoning_effort"),
+                    "field_key": "reasoning_effort",
                     "value": current_effort,
                     "keywords": "reasoning_effort",
                     "edit_type": "select",
@@ -3011,7 +3371,7 @@ class SettingsModal(ModalScreen[None]):
         rows.append({"name": "", "value": "", "edit_type": "none"})
         rows.append({
             "name": "",
-            "value": "Add",
+            "value": t("settings.add_model_action"),
             "keywords": "add create",
             "edit_type": "action",
             "show_value": True,
@@ -3025,11 +3385,15 @@ class SettingsModal(ModalScreen[None]):
         draft = dict(self._add_model_draft or {})
         provider = str(draft.get("provider") or "").strip()
         if not provider:
-            self.app_ref.add_status_message("[!]", "Provider cannot be empty.")
+            self.app_ref.add_status_message(
+                "[!]", t("settings.add_model_provider_required")
+            )
             return ""
         name = str(draft.get("name") or "").strip()
         if not name:
-            self.app_ref.add_status_message("[!]", "Model name cannot be empty.")
+            self.app_ref.add_status_message(
+                "[!]", t("settings.add_model_name_required")
+            )
             return ""
         extra_modalities = str(draft.get("extra_modalities") or "").strip()
         try:

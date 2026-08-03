@@ -214,7 +214,7 @@ _add("app.value.total", "Total", "总计")
 # --- app.py: model page -----------------------------------------------------
 _add("app.model.api_type", "API type", "API 类型")
 _add("app.model.name", "Model name", "模型名称")
-_add("app.model.base_url", "Base URL", "Base URL")
+_add("app.model.base_url", "Base URL", "基础 URL")
 _add("app.model.model", "Model", "模型")
 _add("app.model.max_tokens", "Max tokens", "最大 Token 数")
 _add("app.model.temperature", "Temperature", "温度")
@@ -783,6 +783,40 @@ _add("picker.without_project", "Without project", "不使用项目")
 _add("picker.search_placeholder", "Search projects", "搜索项目")
 
 # --- settings: model creation errors ----------------------------------------
+_add("settings.add_model_action", "Add", "添加")
+_add("settings.fetch_models", "Fetch", "获取")
+_add("settings.no_model_settings", "No model settings", "暂无模型设置")
+_add("settings.no_items", "No items", "暂无条目")
+_add(
+    "settings.add_model_provider_required",
+    "Provider cannot be empty.",
+    "服务商不能为空。",
+)
+_add(
+    "settings.add_model_name_required",
+    "Model name cannot be empty.",
+    "模型名称不能为空。",
+)
+_add(
+    "settings.fetch_models_api_key_required",
+    "Enter an API key before fetching models.",
+    "请先输入 API 密钥，再获取模型列表。",
+)
+_add(
+    "settings.fetch_models_loaded",
+    "Loaded {count} available models.",
+    "已获取 {count} 个可用模型。",
+)
+_add(
+    "settings.fetch_models_empty",
+    "The API returned no available models. You can still enter one manually.",
+    "API 未返回可用模型，仍可手动输入。",
+)
+_add(
+    "settings.fetch_models_failed",
+    "Failed to fetch models: {error}",
+    "获取模型列表失败: {error}",
+)
 _add(
     "settings.add_model_failed",
     "Failed to add model: {error}",

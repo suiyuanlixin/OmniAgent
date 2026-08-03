@@ -151,6 +151,7 @@ python -m omniagent
 - Model list 左侧列表只用于选择要查看和编辑的模型档案，不会更改 `current_model`。
 - `api_type`：支持 `glm`、`anthropic`、`openai`、`gemini`、`ollama`。
 - `base_url`：兼容端点地址；GLM 不使用该字段，即使配置中存在也会静默清除，Settings 也不会显示该项。`gemini` 留空时自动使用官方 OpenAI 兼容地址；`ollama` 留空时走本地默认服务。
+- 添加模型和 Model list 详情中的 `Model` 字段均可根据 `api_type`、`base_url` 与 API Key 获取可用模型列表；下拉选项支持输入过滤，同时保留手动输入。获取结果仅在当前设置窗口内缓存，切换模型或修改连接配置时自动失效，不写入配置文件。
 - `thinking_mode` 与 `reasoning_effort`：控制推理内容显示与强度。
 - `extra_modalities`：以 `{"image": 10, "audio": 50, "video": 50}` 的形式同时声明已启用模态和单文件上限，单位为 MB；不需要的模态直接省略。
 - `multimodal_limit`：单次请求中所有媒体经 Base64 编码后的总量上限，单位为 MB；仅当 `extra_modalities` 非空时配置，无多模态模型必须省略该字段。
