@@ -975,6 +975,11 @@ def save_model_profile_field(name, key, value):
 
 def add_model_profile_with_config(name, model_config):
     config = _load_existing_config()
+    previous_current_model = (
+        config.current_model
+        if config.current_model in config.model_list
+        else ""
+    )
     model_name = str(name or "").strip()
     if not model_name:
         raise ValueError("Model profile name cannot be empty.")
@@ -987,7 +992,7 @@ def add_model_profile_with_config(name, model_config):
     config.model_list[key] = _sanitize_model_config(
         payload, provider=provider, profile_name=model_name
     )
-    config.current_model = key
+    config.current_model = previous_current_model or key
     _persist_config(_sanitize_config(config.to_dict()))
     return key
 

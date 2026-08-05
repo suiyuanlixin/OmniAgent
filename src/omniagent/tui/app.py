@@ -478,6 +478,7 @@ class AgentTUIApp(App):
         self._suppress_stream_output = False
         self._prompt_request: _InlinePromptRequest | None = None
         self._title_summary_sessions: set[str] = set()
+        self._input_suggestion_serial = 0
         self._archived_project_filter = "__all__"
         self._interrupt_send_payload: tuple[str, str] | None = None
         self._settings_model_limit_key = "total"
@@ -666,6 +667,7 @@ class AgentTUIApp(App):
         self, content: str, display_content: str | None = None
     ) -> None:
         display_content = content if display_content is None else display_content
+        self._invalidate_input_suggestion()
 
         is_command = str(content or "").startswith("/")
         if not is_command:
@@ -4280,6 +4282,7 @@ class AgentTUIApp(App):
         self._clear_loaded_session_state(refresh_sidebar=True)
 
     def _clear_loaded_session_state(self, refresh_sidebar: bool = True) -> None:
+        self._invalidate_input_suggestion()
         self._prompt_request = None
         if self.chat is not None:
             self.chat.shutdown()
@@ -4349,7 +4352,13 @@ class AgentTUIApp(App):
         if self.chat is None:
             self.chat = self._build_chat(self.current_session_record)
 
-    def _build_chat(self, session_record: dict) -> OmniAgent:
+    def _build_chat(
+        self,
+        session_record: dict,
+        *,
+        publish_context_usage: bool = True,
+        persist_usage_history: bool = True,
+    ) -> OmniAgent:
         project = self._project_from_session(session_record)
         workspace_dir = project.path if project is not None else None
         agent_mode = bool(project is not None)
@@ -4400,13 +4409,20 @@ class AgentTUIApp(App):
             current_model_name=self.config.active_model_label,
             history_path=session_record.get("history_path"),
             usage_history_callback=(
-                lambda source_chat, entry, session_path=session_record.get(
-                    "session_path"
-                ): self._on_chat_usage_entry(
-                    session_path,
-                    source_chat,
-                    entry,
+                (
+                    lambda source_chat, entry, session_path=session_record.get(
+                        "session_path"
+                    ): self._on_chat_usage_entry(
+                        session_path,
+                        source_chat,
+                        entry,
+                    )
                 )
+                if persist_usage_history
+                else None
+            ),
+            context_usage_callback=(
+                self.set_context_usage if publish_context_usage else None
             ),
             plan_mode_changed_callback=self._on_agent_plan_mode_changed,
         )
@@ -4440,7 +4456,7 @@ class AgentTUIApp(App):
             )
             if response and not response.get("agent_stopped"):
                 self.chat.update_session_episodic_memory()
-            self._call_ui(self._finish_response, response)
+            self._call_ui(self._finish_response, response, user_text)
         except Exception as error:
             self._call_ui(self._finish_with_error, error)
 
@@ -4517,7 +4533,7 @@ class AgentTUIApp(App):
         self._persist_current_session()
         self._maybe_dispatch_pending_message()
 
-    def _finish_response(self, response) -> None:
+    def _finish_response(self, response, user_text: str = "") -> None:
         self._pause_thinking_elapsed_timer()
         self._finish_thought_stream_widget(
             self._elapsed_since_thinking(),
@@ -4533,6 +4549,7 @@ class AgentTUIApp(App):
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
+        self._maybe_schedule_input_suggestion(user_text, response)
         self._maybe_dispatch_pending_message()
 
     def _maybe_show_changed_files(self) -> None:
@@ -4582,6 +4599,119 @@ class AgentTUIApp(App):
         reply = clean_display_text_preserve_newlines(response.get("response", ""))
         if reply:
             self.query_one("#messages-view", ChatView).add_message("assistant", reply)
+
+    def _invalidate_input_suggestion(self) -> None:
+        self._input_suggestion_serial += 1
+        try:
+            self.query_one("#chat-input", ChatInput).clear_suggested_input()
+        except NoMatches:
+            return
+
+    def _maybe_schedule_input_suggestion(self, user_text: str, response) -> None:
+        if (
+            not response
+            or response.get("agent_stopped")
+            or self.current_session_record is None
+            or self.chat_busy
+            or self._interrupt_send_payload is not None
+        ):
+            return
+        assistant_text = clean_display_text_preserve_newlines(
+            response.get("response", "")
+        )
+        if not assistant_text:
+            return
+
+        chat_input = self.query_one("#chat-input", ChatInput)
+        message_input = self.query_one("#message-input", TextArea)
+        if (
+            chat_input.prompt_active
+            or chat_input.has_pending_messages()
+            or str(message_input.text or "")
+        ):
+            return
+
+        record = dict(self.current_session_record)
+        session_path = str(record.get("session_path") or "").strip()
+        if not session_path:
+            return
+        try:
+            suggestion_chat = self._build_chat(
+                record,
+                publish_context_usage=False,
+                persist_usage_history=False,
+            )
+        except Exception:
+            return
+
+        self._input_suggestion_serial += 1
+        serial = self._input_suggestion_serial
+        input_revision = chat_input.input_revision()
+        worker = threading.Thread(
+            target=self._generate_input_suggestion,
+            args=(
+                suggestion_chat,
+                serial,
+                session_path,
+                input_revision,
+                str(user_text or ""),
+                assistant_text,
+            ),
+            daemon=True,
+        )
+        worker.start()
+
+    def _generate_input_suggestion(
+        self,
+        chat: OmniAgent,
+        serial: int,
+        session_path: str,
+        input_revision: int,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        suggestion = ""
+        try:
+            suggestion = chat.generate_user_input_suggestion(
+                user_text,
+                assistant_text,
+            )
+        except Exception:
+            suggestion = ""
+        finally:
+            chat.shutdown(timeout=0)
+        self._call_ui(
+            self._apply_generated_input_suggestion,
+            serial,
+            session_path,
+            input_revision,
+            suggestion,
+        )
+
+    def _apply_generated_input_suggestion(
+        self,
+        serial: int,
+        session_path: str,
+        input_revision: int,
+        suggestion: str,
+    ) -> None:
+        current_session_path = str(
+            (self.current_session_record or {}).get("session_path") or ""
+        ).strip()
+        if (
+            serial != self._input_suggestion_serial
+            or session_path != current_session_path
+            or self.chat_busy
+            or self._interrupt_send_payload is not None
+        ):
+            return
+        chat_input = self.query_one("#chat-input", ChatInput)
+        if chat_input.has_pending_messages():
+            return
+        chat_input.set_suggested_input(
+            suggestion,
+            expected_revision=input_revision,
+        )
 
     def _elapsed_since_thinking(self) -> float:
         if self._thinking_started_at is not None:
@@ -4717,7 +4847,7 @@ class AgentTUIApp(App):
             return
         if session_path in self._title_summary_sessions:
             return
-        chat = self._build_chat(record)
+        chat = self._build_chat(record, publish_context_usage=False)
         self._title_summary_sessions.add(session_path)
         worker = threading.Thread(
             target=self._generate_session_title_summary,
@@ -4742,6 +4872,7 @@ class AgentTUIApp(App):
                 expected_title,
             )
         finally:
+            chat.shutdown(timeout=0)
             self._call_ui(self._clear_pending_title_summary, session_path)
 
     def _clear_pending_title_summary(self, session_path: str) -> None:
@@ -5210,6 +5341,7 @@ class AgentTUIApp(App):
         return text
 
     def _load_session_record(self, record: dict) -> None:
+        self._invalidate_input_suggestion()
         self.current_session_record = record
         project = self._project_from_session(record)
         self._set_current_project(project.name if project is not None else "")

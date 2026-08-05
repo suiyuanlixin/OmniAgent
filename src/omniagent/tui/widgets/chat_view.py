@@ -2617,6 +2617,7 @@ class _LeadingBlankTrimmedMarkdown:
         while lines and self._is_unstyled_blank_line(lines[0]):
             lines.pop(0)
         self._halve_code_block_padding(lines)
+        self._add_code_block_spacing(lines)
         for line in lines:
             for segment in line:
                 yield self._with_foreground_color(segment)
@@ -2661,61 +2662,173 @@ class _LeadingBlankTrimmedMarkdown:
 
     @classmethod
     def _halve_code_block_padding(cls, lines) -> None:
-        line_backgrounds = [cls._uniform_line_background(line) for line in lines]
+        line_backgrounds = [cls._line_background_span(line) for line in lines]
         start = 0
         while start < len(lines):
-            background = line_backgrounds[start]
-            if background is None:
+            background_span = line_backgrounds[start]
+            if background_span is None:
                 start += 1
                 continue
             end = start + 1
-            while end < len(lines) and line_backgrounds[end] == background:
+            while end < len(lines) and line_backgrounds[end] == background_span:
                 end += 1
             visible = [
                 index
                 for index in range(start, end)
-                if cls._line_has_visible_text(lines[index])
+                if cls._line_background_has_visible_text(
+                    lines[index], background_span[0]
+                )
             ]
             if visible:
                 if start < visible[0]:
                     lines[start] = cls._code_padding_half_line(
-                        lines[start], background, top=True
+                        background_span, top=True
                     )
                 if visible[-1] < end - 1:
                     lines[end - 1] = cls._code_padding_half_line(
-                        lines[end - 1], background, top=False
+                        background_span, top=False
                     )
+            elif end - start >= 2:
+                lines[start] = cls._code_padding_half_line(
+                    background_span, top=True
+                )
+                lines[end - 1] = cls._code_padding_half_line(
+                    background_span, top=False
+                )
             start = end
 
     @staticmethod
-    def _uniform_line_background(line):
+    def _line_background_span(line):
         background = None
-        found = False
+        prefix_segments = []
+        background_width = 0
+        suffix_segments = []
+        background_finished = False
         for segment in line:
             if not segment.text:
                 continue
+            segment_width = cell_len(segment.text)
             style = segment.style
             segment_background = (
                 getattr(style, "bgcolor", None) if style is not None else None
             )
             if segment_background is None:
+                if background is None:
+                    prefix_segments.append(segment)
+                else:
+                    background_finished = True
+                    suffix_segments.append(segment)
+                continue
+            if background_finished:
                 return None
-            if not found:
+            if background is None:
                 background = segment_background
-                found = True
             elif segment_background != background:
                 return None
-        return background if found else None
+            background_width += segment_width
+        if background is None or background_width <= 0:
+            return None
+        return (
+            background,
+            tuple(prefix_segments),
+            background_width,
+            tuple(suffix_segments),
+        )
 
     @staticmethod
-    def _line_has_visible_text(line) -> bool:
-        return any(segment.text.strip() for segment in line)
+    def _line_background_has_visible_text(line, background) -> bool:
+        for segment in line:
+            style = segment.style
+            segment_background = (
+                getattr(style, "bgcolor", None) if style is not None else None
+            )
+            if segment_background == background and segment.text.strip():
+                return True
+        return False
+
+    @classmethod
+    def _add_code_block_spacing(cls, lines) -> None:
+        index = 0
+        while index < len(lines):
+            edge, prefix, background_width, suffix = cls._code_padding_edge(
+                lines[index]
+            )
+            if not edge:
+                index += 1
+                continue
+            if (
+                edge == "top"
+                and index > 0
+                and not cls._is_code_spacing_line(
+                    lines[index - 1], prefix, suffix
+                )
+            ):
+                lines.insert(
+                    index,
+                    cls._code_spacing_line(prefix, background_width, suffix),
+                )
+                index += 1
+            elif (
+                edge == "bottom"
+                and index + 1 < len(lines)
+                and not cls._is_code_spacing_line(
+                    lines[index + 1], prefix, suffix
+                )
+            ):
+                lines.insert(
+                    index + 1,
+                    cls._code_spacing_line(prefix, background_width, suffix),
+                )
+                index += 1
+            index += 1
 
     @staticmethod
-    def _code_padding_half_line(line, background, *, top: bool):
-        width = sum(cell_len(segment.text) for segment in line)
-        if width <= 0:
-            return line
+    def _code_padding_edge(line):
+        prefix = []
+        suffix = []
+        edge = ""
+        background_width = 0
+        for segment in line:
+            style = segment.style
+            meta = getattr(style, "meta", None) if style is not None else None
+            if meta and meta.get("omniagent_code_padding_half"):
+                edge = str(meta.get("omniagent_code_padding_edge") or "")
+                background_width = cell_len(segment.text)
+                continue
+            if edge:
+                suffix.append(segment)
+            else:
+                prefix.append(segment)
+        if not edge:
+            return "", (), 0, ()
+        return edge, tuple(prefix), background_width, tuple(suffix)
+
+    @classmethod
+    def _is_code_spacing_line(cls, line, prefix, suffix) -> bool:
+        if cls._is_unstyled_blank_line(line):
+            return True
+        line_text = "".join(segment.text for segment in line)
+        prefix_text = "".join(segment.text for segment in prefix)
+        suffix_text = "".join(segment.text for segment in suffix)
+        if prefix_text and not line_text.startswith(prefix_text):
+            return False
+        if suffix_text and not line_text.endswith(suffix_text):
+            return False
+        start = len(prefix_text)
+        end = len(line_text) - len(suffix_text) if suffix_text else len(line_text)
+        return not line_text[start:end].strip()
+
+    @staticmethod
+    def _code_spacing_line(prefix, background_width, suffix):
+        return [
+            *prefix,
+            Segment(" " * background_width),
+            *suffix,
+        ]
+
+    @staticmethod
+    def _code_padding_half_line(background_span, *, top: bool):
+        background, prefix, background_width, suffix = background_span
         glyph = "\u2584" if top else "\u2580"
         style = Style(
             color=background,
@@ -2723,9 +2836,13 @@ class _LeadingBlankTrimmedMarkdown:
             meta={
                 "omniagent_code_padding_half": True,
                 "omniagent_code_padding_edge": "top" if top else "bottom",
+                "omniagent_code_padding_nested": bool(prefix or suffix),
             },
         )
-        return [Segment(glyph * width, style)]
+        line = list(prefix)
+        line.append(Segment(glyph * background_width, style))
+        line.extend(suffix)
+        return line
 
 
 class MarkdownMessageStatic(Static, can_focus=True):

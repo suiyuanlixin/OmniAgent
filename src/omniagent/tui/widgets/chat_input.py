@@ -1189,6 +1189,8 @@ class ChatInput(Widget):
         self._next_pending_message_id = 1
         self._editing_pending_message_id: int | None = None
         self._chat_busy = False
+        self._suggested_input = ""
+        self._input_revision = 0
 
     class Send(Message):
         def __init__(self, content: str, display_content: str | None = None) -> None:
@@ -1502,6 +1504,8 @@ class ChatInput(Widget):
             return
         if text_area_id != "message-input":
             return
+        self._input_revision += 1
+        self._clear_suggested_input_state()
         if self.prompt_active:
             if (
                 self._prompt_allow_custom
@@ -1856,6 +1860,12 @@ class ChatInput(Widget):
     ) -> bool:
         key = str(event.key or "")
         aliases = {str(alias) for alias in getattr(event, "aliases", []) or []}
+        if key == "tab" or "tab" in aliases:
+            if self._accept_suggested_input(text_area):
+                event.stop()
+                event.prevent_default()
+                return True
+            return False
         parts = key.split("+")
         normalized_enter = key in {"enter", "ctrl+j", "ctrl+m"} or "newline" in aliases
         if not normalized_enter and parts[-1] != "enter":
@@ -2313,12 +2323,89 @@ class ChatInput(Widget):
     def input_placeholder(self, text_area: MessageTextArea | None = None) -> str:
         if self.prompt_active and self._prompt_allow_custom:
             return self._prompt_custom_placeholder
+        if self._suggested_input:
+            return self._suggested_input
         return t("input.placeholder")
+
+    def input_revision(self) -> int:
+        return self._input_revision
+
+    def suggested_input(self) -> str:
+        return self._suggested_input
+
+    def set_suggested_input(
+        self,
+        suggestion: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
+        if threading.current_thread() is not threading.main_thread():
+            if not self.is_mounted:
+                return False
+            try:
+                self.app.call_from_thread(
+                    partial(
+                        self.set_suggested_input,
+                        suggestion,
+                        expected_revision=expected_revision,
+                    )
+                )
+            except Exception:
+                return False
+            return False
+        normalized = " ".join(
+            line.strip()
+            for line in str(suggestion or "").splitlines()
+            if line.strip()
+        )
+        if not normalized or self.prompt_active:
+            return False
+        if (
+            expected_revision is not None
+            and self._input_revision != expected_revision
+        ):
+            return False
+        text_area = self._message_input()
+        if str(text_area.text or "") or text_area.pending_message_id is not None:
+            return False
+        self._suggested_input = normalized
+        text_area.refresh()
+        return True
+
+    def clear_suggested_input(self) -> None:
+        if not self._ensure_ui_thread(self.clear_suggested_input):
+            return
+        self._clear_suggested_input_state()
+
+    def _clear_suggested_input_state(self) -> None:
+        if not self._suggested_input:
+            return
+        self._suggested_input = ""
+        if self.is_mounted:
+            self._message_input().refresh()
+
+    def _accept_suggested_input(self, text_area: MessageTextArea) -> bool:
+        if (
+            self.prompt_active
+            or text_area is not self._message_input()
+            or str(text_area.text or "")
+            or not self._suggested_input
+        ):
+            return False
+        suggestion = self._suggested_input
+        self._suggested_input = ""
+        text_area.load_text(suggestion)
+        lines = suggestion.split("\n")
+        text_area.move_cursor((len(lines) - 1, len(lines[-1])))
+        self.call_after_refresh(self._update_input_height)
+        return True
 
     def set_chat_busy(self, busy: bool) -> None:
         if not self._ensure_ui_thread(self.set_chat_busy, busy):
             return
         self._chat_busy = bool(busy)
+        if self._chat_busy:
+            self._clear_suggested_input_state()
         self._update_pending_shell()
 
     def has_pending_messages(self) -> bool:

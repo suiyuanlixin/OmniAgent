@@ -3450,7 +3450,6 @@ class SettingsModal(ModalScreen[None]):
             )
             return ""
         self.app_ref._reload_config()
-        self.app_ref._sync_chat_from_active_model()
         self.app_ref._apply_config_to_controls()
         self._selected_model_name = str(created)
         return "model_list"

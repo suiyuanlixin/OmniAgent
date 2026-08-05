@@ -234,9 +234,9 @@ _add("app.model.reasoning_effort", "Reasoning effort", "推理强度")
 _add(
     "app.info.context",
     "Context: {value} ({percent}%)",
-    "上下文：{value}（{percent}%）",
+    "上下文：{value} ({percent}%)",
 )
-_add("app.info.context_initial", "Context: 0.0k (0%)", "上下文：0.0k（0%）")
+_add("app.info.context_initial", "Context: 0.0k (0%)", "上下文：0.0k (0%)")
 _add("app.info.interrupt_key", "esc", "esc")
 _add("app.info.interrupt_text", "interrupt", "中断")
 _add("app.info.sessions", "Sessions", "会话")
