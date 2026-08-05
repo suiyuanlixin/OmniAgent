@@ -392,6 +392,14 @@ def _session_paths(session_id, project=None):
     }
 
 
+def session_todo_dir(session_path):
+    value = str(session_path or "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    return path.parent / f"{path.stem}.todos"
+
+
 def _session_title_from_history(conversation_history):
     for message in conversation_history or []:
         if str(message.get("role") or "") != "user":
@@ -590,6 +598,7 @@ def delete_session(session_path):
     path = Path(str(session_path))
     normalized = normalize_session_path(path)
     history_path = path.with_suffix(".history.jsonl")
+    todo_dir = session_todo_dir(path)
     if path.exists():
         try:
             path.unlink()
@@ -600,6 +609,18 @@ def delete_session(session_path):
             history_path.unlink()
         except OSError as error:
             raise ValueError(f"Failed to delete session history: {error}") from error
+    if todo_dir is not None and todo_dir.exists():
+        expected_parent = path.parent.resolve(strict=False)
+        resolved_todo_dir = todo_dir.resolve(strict=False)
+        if (
+            resolved_todo_dir.parent != expected_parent
+            or resolved_todo_dir.name != f"{path.stem}.todos"
+        ):
+            raise ValueError("Session todo path is invalid.")
+        try:
+            shutil.rmtree(resolved_todo_dir)
+        except OSError as error:
+            raise ValueError(f"Failed to delete session todos: {error}") from error
     if normalized:
         unpin_session(normalized)
     return True

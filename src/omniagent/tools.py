@@ -992,8 +992,12 @@ class AgentTools:
         skills_auto_catalog=True,
         stop_requested_callback=None,
         plan_mode=False,
+        todo_dir=None,
     ):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
+        if not todo_dir:
+            raise ValueError("AgentTools requires a session-scoped todo_dir.")
+        self.todo_dir = Path(todo_dir)
         self.visible_output_callback = visible_output_callback
         self.todos_enabled = bool(todos_enabled)
         self.plan_mode = bool(plan_mode)
@@ -1004,7 +1008,7 @@ class AgentTools:
         ensure_cleanup_thread()
         self.todo_store = TodoStore(
             on_change=todo_update_callback if self.todos_enabled else None,
-            todo_dir=_todo_dir_for_workspace(self.workspace_dir),
+            todo_dir=self.todo_dir,
         )
         self.todo_update_callback = todo_update_callback
         self.max_tool_calls = None
@@ -1052,10 +1056,6 @@ class AgentTools:
 
     def set_workspace_dir(self, workspace_dir):
         self.workspace_dir = normalize_workspace_dir(workspace_dir)
-        self.todo_store.set_todo_dir(
-            _todo_dir_for_workspace(self.workspace_dir),
-            load=True,
-        )
         self.skill_registry.configure(workspace_dir=self.workspace_dir)
         self.subagent_registry.configure(workspace_dir=self.workspace_dir)
 
@@ -4245,12 +4245,6 @@ def _program_doc_paths():
         if path.is_file():
             paths.append(path)
     return paths
-
-
-def _todo_dir_for_workspace(workspace_dir):
-    if workspace_dir is None:
-        return None
-    return Path(workspace_dir) / ".omniagent" / "todos"
 
 
 def _final_check_passed(check_result):

@@ -24,10 +24,10 @@ from ...config import (
     parse_extra_modalities_input,
     parse_multimodal_limit,
     normalize_reasoning_effort_for_api,
-    supported_reasoning_efforts,
 )
 from ...i18n import display_width, t
 from ...model_discovery import fetch_available_models
+from ..data import reasoning_levels_for_api
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
 
@@ -3168,9 +3168,7 @@ class SettingsModal(ModalScreen[None]):
             ("GLM", API_TYPE_GLM),
         ]
         draft_api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
-        reasoning_choices = [
-            (value, value) for value in supported_reasoning_efforts(draft_api_type)
-        ]
+        reasoning_choices = reasoning_levels_for_api(draft_api_type)
         thinking_enabled = self._is_toggle_enabled(
             str(draft.get("thinking_mode") or "false")
         )

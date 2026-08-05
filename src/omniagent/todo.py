@@ -134,20 +134,11 @@ class TodoStore:
         self.events_path = None
         self.todo_signature = ""
         self._loading = False
-        self.set_todo_dir(todo_dir, load=True)
-
-    def set_todo_dir(self, todo_dir, load=False):
         if todo_dir:
             self.todo_dir = Path(todo_dir)
             self.current_todo_path = self.todo_dir / CURRENT_TODO_FILE
             self.events_path = self.todo_dir / TODO_EVENTS_FILE
-        else:
-            self.todo_dir = None
-            self.current_todo_path = None
-            self.events_path = None
-
-        if load:
-            self._load_snapshot()
+        self._load_snapshot()
 
     def set_on_change(self, callback):
         self.on_change = callback
@@ -725,9 +716,7 @@ class TodoStore:
             self.items = items
             self.revision = int(data.get("revision") or 0)
             self.todo_signature = str(
-                data.get("todo_signature")
-                or data.get("plan_signature")
-                or _todo_signature(items)
+                data.get("todo_signature") or _todo_signature(items)
             )
         except Exception:
             self.items = []

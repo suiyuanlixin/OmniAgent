@@ -265,7 +265,7 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 
 - Plan mode：只读规划模式，适合先澄清需求、拆任务、看设计、提问题。主 Agent 完成最终方案后会调用专属 `submit_plan` 工具，以用户消息气泡样式显示 `Plan` 与计划正文并请求允许；用户允许后会在同一轮自动切换到 Build mode 执行，执行结束后不会自动回到 Plan mode，拒绝则保持 Plan mode 且不执行。
 - Build mode：实际执行模式，允许在工作区内读写文件和运行命令。
-- Todo 跟踪：使用 `update_todo` 维护当前执行计划，并同步显示到对话流与 Todo 面板。
+- Todo 跟踪：使用 `update_todo` 维护当前执行计划，并同步显示到对话流与 Todo 面板。Todo 按会话独立持久化；异常中断或退出后重新进入同一对话时，会恢复未完成项并在下一轮继续。
 - 审批保护：写文件、补丁、命令执行会根据审批模式要求确认。
 - 最终校验：任务结束前保留验证步骤，降低漏改和回归风险。
 
@@ -453,13 +453,12 @@ sessions/
 └── orphan/
 ```
 
-每个会话会保存 JSON 快照，并在旁边保留 `.history.jsonl` 历史。
+每个会话会保存 JSON 快照，并在旁边保留 `.history.jsonl` 历史。对应的 `<session-id>.todos/` 目录保存 Todo 快照 `current.json` 与变更记录 `events.jsonl`。
 
 ### 工作区状态
 
 工作区相关运行数据保存在 `<workspace>/.omniagent/`，例如：
 
-- `todos/`
 - `skills/`
 - `subagents/`
 - `team/`

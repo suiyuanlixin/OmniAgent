@@ -246,6 +246,10 @@ def print_success(content):
 
 
 def print_error(content):
+    bridge = get_bridge()
+    if bridge is not None and hasattr(bridge, "add_error_message"):
+        bridge.add_error_message(content)
+        return
     print_message("[✗]", content)
 
 

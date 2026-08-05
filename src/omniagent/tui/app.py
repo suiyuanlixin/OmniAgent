@@ -40,7 +40,6 @@ from ..config import (
     save_config_field,
     save_config_fields,
     save_model_profile_field,
-    supported_reasoning_efforts,
 )
 from ..i18n import (
     display_width,
@@ -75,12 +74,13 @@ from ..session import (
     rename_project,
     rename_session,
     save_session_record,
+    session_todo_dir,
     unarchive_session,
     unpin_project,
     unpin_session,
 )
 from ..skills import APP_SKILLS_DIR, SkillRegistry
-from .data import PROJECT_LOGO
+from .data import PROJECT_LOGO, reasoning_label, reasoning_levels_for_api
 from .runtime import clear_bridge, render_console_text, set_bridge
 from .theme import render_css
 from .widgets.chat_input import ChatInput, HalfRowSpacer
@@ -162,12 +162,6 @@ Toast.-error .toast--title {
     color: $foreground;
 }
 """
-
-# Reasoning-effort values that have a translated label. "none" maps to "off".
-REASONING_LABEL_KEYS = frozenset(
-    {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
-)
-
 
 @dataclass
 class _InlinePromptOption:
@@ -678,8 +672,8 @@ class AgentTUIApp(App):
             try:
                 self._ensure_ready_for_message()
             except Exception as error:
-                self.add_status_message(
-                    "[✗]", t("app.toast.chat_init_failed", error=error)
+                self.add_error_message(
+                    t("app.toast.chat_init_failed", error=error)
                 )
                 return
 
@@ -1032,6 +1026,12 @@ class AgentTUIApp(App):
         if not text:
             return
         self._call_ui(self._show_notification, text)
+
+    def add_error_message(self, content) -> None:
+        text = str(content or "").strip()
+        if not text:
+            return
+        self._call_ui(self._append_status_text, text)
 
     def _show_notification(self, text: str) -> None:
         self.notify(escape_markup(text), severity="information")
@@ -1866,18 +1866,8 @@ class AgentTUIApp(App):
 
     @staticmethod
     def _reasoning_label(value: str, title_case: bool = False) -> str:
-        """Display label for a reasoning-effort value.
-
-        ``title_case`` only affects English: the chat-input selector wants
-        "Medium" while the settings row wants "medium". CJK labels have no
-        case, so the flag is a no-op there and callers keep working unchanged.
-        """
-        text = str(value or "").strip().lower()
-        key = "off" if text == "none" else text
-        label = t(f"app.reasoning.{key}") if key in REASONING_LABEL_KEYS else text
-        if title_case or not label.isascii():
-            return label
-        return label.lower()
+        """Display label for a reasoning-effort value."""
+        return reasoning_label(value, title_case=title_case)
 
     def _reasoning_choices_for_api(
         self,
@@ -1886,15 +1876,11 @@ class AgentTUIApp(App):
         include_off: bool = False,
         title_case: bool = False,
     ) -> list[tuple[str, str]]:
-        choices = [
-            (self._reasoning_label(value, title_case=title_case), value)
-            for value in supported_reasoning_efforts(api_type)
-        ]
-        if include_off:
-            return [
-                (self._reasoning_label("none", title_case=title_case), "none")
-            ] + choices
-        return choices
+        return reasoning_levels_for_api(
+            api_type,
+            include_off=include_off,
+            title_case=title_case,
+        )
 
     def _thinking_value_from_config(self) -> str:
         active_model = self.config.active_model
@@ -4382,6 +4368,7 @@ class AgentTUIApp(App):
             extra_modalities=model.extra_modalities,
             agent_mode=agent_mode,
             workspace_dir=workspace_dir,
+            todo_dir=session_todo_dir(session_record.get("session_path")),
             max_agent_rounds=self.config.max_agent_rounds,
             max_agent_tool_calls=self.config.max_agent_tool_calls,
             agent_approval_mode=self.config.agent_approval_mode,
@@ -4570,7 +4557,7 @@ class AgentTUIApp(App):
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
-        self.add_status_message("[✗]", t("app.toast.message_failed", error=error))
+        self.add_error_message(t("app.toast.message_failed", error=error))
         self._persist_current_session()
         self._message_started_at = None
         self._thinking_started_at = None
@@ -4578,7 +4565,6 @@ class AgentTUIApp(App):
 
     def _display_response(self, response) -> None:
         if not response:
-            self.add_status_message("[✗]", t("app.toast.request_failed"))
             return
         if response.get("agent_stopped"):
             return
@@ -5231,7 +5217,13 @@ class AgentTUIApp(App):
             save_config_field("current_model", record.get("model_name"))
             self._reload_config()
         self.chat = self._build_chat(record)
-        self.chat.set_history(record.get("conversation") or [])
+        self.chat.set_history(
+            record.get("conversation") or [],
+            preserve_todos=True,
+        )
+        todo_status = self.chat.get_todo_status()
+        self.todo_items = list(todo_status.get("active_items") or [])
+        self._set_todo_panel_items(self.todo_items)
         self._sync_chat_view_with_history()
         self._apply_config_to_controls()
         self._refresh_project_views()

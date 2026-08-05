@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..config import supported_reasoning_efforts
 from ..i18n import t
 from .theme import TEXT_MUTED, TEXT_PRIMARY
 
@@ -23,6 +24,38 @@ def approval_levels() -> list[tuple[str, str]]:
 
 def thinking_levels() -> list[tuple[str, str]]:
     return [(t(f"input.thinking.{value}"), value) for value in THINKING_LEVEL_VALUES]
+
+
+REASONING_LABEL_VALUES = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+
+def reasoning_label(value: str, *, title_case: bool = False) -> str:
+    text = str(value or "").strip().lower()
+    key = "off" if text == "none" else text
+    label = t(f"app.reasoning.{key}") if key in REASONING_LABEL_VALUES else text
+    if title_case or not label.isascii():
+        return label
+    return label.lower()
+
+
+def reasoning_levels_for_api(
+    api_type: str,
+    *,
+    include_off: bool = False,
+    title_case: bool = False,
+) -> list[tuple[str, str]]:
+    choices = [
+        (reasoning_label(value, title_case=title_case), value)
+        for value in supported_reasoning_efforts(api_type)
+    ]
+    if include_off:
+        return [
+            (reasoning_label("none", title_case=title_case), "none"),
+            *choices,
+        ]
+    return choices
 
 
 PROJECT_NAME = "OmniAgent"

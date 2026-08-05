@@ -303,6 +303,7 @@ class OmniAgent:
         history_path=None,
         usage_history_callback=None,
         plan_mode_changed_callback=None,
+        todo_dir=None,
     ):
         _ensure_user_prompt_file()
         self.memory_store = MemoryStore(history_path=history_path)
@@ -343,6 +344,7 @@ class OmniAgent:
         self.set_memory_model(memory_model)
         self.agent_tools = AgentTools(
             workspace_dir,
+            todo_dir=todo_dir,
             approval_mode=agent_approval_mode,
             visible_output_callback=self._before_agent_visible_output,
             web_search_enabled=web_search_enabled,
@@ -969,7 +971,10 @@ class OmniAgent:
         self.agent_response_streamed = False
         self.agent_response_started = False
         self.agent_output_needs_separator = False
-        self.agent_tools.begin_agent_session(clear_todos=not self.resume_existing_plan)
+        resume_existing_plan = (
+            self.resume_existing_plan or self.agent_tools.has_incomplete_todos()
+        )
+        self.agent_tools.begin_agent_session(clear_todos=not resume_existing_plan)
         self.resume_existing_plan = False
         self.agent_tools.set_budget_context(
             self.agent_tool_call_limit,
@@ -5901,6 +5906,15 @@ class OmniAgent:
     def _agent_system_prompt(self):
         prompt = AGENT_SYSTEM_PROMPT
         prompt += "\n\n" + AGENT_TODO_RULES
+        if self.agent_tools.has_incomplete_todos():
+            prompt += (
+                "\n\nRestored todo list for this conversation:\n"
+                f"{self.agent_tools.todo_summary(include_completed=True)}\n"
+                "Continue from this stored list. Preserve existing todo ids and statuses, "
+                "work from the in-progress or next ready item, and call update_todo with "
+                "the full list whenever an item changes. Do not discard unfinished items "
+                "unless the user explicitly replaces or cancels the task."
+            )
         if self.agent_tools.plan_mode:
             prompt += (
                 "\n\nYou are in Plan mode. This is a planning and clarification workflow "
@@ -6621,11 +6635,14 @@ class OmniAgent:
             effective["content"] = blocks
         return effective
 
-    def set_history(self, history):
+    def set_history(self, history, *, preserve_todos=False):
         self.conversation_history = self._normalized_history_messages(history)
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
-        self.clear_todos()
+        if preserve_todos:
+            self.resume_existing_plan = self.agent_tools.has_incomplete_todos()
+        else:
+            self.clear_todos()
         self._clear_context_usage()
         estimated_tokens = self._estimate_current_context_tokens()
         if estimated_tokens > 0:
