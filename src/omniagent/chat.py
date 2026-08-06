@@ -68,7 +68,6 @@ from .tools import (
     SUBMIT_PLAN_TOOL_NAME,
     TOOL_DEFINITIONS,
     WEB_FETCH_TOOL_DEFINITION,
-    WEB_SEARCH_TOOL_DEFINITION,
     anthropic_tool_schemas,
     glm_tool_schemas,
     ollama_tool_schemas,
@@ -309,10 +308,9 @@ class OmniAgent:
         memory_model=AUTO_MODEL_SELECTION,
         web_search_enabled=True,
         web_search_provider="tavily",
-        web_search_api_key="",
+        web_search_api_key=None,
         web_search_max_results=5,
-        web_search_depth="basic",
-        web_search_topic="general",
+        web_search_providers=None,
         agent_plan_enabled=True,
         agent_team_enable=False,
         current_model_name="",
@@ -369,8 +367,7 @@ class OmniAgent:
             web_search_provider=web_search_provider,
             web_search_api_key=web_search_api_key,
             web_search_max_results=web_search_max_results,
-            web_search_depth=web_search_depth,
-            web_search_topic=web_search_topic,
+            web_search_providers=web_search_providers,
             todo_update_callback=set_todo_panel,
             todos_enabled=True,
             skills_enabled=skills_enabled,
@@ -642,16 +639,14 @@ class OmniAgent:
         provider=None,
         api_key=None,
         max_results=None,
-        search_depth=None,
-        topic=None,
+        providers=None,
     ):
         self.agent_tools.set_web_search_config(
-            enabled,
-            provider,
-            api_key,
-            max_results,
-            search_depth,
-            topic,
+            enabled=enabled,
+            provider=provider,
+            api_key=api_key,
+            max_results=max_results,
+            providers=providers,
         )
 
     def get_web_search_status(self):
@@ -2530,6 +2525,11 @@ class OmniAgent:
                     + self.agent_tools.subagent_tool_definitions()
                     + self.agent_tools.team_tool_definitions(),
                     plan_mode=self.agent_tools.plan_mode,
+                    web_search_definition=(
+                        self.agent_tools.web_search_tool_definition()
+                        if self.agent_tools.web_search_available
+                        else None
+                    ),
                 ),
                 stream=True,
             )
@@ -2691,6 +2691,11 @@ class OmniAgent:
                 + self.agent_tools.subagent_tool_definitions()
                 + self.agent_tools.team_tool_definitions(),
                 plan_mode=self.agent_tools.plan_mode,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if self.agent_tools.web_search_available
+                    else None
+                ),
             ),
             stream=True,
             **self._anthropic_request_options(),
@@ -6390,6 +6395,11 @@ class OmniAgent:
                 include_plan,
                 extra_definitions=extra_definitions,
                 plan_mode=plan_mode,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if include_web_search
+                    else None
+                ),
             )
         return glm_tool_schemas(
             include_web_search,
@@ -6397,6 +6407,11 @@ class OmniAgent:
             include_plan,
             extra_definitions=extra_definitions,
             plan_mode=plan_mode,
+            web_search_definition=(
+                self.agent_tools.web_search_tool_definition()
+                if include_web_search
+                else None
+            ),
         )
 
     def _subagent_tool_schemas(self, spec):
@@ -6415,6 +6430,11 @@ class OmniAgent:
                 False,
                 only_tools=effective_spec.tool_names,
                 exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if include_web_search
+                    else None
+                ),
             )
         if self.api_type == API_TYPE_OLLAMA:
             return ollama_tool_schemas(
@@ -6423,6 +6443,11 @@ class OmniAgent:
                 False,
                 only_tools=effective_spec.tool_names,
                 exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if include_web_search
+                    else None
+                ),
             )
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
             return openai_tool_schemas(
@@ -6431,6 +6456,11 @@ class OmniAgent:
                 False,
                 only_tools=effective_spec.tool_names,
                 exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if include_web_search
+                    else None
+                ),
             )
         return glm_tool_schemas(
             include_web_search,
@@ -6438,6 +6468,11 @@ class OmniAgent:
             False,
             only_tools=effective_spec.tool_names,
             exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
+            web_search_definition=(
+                self.agent_tools.web_search_tool_definition()
+                if include_web_search
+                else None
+            ),
         )
 
     def _effective_subagent_spec(self, spec: SubagentSpec) -> SubagentSpec:
@@ -6473,6 +6508,11 @@ class OmniAgent:
                 extra_definitions=report_definition,
                 only_tools=tool_names,
                 exclude_tools=excluded,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if include_web_search
+                    else None
+                ),
             )
         if self.api_type == API_TYPE_OLLAMA:
             return ollama_tool_schemas(
@@ -6482,6 +6522,11 @@ class OmniAgent:
                 extra_definitions=report_definition,
                 only_tools=tool_names,
                 exclude_tools=excluded,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if include_web_search
+                    else None
+                ),
             )
         if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
             return openai_tool_schemas(
@@ -6491,6 +6536,11 @@ class OmniAgent:
                 extra_definitions=report_definition,
                 only_tools=tool_names,
                 exclude_tools=excluded,
+                web_search_definition=(
+                    self.agent_tools.web_search_tool_definition()
+                    if include_web_search
+                    else None
+                ),
             )
         return glm_tool_schemas(
             include_web_search,
@@ -6499,6 +6549,11 @@ class OmniAgent:
             extra_definitions=report_definition,
             only_tools=tool_names,
             exclude_tools=excluded,
+            web_search_definition=(
+                self.agent_tools.web_search_tool_definition()
+                if include_web_search
+                else None
+            ),
         )
 
     def _normal_web_search_tool_schemas(self):
@@ -6519,7 +6574,7 @@ class OmniAgent:
             definitions.append(PROGRAM_DOCS_TOOL_DEFINITION)
         definitions.append(WEB_FETCH_TOOL_DEFINITION)
         if self.agent_tools.web_search_available:
-            definitions.append(WEB_SEARCH_TOOL_DEFINITION)
+            definitions.append(self.agent_tools.web_search_tool_definition())
 
         if self.api_type == API_TYPE_ANTHROPIC:
             return definitions

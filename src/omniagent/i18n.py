@@ -284,15 +284,30 @@ _add("app.memory.model", "Memory model", "记忆模型")
 
 # --- app.py: web search -----------------------------------------------------
 _add("app.web.max_results", "Max results", "最大结果数")
-_add("app.web.search_depth", "Search depth", "搜索深度")
-_add("app.web.topic", "Topic", "主题")
-_add("app.web.depth.basic", "Basic", "基础")
-_add("app.web.depth.fast", "Fast", "快速")
-_add("app.web.depth.ultra_fast", "Ultra fast", "极速")
-_add("app.web.depth.advanced", "Advanced", "深度")
-_add("app.web.topic.general", "General", "通用")
-_add("app.web.topic.news", "News", "新闻")
-_add("app.web.topic.finance", "Finance", "财经")
+_add("app.web.provider_field.engine", "Search engine", "搜索引擎")
+_add("app.web.provider_field.search_depth", "Search depth", "搜索深度")
+_add("app.web.provider_field.content_size", "Content size", "内容长度")
+_add("app.web.provider_field.extra_snippets", "Extra snippets", "额外摘录")
+_add("app.web.provider_field.engine.search_std", "Search std", "标准搜索")
+_add("app.web.provider_field.engine.search_pro", "Search pro", "增强搜索")
+_add(
+    "app.web.provider_field.engine.search_pro_sogou",
+    "Search pro sogou",
+    "搜狗搜索",
+)
+_add(
+    "app.web.provider_field.engine.search_pro_quark",
+    "Search pro quark",
+    "夸克搜索",
+)
+_add("app.web.provider_field.search_depth.basic", "Basic", "基础")
+_add("app.web.provider_field.search_depth.fast", "Fast", "快速")
+_add("app.web.provider_field.search_depth.ultra-fast", "Ultra fast", "极速")
+_add("app.web.provider_field.search_depth.advanced", "Advanced", "深度")
+_add("app.web.provider_field.content_size.medium", "Medium", "中等")
+_add("app.web.provider_field.content_size.high", "High", "详细")
+_add("app.web.provider_field.extra_snippets.true", "Enabled", "开启")
+_add("app.web.provider_field.extra_snippets.false", "Disabled", "关闭")
 
 # --- app.py: agent team -----------------------------------------------------
 _add("app.team.empty", "No members", "暂无成员")

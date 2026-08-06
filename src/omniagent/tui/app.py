@@ -51,7 +51,10 @@ from ..installer import PROVIDERS, install_registry_skill
 from ..memory import MemoryStore
 from ..main import attach_external_file_references_with_media
 from ..references import resolve_references
-from ..search import TAVILY_SEARCH_DEPTHS, TAVILY_TOPICS, WEB_SEARCH_PROVIDERS
+from ..search import (
+    WEB_SEARCH_PROVIDERS,
+    provider_config_fields,
+)
 from ..session import (
     ProjectRecord,
     SESSION_TITLE_STATE_GENERATED,
@@ -2438,7 +2441,9 @@ class AgentTUIApp(App):
         )
         active_model = config.model_list.get(selected_key, config.active_model)
         bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
-        reasoning_choices = self._reasoning_choices_for_api(active_model.api_type)
+        reasoning_choices = self._reasoning_choices_for_api(
+            active_model.api_type, title_case=True
+        )
         current_effort = normalize_reasoning_effort_for_api(
             active_model.api_type,
             active_model.reasoning_effort or "medium",
@@ -3279,30 +3284,9 @@ class AgentTUIApp(App):
     def _settings_web_search_rows(self) -> list[dict]:
         bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
         provider_choices = [
-            (provider, provider) for provider in sorted(WEB_SEARCH_PROVIDERS)
+            (provider.capitalize(), provider) for provider in sorted(WEB_SEARCH_PROVIDERS)
         ]
-        depth_labels = {
-            "basic": t("app.web.depth.basic"),
-            "fast": t("app.web.depth.fast"),
-            "ultra-fast": t("app.web.depth.ultra_fast"),
-            "advanced": t("app.web.depth.advanced"),
-        }
-        search_depth_choices = [
-            (depth_labels.get(depth, depth), depth)
-            for depth in ("basic", "fast", "ultra-fast", "advanced")
-            if depth in TAVILY_SEARCH_DEPTHS
-        ]
-        topic_labels = {
-            "general": t("app.web.topic.general"),
-            "news": t("app.web.topic.news"),
-            "finance": t("app.web.topic.finance"),
-        }
-        topic_choices = [
-            (topic_labels.get(topic, topic), topic)
-            for topic in ("general", "news", "finance")
-            if topic in TAVILY_TOPICS
-        ]
-        return [
+        rows = [
             {
                 "name": t("app.row.enable"),
                 "value": "true" if self.config.web_search_enable else "false",
@@ -3329,27 +3313,41 @@ class AgentTUIApp(App):
             {
                 "name": t("app.web.max_results"),
                 "value": str(self.config.web_search_max_results),
-                "keywords": "max_results 结果",
+                "keywords": "max_results 结果 上限",
                 "edit_type": "input",
                 "on_change": lambda v: self._on_setting_search_max_changed(v),
             },
-            {
-                "name": t("app.web.search_depth"),
-                "value": self.config.web_search_depth,
-                "keywords": "search_depth 深度",
-                "edit_type": "select",
-                "options": search_depth_choices,
-                "on_change": lambda v: self._on_setting_search_depth_changed(v),
-            },
-            {
-                "name": t("app.web.topic"),
-                "value": self.config.web_search_topic,
-                "keywords": "topic 主题",
-                "edit_type": "select",
-                "options": topic_choices,
-                "on_change": lambda v: self._on_setting_search_topic_changed(v),
-            },
         ]
+        # Each provider exposes its own native search options (Tavily
+        # search_depth, Zhipu content_size, Brave extra_snippets) which are
+        # rendered with localized labels below the common rows.
+        provider_config = self.config.web_search_provider_config()
+        for field in provider_config_fields(self.config.web_search_provider):
+            if field.key == "api_key":
+                continue
+            label_key = f"app.web.provider_field.{field.key}"
+            row = {
+                "name": t(label_key),
+                "value": str(provider_config.get(field.key) or field.default),
+                "keywords": f"web_search {field.key}",
+                "edit_type": "select" if field.choices else "input",
+                "on_change": lambda v, key=field.key: (
+                    self._on_setting_search_provider_field_changed(key, v)
+                ),
+            }
+            if field.choices:
+                row["options"] = [
+                    (self._provider_field_choice_label(label_key, choice), choice)
+                    for choice in field.choices
+                ]
+            rows.append(row)
+        return rows
+
+    def _provider_field_choice_label(self, label_key, choice):
+        """Localized label for a provider field choice, falling back to raw value."""
+        choice_key = f"{label_key}.{choice}"
+        localized = t(choice_key)
+        return localized if localized != choice_key else choice
 
     def _team_store_for_page(self) -> TeamStore | None:
         project = self._project_from_session(self.current_session_record)
@@ -4161,7 +4159,10 @@ class AgentTUIApp(App):
         save_config_field("web_search_provider", value)
         self._reload_config()
         if self.chat is not None:
-            self.chat.set_web_search_config(provider=value)
+            self.chat.set_web_search_config(
+                provider=value,
+                providers=self.config.web_search_providers,
+            )
         self._apply_config_to_controls()
 
     def _on_setting_search_api_key_changed(self, value: str) -> None:
@@ -4169,21 +4170,20 @@ class AgentTUIApp(App):
         save_config_field("web_search_api_key", api_key)
         self._reload_config()
         if self.chat is not None:
-            self.chat.set_web_search_config(api_key=api_key)
+            self.chat.set_web_search_config(
+                providers=self.config.web_search_providers
+            )
         self._apply_config_to_controls()
 
-    def _on_setting_search_depth_changed(self, value: str) -> None:
-        save_config_field("web_search_depth", value)
+    def _on_setting_search_provider_field_changed(
+        self, key: str, value: str
+    ) -> None:
+        save_config_field("web_search_provider_config", {key: value})
         self._reload_config()
         if self.chat is not None:
-            self.chat.set_web_search_config(search_depth=value)
-        self._apply_config_to_controls()
-
-    def _on_setting_search_topic_changed(self, value: str) -> None:
-        save_config_field("web_search_topic", value)
-        self._reload_config()
-        if self.chat is not None:
-            self.chat.set_web_search_config(topic=value)
+            self.chat.set_web_search_config(
+                providers=self.config.web_search_providers
+            )
         self._apply_config_to_controls()
 
     def _on_setting_compact_changed(self, value: str) -> None:
@@ -4400,10 +4400,8 @@ class AgentTUIApp(App):
             ),
             web_search_enabled=self.config.web_search_enable,
             web_search_provider=self.config.web_search_provider,
-            web_search_api_key=self.config.web_search_api_key,
+            web_search_providers=self.config.web_search_providers,
             web_search_max_results=self.config.web_search_max_results,
-            web_search_depth=self.config.web_search_depth,
-            web_search_topic=self.config.web_search_topic,
             agent_plan_enabled=self.config.agent_plan_enable,
             agent_team_enable=self.config.agent_team_enable,
             current_model_name=self.config.active_model_label,

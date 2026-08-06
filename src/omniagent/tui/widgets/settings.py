@@ -3168,7 +3168,7 @@ class SettingsModal(ModalScreen[None]):
             ("GLM", API_TYPE_GLM),
         ]
         draft_api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
-        reasoning_choices = reasoning_levels_for_api(draft_api_type)
+        reasoning_choices = reasoning_levels_for_api(draft_api_type, title_case=True)
         thinking_enabled = self._is_toggle_enabled(
             str(draft.get("thinking_mode") or "false")
         )

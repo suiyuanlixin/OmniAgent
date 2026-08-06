@@ -59,17 +59,17 @@ from .ui import (
     tool_display_is_error,
     tool_result_is_error,
 )
-from .search import (
-    DEFAULT_WEB_SEARCH_DEPTH,
+from .websearch import (
     DEFAULT_WEB_SEARCH_ENABLE,
     DEFAULT_WEB_SEARCH_MAX_RESULTS,
     DEFAULT_WEB_SEARCH_PROVIDER,
-    DEFAULT_WEB_SEARCH_TOPIC,
+    MAX_WEB_SEARCH_MAX_RESULTS,
+    default_provider_configs,
     is_web_search_configured,
-    normalize_tavily_search_depth,
-    normalize_tavily_topic,
+    normalize_provider_configs,
     normalize_web_search_provider,
-    search_tavily,
+    provider_tool_definition,
+    search_web,
 )
 from .subagents import (
     DISPATCH_SUBAGENT_TOOL_NAME,
@@ -742,64 +742,7 @@ TOOL_DEFINITIONS = [
 ]
 
 
-WEB_SEARCH_TOOL_DEFINITION = {
-    "name": "web_search",
-    "description": (
-        "Search the public web with Tavily for current or external information. "
-        "Use it for recent facts, releases, prices, laws, schedules, and source-backed answers."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The web search query.",
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of search results to return. Defaults to the app setting.",
-            },
-            "search_depth": {
-                "type": "string",
-                "enum": ["basic", "fast", "ultra-fast", "advanced"],
-                "description": "Tavily search depth. basic/fast/ultra-fast cost 1 credit; advanced costs 2.",
-            },
-            "topic": {
-                "type": "string",
-                "enum": ["general", "news", "finance"],
-                "description": "Search topic. Use news for current events and finance for market-related queries.",
-            },
-            "time_range": {
-                "type": "string",
-                "enum": ["day", "week", "month", "year", "d", "w", "m", "y"],
-                "description": "Optional recency filter.",
-            },
-            "include_answer": {
-                "type": "boolean",
-                "description": "Whether Tavily should include its generated answer. Defaults to false.",
-            },
-            "include_raw_content": {
-                "type": "boolean",
-                "description": "Whether Tavily should include parsed page content. Use sparingly.",
-            },
-            "include_domains": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional domains to include.",
-            },
-            "exclude_domains": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional domains to exclude.",
-            },
-            "country": {
-                "type": "string",
-                "description": "Optional country boost for general search, such as united states or china.",
-            },
-        },
-        "required": ["query"],
-    },
-}
+WEB_SEARCH_TOOL_DEFINITION = provider_tool_definition(DEFAULT_WEB_SEARCH_PROVIDER)
 
 
 SKILL_TOOL_DEFINITIONS = [
@@ -860,6 +803,7 @@ def tool_definitions(
     only_tools=None,
     exclude_tools=None,
     plan_mode=False,
+    web_search_definition=None,
 ):
     definitions = [
         tool
@@ -869,7 +813,7 @@ def tool_definitions(
     if include_skills:
         definitions.extend(SKILL_TOOL_DEFINITIONS)
     if include_web_search:
-        definitions.append(WEB_SEARCH_TOOL_DEFINITION)
+        definitions.append(web_search_definition or WEB_SEARCH_TOOL_DEFINITION)
     if extra_definitions:
         definitions.extend(extra_definitions)
     if plan_mode:
@@ -886,6 +830,7 @@ def anthropic_tool_schemas(
     only_tools=None,
     exclude_tools=None,
     plan_mode=False,
+    web_search_definition=None,
 ):
     return tool_definitions(
         include_web_search,
@@ -895,6 +840,7 @@ def anthropic_tool_schemas(
         only_tools=only_tools,
         exclude_tools=exclude_tools,
         plan_mode=plan_mode,
+        web_search_definition=web_search_definition,
     )
 
 
@@ -906,6 +852,7 @@ def glm_tool_schemas(
     only_tools=None,
     exclude_tools=None,
     plan_mode=False,
+    web_search_definition=None,
 ):
     return [
         {
@@ -924,6 +871,7 @@ def glm_tool_schemas(
             only_tools=only_tools,
             exclude_tools=exclude_tools,
             plan_mode=plan_mode,
+            web_search_definition=web_search_definition,
         )
     ]
 
@@ -936,6 +884,7 @@ def openai_tool_schemas(
     only_tools=None,
     exclude_tools=None,
     plan_mode=False,
+    web_search_definition=None,
 ):
     return glm_tool_schemas(
         include_web_search,
@@ -945,6 +894,7 @@ def openai_tool_schemas(
         only_tools=only_tools,
         exclude_tools=exclude_tools,
         plan_mode=plan_mode,
+        web_search_definition=web_search_definition,
     )
 
 
@@ -956,6 +906,7 @@ def ollama_tool_schemas(
     only_tools=None,
     exclude_tools=None,
     plan_mode=False,
+    web_search_definition=None,
 ):
     return glm_tool_schemas(
         include_web_search,
@@ -965,6 +916,7 @@ def ollama_tool_schemas(
         only_tools=only_tools,
         exclude_tools=exclude_tools,
         plan_mode=plan_mode,
+        web_search_definition=web_search_definition,
     )
 
 
@@ -980,10 +932,9 @@ class AgentTools:
         visible_output_callback=None,
         web_search_enabled=DEFAULT_WEB_SEARCH_ENABLE,
         web_search_provider=DEFAULT_WEB_SEARCH_PROVIDER,
-        web_search_api_key="",
+        web_search_api_key=None,
         web_search_max_results=DEFAULT_WEB_SEARCH_MAX_RESULTS,
-        web_search_depth=DEFAULT_WEB_SEARCH_DEPTH,
-        web_search_topic=DEFAULT_WEB_SEARCH_TOPIC,
+        web_search_providers=None,
         todo_update_callback=None,
         todos_enabled=True,
         skills_enabled=True,
@@ -1031,12 +982,11 @@ class AgentTools:
         self.team_enabled = False
         self.set_approval_mode(approval_mode)
         self.set_web_search_config(
-            web_search_enabled,
-            web_search_provider,
-            web_search_api_key,
-            web_search_max_results,
-            web_search_depth,
-            web_search_topic,
+            enabled=web_search_enabled,
+            provider=web_search_provider,
+            api_key=web_search_api_key,
+            max_results=web_search_max_results,
+            providers=web_search_providers,
         )
         self._display_payload = None
         self._submitted_plan_approved = None
@@ -1455,9 +1405,17 @@ class AgentTools:
         provider=None,
         api_key=None,
         max_results=None,
-        search_depth=None,
-        topic=None,
+        providers=None,
     ):
+        """Apply the user-owned web search settings.
+
+        Only settings the user controls live here: whether search is on, which
+        provider and credentials to use, and the max_results ceiling. Each
+        provider's native options (e.g. Tavily search_depth, Brave
+        extra_snippets) live in web_search_providers. Per search intent (topic,
+        freshness, domains, country, language) is the model's to choose and is
+        never stored.
+        """
         if enabled is not None:
             self.web_search_enabled = bool(enabled)
         elif not hasattr(self, "web_search_enabled"):
@@ -1466,35 +1424,41 @@ class AgentTools:
             self.web_search_provider = normalize_web_search_provider(provider)
         elif not hasattr(self, "web_search_provider"):
             self.web_search_provider = DEFAULT_WEB_SEARCH_PROVIDER
+        if providers is not None:
+            self.web_search_providers = normalize_provider_configs(providers)
+        elif not hasattr(self, "web_search_providers"):
+            self.web_search_providers = default_provider_configs()
         if api_key is not None:
-            self.web_search_api_key = str(api_key or "").strip()
-        elif not hasattr(self, "web_search_api_key"):
-            self.web_search_api_key = ""
+            self.web_search_providers[self.web_search_provider]["api_key"] = str(
+                api_key or ""
+            ).strip()
         if max_results is not None:
             self.web_search_max_results = _bounded_int(
                 max_results,
                 DEFAULT_WEB_SEARCH_MAX_RESULTS,
                 1,
-                20,
+                MAX_WEB_SEARCH_MAX_RESULTS,
                 "web_search_max_results",
             )
         elif not hasattr(self, "web_search_max_results"):
             self.web_search_max_results = DEFAULT_WEB_SEARCH_MAX_RESULTS
-        if search_depth is not None:
-            self.web_search_depth = normalize_tavily_search_depth(search_depth)
-        elif not hasattr(self, "web_search_depth"):
-            self.web_search_depth = DEFAULT_WEB_SEARCH_DEPTH
-        if topic is not None:
-            self.web_search_topic = normalize_tavily_topic(topic)
-        elif not hasattr(self, "web_search_topic"):
-            self.web_search_topic = DEFAULT_WEB_SEARCH_TOPIC
+
+    @property
+    def web_search_api_key(self):
+        return str(
+            self.web_search_providers.get(self.web_search_provider, {}).get("api_key")
+            or ""
+        )
 
     @property
     def web_search_available(self):
         return self.web_search_enabled and is_web_search_configured(
             self.web_search_provider,
-            self.web_search_api_key,
+            providers=self.web_search_providers,
         )
+
+    def web_search_tool_definition(self):
+        return provider_tool_definition(self.web_search_provider)
 
     def web_search_status(self):
         return {
@@ -1502,12 +1466,17 @@ class AgentTools:
             "available": self.web_search_available,
             "provider": self.web_search_provider,
             "max_results": self.web_search_max_results,
-            "search_depth": self.web_search_depth,
-            "topic": self.web_search_topic,
         }
 
-    def search_web(self, query, **kwargs):
-        payload = {"query": query, **kwargs}
+    def search_web(self, query=None, **kwargs):
+        payload = dict(kwargs)
+        if query is not None:
+            query_fields = {
+                "tavily": "query",
+                "zhipu": "search_query",
+                "brave": "q",
+            }
+            payload.setdefault(query_fields[self.web_search_provider], query)
         return self._web_search(payload)
 
     def begin_agent_session(self, clear_todos=True):
@@ -3662,41 +3631,31 @@ class AgentTools:
     def _web_search(self, tool_input):
         if not self.web_search_enabled:
             raise AgentToolError("Web search is disabled. Use /search on to enable it.")
-        if self.web_search_provider != DEFAULT_WEB_SEARCH_PROVIDER:
-            raise AgentToolError(
-                f"Unsupported web search provider: {self.web_search_provider}"
-            )
 
-        query = _required_string(tool_input, "query")
+        if not isinstance(tool_input, dict):
+            raise AgentToolError("Web search input must be an object.")
         self._before_visible_output()
+        query = str(
+            tool_input.get("query")
+            or tool_input.get("search_query")
+            or tool_input.get("q")
+            or ""
+        ).strip()
+        if not query:
+            raise AgentToolError("Search query cannot be empty.")
         if not self.suppress_visible_output:
             add_web_search_entry(query)
         self._display_payload = {
             "kind": "web_search",
             "content": query,
         }
-        max_results = (
-            _optional_positive_int(tool_input, "max_results")
-            or self.web_search_max_results
-        )
-        search_depth = str(tool_input.get("search_depth") or self.web_search_depth)
-        topic = str(tool_input.get("topic") or self.web_search_topic)
-        time_range = str(tool_input.get("time_range") or "")
-        include_answer = _optional_bool(tool_input, "include_answer", False)
-        include_raw_content = _optional_bool(tool_input, "include_raw_content", False)
-
-        return search_tavily(
-            query,
-            api_key=self.web_search_api_key,
-            max_results=max_results,
-            search_depth=search_depth,
-            topic=topic,
-            time_range=time_range,
-            include_answer=include_answer,
-            include_raw_content=include_raw_content,
-            include_domains=tool_input.get("include_domains"),
-            exclude_domains=tool_input.get("exclude_domains"),
-            country=tool_input.get("country", ""),
+        return search_web(
+            self.web_search_provider,
+            tool_input,
+            provider_config=self.web_search_providers.get(
+                self.web_search_provider, {}
+            ),
+            max_results_ceiling=self.web_search_max_results,
         )
 
     def _iter_files(self, root):

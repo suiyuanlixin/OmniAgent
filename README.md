@@ -13,14 +13,14 @@ OmniAgent 是一个基于 Python、Textual 和 Rich 的本地 AI Agent 工作台
 - 支持子智能体：Plan mode 提供 `reader`、`researcher`，Build mode 额外提供 `auditor`、`builder`。
 - 支持 Agent Team，可启用 `architect`、`reviewer`、`implementer`、`devops`、`debugger`，并通过写入范围所有权避免并发修改冲突。
 - 支持持久记忆、偏好记忆、情景记忆、自动上下文压缩与手动 `/comp` 压缩。
-- 支持 Tavily 网络搜索、程序级 / 工作区级 Skills，以及 ClawHub / SkillHub 安装流程。
+- 支持 Tavily、智谱和 Brave 网络搜索、程序级 / 工作区级 Skills，以及 ClawHub / SkillHub 安装流程。
 - 对写文件、补丁、命令执行等高风险操作提供审批保护。
 
 ## 环境要求
 
 - Python 3.10+
 - 可访问目标模型服务的 API Key
-- 如需网络搜索，准备 Tavily API Key
+- 如需网络搜索，准备 Tavily、智谱或 Brave 中至少一个 Provider 的 API Key
 - 如需本地模型，已安装并启动 Ollama
 
 核心依赖位于 `requirements.txt`，其中包括：
@@ -134,10 +134,22 @@ python -m omniagent
   "web_search": {
     "enable": true,
     "provider": "tavily",
-    "api_key": "tvly-xxxxxxxx",
     "max_results": 10,
-    "search_depth": "basic",
-    "topic": "general"
+    "providers": {
+      "tavily": {
+        "api_key": "tvly-xxxxxxxx",
+        "search_depth": "advanced"
+      },
+      "zhipu": {
+        "api_key": "xxxxxxxx",
+        "engine": "search_std",
+        "content_size": "medium"
+      },
+      "brave": {
+        "api_key": "xxxxxxxx",
+        "extra_snippets": "false"
+      }
+    }
   }
 }
 ```
@@ -168,7 +180,12 @@ python -m omniagent
 - 每个 Provider API 回合（主对话、工具/Agent、压缩、Memory 更新和标题生成）的 usage 会写入 session 的 `usage_history`；提供商未返回 usage 时保留该回合记录并标记 `usage_available: false`。
 - `auto_compact.compact_model`：上下文压缩模型，使用同样的 Provider/Model 引用对象，`auto` 表示跟随当前模型；压缩请求的 usage 会与主对话 usage 分开记录。
 - `memory_system.memory_model`：记忆写入模型，使用同样的 Provider/Model 引用对象，`auto` 表示跟随当前模型。
-- `web_search.provider`：当前仅支持 `tavily`。
+- `web_search.provider`：当前启用的搜索 Provider，支持 `tavily`、`zhipu`、`brave`。
+- `web_search.providers`：按 Provider 独立保存密钥和专属设置。Tavily 的 `search_depth` 支持 `basic`、`fast`、`ultra-fast`、`advanced`；智谱的 `engine` 支持 `search_std`、`search_pro`、`search_pro_sogou`、`search_pro_quark`，`content_size` 支持 `medium`、`high`；Brave 的 `extra_snippets` 支持 `true`、`false`。这些原生参数就是各 Provider 的搜索方式，由用户配置且每次搜索都按该值执行，模型不能更改。
+- `web_search.max_results` 是上限而不是固定值：模型可以在上限内调低，但请求更多结果时会被收敛到上限。
+- 检索意图参数由模型按当前 Provider 使用原生字段，不写入配置。Tavily 可传 `topic`、`time_range`、`start_date`、`end_date`、`chunks_per_source`、`include_answer`、`include_raw_content`、`include_domains`、`exclude_domains`、`country`；智谱可传 `search_recency_filter`、`search_domain_filter`；Brave 可传 `freshness`（包括自定义日期区间）、`country`、`search_lang`、`ui_lang`、`offset`。搜索词字段也按 Provider 原生名称变化：Tavily 是 `query`，智谱是 `search_query`，Brave 是 `q`。
+- 用户锁定的 Provider 配置（Tavily `search_depth`、智谱配置中的 `engine`/`content_size`、Brave `extra_snippets`）不会出现在模型工具参数中，也不能由模型覆盖。
+- 旧版顶层 `web_search.api_key`、`web_search.search_depth`、`web_search.topic` 和 `web_search.mode` 会在加载时自动迁移或丢弃，不再写回旧结构。Tavily 的搜索深度会迁移到 `providers.tavily.search_depth`，Provider 无关的 `mode` 会按 fast/balanced/deep 映射到 Tavily 的 fast/basic/advanced。
 
 `reasoning_effort` 的有效值按提供商不同：
 
@@ -289,7 +306,7 @@ Agent 模式用于多步骤本地任务。模型可以请求工具，客户端�
 - Artifact 另有不可配置的磁盘安全策略：单文件最多 `256 MiB`、缓存总量最多 `1 GiB`，并保留至少 `256 MiB` 可用磁盘空间。达到安全限制时会停止生产者并明确标记 Artifact 不完整，不会把部分内容伪装为完整原文。
 - `bash` 流式合并 stdout/stderr，内存只维护有界预览窗口；超时、用户取消或磁盘安全停止都会执行有界进程树终止、有限时间 wait、必要时 force-kill，并明确区分终止成功、强制终止和无法确认。
 - `grep` 优先使用带进程超时的 Ripgrep，最多返回 `100` 条匹配，并给出实际匹配列号和围绕匹配位置的上下文；无 Ripgrep 时使用兼容回退实现。`glob` 最多返回 `100` 个文件，并使用有界候选集合而不是一次收集全部匹配。
-- Web Search 保留 Tavily 返回的 answer、content 和 raw content 空白格式，搜索结果块直接以结构记录交给 Artifact 管线，不再从格式化纯文本中猜测记录边界。Program Docs、Skill、Team Inbox 和 Shell 等流式生产者会在生成过程中直接写入 Artifact Writer。
+- Web Search 将 Tavily、智谱和 Brave 的响应统一为标题、URL、来源、发布时间、摘要和正文结构；搜索结果块直接以结构记录交给 Artifact 管线，不再从格式化纯文本中猜测记录边界。Program Docs、Skill、Team Inbox 和 Shell 等流式生产者会在生成过程中直接写入 Artifact Writer。
 - Artifact 预览之后仍有统一上下文预算作为最后防线：只有 history 达到 `context_window_tokens - max_tokens` 时，才清理旧工具结果或调用压缩模型。
 
 安全限制：
@@ -405,7 +422,7 @@ Skills 是给 Agent 使用的可复用工作流说明，不直接执行脚本，
 
 ## 网络搜索
 
-网络搜索使用 Tavily。开启并配置 key 后：
+网络搜索支持 Tavily、智谱和 Brave。选择一个 Provider 并配置对应 key 后：
 
 - 普通聊天可按需调用搜索
 - Agent 模式会获得 `web_search` 工具
@@ -415,10 +432,21 @@ Skills 是给 Agent 使用的可复用工作流说明，不直接执行脚本，
 
 - 输入 `/search` 打开 Web Search 设置页面
 - 在设置页中开启/关闭搜索
-- 在设置页中填写 Tavily API Key
-- 在设置页中调整 `provider`、`max_results`、`depth`、`topic`
+- 在设置页中选择 `provider`，并填写该 Provider 独立保存的 API Key
+- 在设置页中调整该 Provider 自己的搜索参数（见下）
+- 在设置页中设置 `max_results` 上限
 
-当前仅支持 `tavily`，搜索深度支持 `basic`、`fast`、`ultra-fast`、`advanced`，主题支持 `general`、`news`、`finance`。
+用户参数与模型参数是分开的。设置页只包含由用户负责的项：是否启用、`provider`、API Key、各 Provider 的原生搜索参数，以及 `max_results` 上限。搜索方式按 Provider 各自独立配置：
+
+- Tavily 的 **Search depth**：`Basic`、`Fast`、`Ultra fast`、`Advanced`
+- 智谱的 **Content size**：`Medium`、`High`（另可选 `Search engine`）
+- Brave 的 **Extra snippets**：`Enabled`、`Disabled`
+
+这些参数会原样传给对应 Provider，每次搜索都按该值执行，模型不能更改。
+
+`web_search` 工具会根据当前 Provider 动态变化。模型使用当前 Provider 的原生字段：Tavily 使用 `query`、`max_results`、`topic`、`time_range`、`start_date`、`end_date`、`chunks_per_source`、`auto_parameters`、`include_answer`、`include_raw_content`、`include_domains`、`exclude_domains`、`country`；智谱使用 `search_query`、`count`、`search_recency_filter`、`search_domain_filter`；Brave 使用 `q`、`count`、`freshness`、`country`、`search_lang`、`ui_lang`、`offset`。结果数量字段只能在用户设置的上限内调低，用户锁定的 Provider 配置不会暴露给模型。
+
+主题支持 `general`、`news`、`finance`。模型不再使用跨 Provider 的 `include_content` 转换参数；如需更丰富内容，应直接使用当前 Provider 支持的原生字段，例如 Tavily 的 `include_raw_content`。
 
 ## 记忆、会话与本地数据
 
@@ -498,7 +526,8 @@ OmniAgent/
         ├── commands.py      # 斜杠命令定义
         ├── tools.py         # Agent 工具定义与执行器
         ├── output.py        # Artifact 与工具输出处理
-        ├── search.py        # Tavily 搜索封装
+        ├── websearch.py      # Web Search 兼容入口
+        ├── search/           # 搜索模型、Registry、格式化与 Provider 适配器
         ├── memory.py        # 持久记忆与历史
         ├── session.py       # 会话与项目索引存储
         ├── todo.py          # Todo 状态与快照
@@ -550,7 +579,7 @@ python -m omniagent
 
 - 输入 `/search`
 - 开启 Web Search
-- 填写 Tavily API Key
+- 选择已配置密钥的 Provider，并填写对应 API Key
 
 ### Ollama 本地模型无法连接
 

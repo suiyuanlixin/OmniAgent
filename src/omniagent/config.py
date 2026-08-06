@@ -7,15 +7,16 @@ from .persistence import atomic_write_text
 from .paths import APP_HOME
 from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, normalize_language
 
-from .search import (
+from .websearch import (
     DEFAULT_WEB_SEARCH_DEPTH,
     DEFAULT_WEB_SEARCH_ENABLE,
     DEFAULT_WEB_SEARCH_MAX_RESULTS,
     DEFAULT_WEB_SEARCH_PROVIDER,
-    DEFAULT_WEB_SEARCH_TOPIC,
     TAVILY_SEARCH_DEPTHS,
-    TAVILY_TOPICS,
     WEB_SEARCH_PROVIDERS,
+    default_provider_configs,
+    normalize_provider_config,
+    normalize_provider_configs,
 )
 
 CONFIG_FILE = APP_HOME / "config.json"
@@ -124,8 +125,7 @@ GLOBAL_FIELD_KEYS = {
     "web_search_provider",
     "web_search_api_key",
     "web_search_max_results",
-    "web_search_depth",
-    "web_search_topic",
+    "web_search_provider_config",
 }
 
 
@@ -188,10 +188,21 @@ class AppConfig:
     language: str = DEFAULT_LANGUAGE
     web_search_enable: bool = DEFAULT_WEB_SEARCH_ENABLE
     web_search_provider: str = DEFAULT_WEB_SEARCH_PROVIDER
-    web_search_api_key: str = ""
+    web_search_providers: dict[str, dict[str, str]] = field(
+        default_factory=default_provider_configs
+    )
     web_search_max_results: int = DEFAULT_WEB_SEARCH_MAX_RESULTS
-    web_search_depth: str = DEFAULT_WEB_SEARCH_DEPTH
-    web_search_topic: str = DEFAULT_WEB_SEARCH_TOPIC
+
+    def web_search_provider_config(self, provider=None):
+        provider_name = parse_web_search_provider(provider or self.web_search_provider)
+        return self.web_search_providers.setdefault(
+            provider_name,
+            normalize_provider_config(provider_name, {}),
+        )
+
+    @property
+    def web_search_api_key(self):
+        return str(self.web_search_provider_config().get("api_key") or "")
 
     @property
     def active_model_name(self):
@@ -320,10 +331,8 @@ class AppConfig:
             "web_search": {
                 "enable": self.web_search_enable,
                 "provider": self.web_search_provider,
-                "api_key": self.web_search_api_key,
                 "max_results": self.web_search_max_results,
-                "search_depth": self.web_search_depth,
-                "topic": self.web_search_topic,
+                "providers": normalize_provider_configs(self.web_search_providers),
             },
         }
 
@@ -348,9 +357,10 @@ class AppConfig:
             "web_search_enable": self.web_search_enable,
             "web_search_provider": self.web_search_provider,
             "web_search_api_key": self.web_search_api_key,
+            "web_search_providers": normalize_provider_configs(
+                self.web_search_providers
+            ),
             "web_search_max_results": self.web_search_max_results,
-            "web_search_depth": self.web_search_depth,
-            "web_search_topic": self.web_search_topic,
         }
         values.update(self.active_model.to_dict())
         return values
@@ -599,24 +609,24 @@ def parse_web_search_max_results(value):
 def parse_web_search_provider(value):
     provider = str(value or DEFAULT_WEB_SEARCH_PROVIDER).strip().lower()
     if provider not in WEB_SEARCH_PROVIDERS:
-        raise ValueError("Web search provider must be tavily.")
+        choices = ", ".join(sorted(WEB_SEARCH_PROVIDERS))
+        raise ValueError(f"Web search provider must be one of: {choices}.")
     return provider
 
 
-def parse_web_search_depth(value):
-    depth = str(value or DEFAULT_WEB_SEARCH_DEPTH).strip().lower()
-    if depth not in TAVILY_SEARCH_DEPTHS:
-        raise ValueError(
-            "Web search depth must be basic, fast, ultra-fast, or advanced."
-        )
-    return depth
+def _legacy_depth_to_tavily(value):
+    """Map a legacy depth or mode value onto the Tavily search_depth vocabulary.
 
-
-def parse_web_search_topic(value):
-    topic = str(value or DEFAULT_WEB_SEARCH_TOPIC).strip().lower()
-    if topic not in TAVILY_TOPICS:
-        raise ValueError("Web search topic must be general, news, or finance.")
-    return topic
+    Pre-provider configs used a Tavily-style search_depth (basic/fast/ultra-fast/
+    advanced), and the intermediate provider-neutral mode used fast/balanced/deep.
+    Both are accepted so existing configs migrate without data loss.
+    """
+    depth = str(value or "").strip().lower()
+    if depth in TAVILY_SEARCH_DEPTHS:
+        return depth
+    return {"fast": "fast", "balanced": "basic", "deep": "advanced"}.get(
+        depth, DEFAULT_WEB_SEARCH_DEPTH
+    )
 
 
 def parse_language(value):
@@ -861,24 +871,26 @@ def _sanitize_config(data):
         )
     except ValueError:
         web_search_provider = DEFAULT_WEB_SEARCH_PROVIDER
+    web_search_providers = normalize_provider_configs(web_search.get("providers"))
+    legacy_api_key = str(web_search.get("api_key") or "").strip()
+    if legacy_api_key and not web_search_providers["tavily"].get("api_key"):
+        web_search_providers["tavily"]["api_key"] = legacy_api_key
+    legacy_depth = str(
+        web_search.get("search_depth") or web_search.get("mode") or ""
+    ).strip().lower()
+    if legacy_depth:
+        # A top-level search_depth/mode marks a pre-refactor config in which the
+        # Tavily depth was never user-configurable (the provider tree only held
+        # a default fill), so the legacy value is authoritative.
+        web_search_providers["tavily"]["search_depth"] = _legacy_depth_to_tavily(
+            legacy_depth
+        )
     try:
         web_search_max_results = parse_web_search_max_results(
             web_search.get("max_results", DEFAULT_WEB_SEARCH_MAX_RESULTS)
         )
     except ValueError:
         web_search_max_results = DEFAULT_WEB_SEARCH_MAX_RESULTS
-    try:
-        web_search_depth = parse_web_search_depth(
-            web_search.get("search_depth", DEFAULT_WEB_SEARCH_DEPTH)
-        )
-    except ValueError:
-        web_search_depth = DEFAULT_WEB_SEARCH_DEPTH
-    try:
-        web_search_topic = parse_web_search_topic(
-            web_search.get("topic", DEFAULT_WEB_SEARCH_TOPIC)
-        )
-    except ValueError:
-        web_search_topic = DEFAULT_WEB_SEARCH_TOPIC
 
     return AppConfig(
         current_model=current_model,
@@ -924,10 +936,8 @@ def _sanitize_config(data):
             web_search.get("enable"), DEFAULT_WEB_SEARCH_ENABLE
         ),
         web_search_provider=web_search_provider,
-        web_search_api_key=str(web_search.get("api_key") or "").strip(),
+        web_search_providers=web_search_providers,
         web_search_max_results=web_search_max_results,
-        web_search_depth=web_search_depth,
-        web_search_topic=web_search_topic,
     )
 
 
@@ -950,7 +960,17 @@ def _load_existing_config():
         config = _default_config()
         _persist_config(config)
         return config
-    return _sanitize_config(raw)
+    config = _sanitize_config(raw)
+    web_search = raw.get("web_search") if isinstance(raw, dict) else None
+    if not isinstance(web_search, dict) or (
+        "providers" not in web_search
+        or "mode" in web_search
+        or "api_key" in web_search
+        or "search_depth" in web_search
+        or "topic" in web_search
+    ):
+        _persist_config(config)
+    return config
 
 
 def load_config():
@@ -1161,12 +1181,20 @@ def save_config_fields(fields, model_name=None):
         elif key == "web_search_provider":
             config.web_search_provider = parse_web_search_provider(value)
         elif key == "web_search_api_key":
-            config.web_search_api_key = str(value or "").strip()
+            config.web_search_provider_config()["api_key"] = str(value or "").strip()
         elif key == "web_search_max_results":
             config.web_search_max_results = parse_web_search_max_results(value)
-        elif key == "web_search_depth":
-            config.web_search_depth = parse_web_search_depth(value)
-        elif key == "web_search_topic":
-            config.web_search_topic = parse_web_search_topic(value)
+        elif key == "web_search_provider_config":
+            if not isinstance(value, dict):
+                raise ValueError("Web search provider config must be an object.")
+            provider_config = dict(config.web_search_provider_config())
+            provider_config.update(value)
+            config.web_search_providers[config.web_search_provider] = (
+                normalize_provider_config(
+                    config.web_search_provider,
+                    provider_config,
+                    strict=True,
+                )
+            )
 
     _persist_config(_sanitize_config(config.to_dict()))
