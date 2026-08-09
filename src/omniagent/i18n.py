@@ -653,6 +653,28 @@ _add("sidebar.archive_chats", "Archive chats", "归档全部会话")
 _add("input.placeholder", "Type a message", "输入消息")
 _add("input.mode.plan", "Plan", "规划")
 _add("input.mode.build", "Build", "执行")
+_add("input.mode.goal", "Goal", "Goal")
+_add("input.goal.active", "Pursuing goal", "\u8fdb\u884c\u4e2d\u7684\u76ee\u6807")
+_add("input.goal.paused", "Paused goal", "\u5df2\u6682\u505c\u7684\u76ee\u6807")
+_add("input.goal.blocked", "Blocked goal", "\u5df2\u963b\u585e\u7684\u76ee\u6807")
+_add("input.goal.placeholder", "Goal", "\u76ee\u6807")
+_add("input.goal.pause", "Pause", "\u6682\u505c")
+_add("input.goal.resume", "Resume", "\u7ee7\u7eed")
+_add("input.goal.close", "Close", "\u5173\u95ed")
+_add("input.goal.stopping", "Goal is still stopping.", "Goal \u4ecd\u5728\u505c\u6b62\u4e2d\u3002")
+_add("input.goal.paused_mode", "Paused after leaving Goal mode.", "\u79bb\u5f00 Goal \u6a21\u5f0f\u540e\u5df2\u6682\u505c\u3002")
+_add("input.goal.paused_user", "Paused by user.", "\u7528\u6237\u5df2\u6682\u505c\u3002")
+_add(
+    "input.goal.paused_error",
+    "Paused after a local error.",
+    "\u672c\u5730\u9519\u8bef\u540e\u5df2\u6682\u505c\u3002",
+)
+_add(
+    "input.goal.paused_recovery",
+    "Paused after restoring the session.",
+    "\u6062\u590d\u4f1a\u8bdd\u540e\u5df2\u6682\u505c\u3002",
+)
+_add("input.goal.closed_user", "Closed by user.", "\u7528\u6237\u5df2\u5173\u95ed\u3002")
 _add("input.no_model", "No model", "无模型")
 
 # Approval levels: consumed by tui/data.py approval_levels().
@@ -695,6 +717,26 @@ _add("input.cmd_hint.team", "Open team page", "打开团队页面")
 
 # --- widgets: chat view -----------------------------------------------------
 _add("chat.plan_header", "Plan", "规划")
+_add("chat.goal.header", "Goal", "\u76ee\u6807")
+_add("chat.goal.status", "Status", "\u72b6\u6001")
+_add("chat.goal.phase", "Phase", "\u9636\u6bb5")
+_add("chat.goal.step", "Step", "\u6b65\u9aa4")
+_add("chat.goal.progress", "Progress", "\u8fdb\u5ea6")
+_add("chat.goal.reason", "Reason", "\u539f\u56e0")
+_add("chat.goal.criteria", "Success criteria", "\u6210\u529f\u6807\u51c6")
+_add("chat.goal.plan", "Plan", "\u8ba1\u5212")
+_add("chat.goal.verification", "Verification", "\u9a8c\u8bc1")
+_add("chat.goal.iteration", "Iteration", "\u8fed\u4ee3")
+_add("chat.goal.updated", "Updated", "\u66f4\u65b0\u65f6\u95f4")
+_add("chat.goal.status.active", "Active", "\u8fdb\u884c\u4e2d")
+_add("chat.goal.status.paused", "Paused", "\u5df2\u6682\u505c")
+_add("chat.goal.status.completed", "Completed", "\u5df2\u5b8c\u6210")
+_add("chat.goal.status.blocked", "Blocked", "\u5df2\u963b\u585e")
+_add("chat.goal.status.failed", "Failed", "\u5931\u8d25")
+_add("chat.goal.status.cancelled", "Cancelled", "\u5df2\u53d6\u6d88")
+_add("chat.goal.phase.planning", "Planning", "\u89c4\u5212")
+_add("chat.goal.phase.building", "Building", "\u6784\u5efa")
+_add("chat.goal.phase.verifying", "Verifying", "\u9a8c\u8bc1")
 _add("chat.tool_call_failed", "Tool call failed.", "工具调用失败。")
 _add("chat.status.failed", "failed", "失败")
 _add("chat.status.rejected", "rejected", "已拒绝")
@@ -723,6 +765,7 @@ _add("chat.tool.glob", "Glob", "匹配")
 _add("chat.tool.list_dir", "List dir", "列出目录")
 _add("chat.tool.list_skills", "List skills", "列出技能")
 _add("chat.tool.update_todo", "Todos", "待办")
+_add("chat.tool.update_goal", "Goal", "\u66f4\u65b0 Goal")
 _add("chat.tool.ask_user", "Questions", "提问")
 _add("chat.tool.submit_plan", "Plan", "规划")
 _add("chat.tool.web_fetch", "Webfetch", "网页抓取")

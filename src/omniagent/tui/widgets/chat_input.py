@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from time import perf_counter
+from datetime import datetime
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, Container, VerticalScroll
 from textual.strip import Strip
-from textual.widgets import Button, Static, TextArea
+from textual.widgets import Button, Input, Static, TextArea
 from textual.widget import Widget
 from textual.message import Message
 from textual.reactive import reactive
@@ -82,9 +83,13 @@ def plan_choices() -> tuple[str, str]:
     return (t("input.mode.plan"), t("input.mode.build"))
 
 
+def mode_choices() -> tuple[str, str, str]:
+    return (*plan_choices(), t("input.mode.goal"))
+
+
 def plan_options_width() -> int:
     return (
-        max(display_width(label) for label in plan_choices())
+        max(display_width(label) for label in mode_choices())
         + (OPTION_HORIZONTAL_PADDING * 2)
         + OPTION_CONTENT_GUTTER
     )
@@ -182,6 +187,40 @@ class BottomHalfRowSpacer(Static):
             style=Style(
                 color=colour.hex if colour else SURFACE_BACKGROUND,
                 bgcolor=bg.hex if bg else PAGE_BACKGROUND,
+            ),
+        )
+
+
+class RowRule(Static):
+    """A 1-cell-high divider drawn with box-drawing characters.
+
+    Follows the same pattern as the spacers above: the glyph is repeated to the
+    measured width so the rule spans its container without depending on CSS
+    borders, which this layout does not use anywhere else.
+    """
+
+    DEFAULT_CSS = render_css(
+        """
+    RowRule {
+        width: 100%;
+        height: 1;
+        background: $SURFACE_BACKGROUND;
+        color: $TEXT_MUTED;
+    }
+    """
+    )
+
+    def render(self):
+        width = self.size.width
+        if width <= 0:
+            return ""
+        colour = self.styles.color
+        bg = self.styles.background
+        return Text(
+            "\u2500" * width,
+            style=Style(
+                color=colour.hex if colour else TEXT_MUTED,
+                bgcolor=bg.hex if bg else SURFACE_BACKGROUND,
             ),
         )
 
@@ -628,7 +667,98 @@ class MessageTextArea(TextArea):
                         cell_length=width,
                     )
             return Strip([Segment(padded_hint, placeholder_style)], cell_length=width)
-        return super().render_line(y)
+        strip = super().render_line(y)
+        return self._apply_reference_background(strip, y)
+
+    def _apply_reference_background(self, strip: Strip, y: int) -> Strip:
+        if not self._input_references:
+            return strip
+        wrapped_document = self.wrapped_document
+        y_offset = y + self.scroll_offset.y
+        if y_offset < 0 or y_offset >= wrapped_document.height:
+            return strip
+        try:
+            line_info = wrapped_document._offset_to_line_info[y_offset]
+        except IndexError:
+            return strip
+        if line_info is None:
+            return strip
+        line_index, section_offset = line_info
+        document_line = self.document.get_line(line_index)
+        line_start = self._location_to_offset((line_index, 0))
+        wrap_offsets = wrapped_document.get_offsets(line_index)
+        section_start = wrap_offsets[section_offset - 1] if section_offset else 0
+        section_end = (
+            wrap_offsets[section_offset]
+            if section_offset < len(wrap_offsets)
+            else len(document_line)
+        )
+        section_text = document_line[section_start:section_end]
+        gutter_width = self.gutter_width
+        scroll_x = 0 if self.soft_wrap else self.scroll_offset.x
+        result = strip
+        for reference in self._input_references:
+            reference_start = reference.start - line_start
+            reference_end = reference.end - line_start
+            overlap_start = max(reference_start, section_start)
+            overlap_end = min(reference_end, section_end)
+            if overlap_start >= overlap_end:
+                continue
+            local_start = overlap_start - section_start
+            local_end = overlap_end - section_start
+            start_cell = (
+                gutter_width
+                + cell_len(section_text[:local_start])
+                - scroll_x
+            )
+            end_cell = (
+                gutter_width
+                + cell_len(section_text[:local_end])
+                - scroll_x
+            )
+            result = self._style_reference_cells(result, start_cell, end_cell)
+        return result
+
+    @staticmethod
+    def _style_reference_cells(strip: Strip, start: int, end: int) -> Strip:
+        start = max(0, min(int(start), strip.cell_length))
+        end = max(start, min(int(end), strip.cell_length))
+        if start >= end:
+            return strip
+        result = []
+        cursor = 0
+        reference_style = Style(color=TEXT_PRIMARY, bgcolor=REFERENCE_BACKGROUND)
+        for segment in strip._segments:
+            width = cell_len(segment.text)
+            segment_start = cursor
+            segment_end = cursor + width
+            cursor = segment_end
+            if not segment.text or segment_end <= start or segment_start >= end:
+                result.append(segment)
+                continue
+            local_start = max(0, start - segment_start)
+            local_end = min(width, end - segment_start)
+            pieces = []
+            target = segment
+            if local_start:
+                left, target = target.split_cells(local_start)
+                pieces.append(left)
+            target_width = local_end - local_start
+            if target_width < cell_len(target.text):
+                target, right = target.split_cells(target_width)
+            else:
+                right = Segment("", target.style, target.control)
+            current_style = target.style or Style()
+            background = current_style.bgcolor
+            if background is None or SURFACE_BACKGROUND in str(background):
+                target = Segment(
+                    target.text, current_style + reference_style, target.control
+                )
+            pieces.append(target)
+            if right.text:
+                pieces.append(right)
+            result.extend(pieces)
+        return Strip(result, strip.cell_length).simplify()
 
 
 class ChatInput(Widget):
@@ -681,6 +811,125 @@ class ChatInput(Widget):
         padding: 1 1 0 1;
     }
 
+    /* The Goal bar sits tight against the page above it: half a row. Textual
+       padding is whole rows only, so #input-area drops its own top padding and
+       the lower-half block glyph supplies the half cell. Without the Goal bar
+       the first strip keeps #input-area's full row instead. */
+    #input-top-gap {
+        display: none;
+        width: 100%;
+        color: $SURFACE_BACKGROUND;
+        background: $PAGE_BACKGROUND;
+    }
+    ChatInput.half-top-gap #input-top-gap {
+        display: block;
+    }
+    ChatInput.half-top-gap > #input-area {
+        padding: 0 1 0 1;
+    }
+    #goal-bar {
+        display: none;
+        width: 100%;
+        height: 1;
+        min-height: 1;
+        margin: 0 0 1 0;
+        padding: 0 0 0 1;
+        background: $SURFACE_BACKGROUND;
+        align-vertical: middle;
+    }
+    #goal-bar.visible {
+        display: block;
+    }
+    #goal-status {
+        width: auto;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        padding: 0 1 0 0;
+        content-align: left middle;
+    }
+    #goal-title {
+        width: 1fr;
+        min-width: 0;
+        height: 1;
+        color: $TEXT_MUTED;
+        background: transparent;
+        border: none;
+        padding: 0;
+        text-align: left;
+        content-align: left middle;
+    }
+    #goal-title:hover,
+    #goal-title:focus,
+    #goal-title.-active {
+        color: $TEXT_MUTED;
+        background: transparent;
+        border: none;
+        text-style: none;
+        tint: transparent;
+    }
+    #goal-title-input {
+        display: none;
+        width: 1fr;
+        min-width: 0;
+        height: 1;
+        border: none;
+        padding: 0;
+        color: $TEXT_PRIMARY;
+        background: transparent;
+    }
+    /* Editing must not tint the bar: Textual's Input adds a focus
+       background-tint on top of the background colour. */
+    #goal-title-input:focus {
+        background: transparent;
+        background-tint: transparent;
+        border: none;
+    }
+    #goal-title-input.visible {
+        display: block;
+    }
+    #goal-elapsed {
+        width: auto;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        padding: 0 1;
+        content-align: right middle;
+    }
+    #goal-toggle,
+    #goal-close {
+        width: 3;
+        min-width: 3;
+        height: 1;
+        color: $TEXT_PRIMARY;
+        background: transparent;
+        border: none;
+        padding: 0;
+        text-align: center;
+        content-align: center middle;
+    }
+    #goal-toggle:hover,
+    #goal-close:hover {
+        color: $TEXT_PRIMARY;
+        background: $INFO_BAR_BACKGROUND;
+        border: none;
+    }
+    /* Keep the pressed/focused state flat: Textual's default Button.-active
+       adds a light tint that reads as a white flash on this bar. */
+    #goal-toggle:focus,
+    #goal-toggle.-active,
+    #goal-close:focus,
+    #goal-close.-active {
+        color: $TEXT_PRIMARY;
+        background: transparent;
+        border: none;
+        tint: transparent;
+        text-style: none;
+    }
+    #goal-toggle.-active:hover,
+    #goal-close.-active:hover {
+        background: $INFO_BAR_BACKGROUND;
+        tint: transparent;
+    }
+
     #prompt-shell {
         display: none;
         width: 100%;
@@ -728,31 +977,35 @@ class ChatInput(Widget):
         background: $SURFACE_BACKGROUND;
     }
 
+    /* Inside #input-area now, which already supplies the surface's horizontal
+       padding, so this shell adds none of its own. A full row below keeps the
+       queue from crowding the composer. */
     #pending-shell {
         display: none;
         width: 100%;
         height: auto;
-        margin: 0;
+        margin: 0 0 1 0;
         background: $SURFACE_BACKGROUND;
-        padding: 0 1 0 1;
-    }
-    #pending-top-gap {
-        display: none;
-        color: $SURFACE_BACKGROUND;
-        background: $PAGE_BACKGROUND;
-    }
-    ChatInput.todo-visible #pending-top-gap {
-        color: $SURFACE_BACKGROUND;
-    }
-    #pending-top-gap.visible {
-        display: block;
+        padding: 0;
     }
     #pending-shell.visible {
         display: block;
     }
-    ChatInput.prompt-mode #pending-top-gap,
     ChatInput.prompt-mode #pending-shell {
         display: none;
+    }
+    /* The rule takes the row that used to separate the Goal bar from the queue,
+       so the two strips read as one block. Shown only while both are visible;
+       with both up, the Goal bar's bottom margin moves into this row so the
+       divider exactly replaces the old blank line. */
+    #goal-pending-rule {
+        display: none;
+    }
+    ChatInput.goal-queue #goal-pending-rule {
+        display: block;
+    }
+    ChatInput.goal-queue #goal-bar {
+        margin: 0;
     }
     #pending-list {
         width: 100%;
@@ -1130,6 +1383,10 @@ class ChatInput(Widget):
     #plan-opt-build {
         color: $BUILD_MODE;
     }
+    #plan-trigger.mode-goal,
+    #plan-opt-goal {
+        color: $GOAL_MODE;
+    }
     #approval-trigger.level-approve,
     #approval-approve {
         color: $APPROVE_FOR_ME;
@@ -1148,6 +1405,7 @@ class ChatInput(Widget):
     )
 
     plan_mode = reactive(True)
+    goal_mode = reactive(False)
     chat_active = reactive(False)
     project_selected = reactive(False)
     allow_model_change = reactive(True)
@@ -1191,6 +1449,8 @@ class ChatInput(Widget):
         self._chat_busy = False
         self._suggested_input = ""
         self._input_revision = 0
+        self._goal_data: dict[str, object] = {}
+        self._goal_elapsed_timer = None
 
     class Send(Message):
         def __init__(self, content: str, display_content: str | None = None) -> None:
@@ -1228,6 +1488,22 @@ class ChatInput(Widget):
             super().__init__()
             self.enabled = enabled
 
+    class GoalModeChanged(Message):
+        def __init__(self, enabled: bool) -> None:
+            super().__init__()
+            self.enabled = bool(enabled)
+
+    class GoalTitleChanged(Message):
+        def __init__(self, description: str) -> None:
+            super().__init__()
+            self.description = str(description or "").strip()
+
+    class GoalToggleRequested(Message):
+        pass
+
+    class GoalCloseRequested(Message):
+        pass
+
     class ApprovalChanged(Message):
         def __init__(self, label: str, value: str) -> None:
             super().__init__()
@@ -1253,6 +1529,13 @@ class ChatInput(Widget):
         self._fit_trigger_to_label("plan")
         self._set_approval_level(self.selected_approval_value)
         self._update_plan_build()
+        # Textual's CSS parser rejects `line-pad: 0`, but Button's default
+        # line-pad of 1 would add a leading cell that the Input-based title
+        # editor does not have. Drop it here so the label keeps the same left
+        # offset before and after the title is confirmed.
+        self.query_one("#goal-title", Button).styles.line_pad = 0
+        self._refresh_goal_bar()
+        self._goal_elapsed_timer = self.set_interval(1.0, self._refresh_goal_elapsed)
         if os.name == "nt":
             self._modifier_timer = self.set_interval(0.02, self._sample_modifier_keys)
         self.call_after_refresh(self._update_input_height)
@@ -1261,15 +1544,32 @@ class ChatInput(Widget):
     def on_unmount(self) -> None:
         if self._modifier_timer is not None:
             self._modifier_timer.pause()
+        if self._goal_elapsed_timer is not None:
+            self._goal_elapsed_timer.pause()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="command-menu-shell"):
             yield BottomHalfRowSpacer(id="command-menu-top-edge")
             yield VerticalScroll(id="command-menu")
-        yield BottomHalfRowSpacer(id="pending-top-gap")
-        with Horizontal(id="pending-shell"):
-            yield Vertical(id="pending-list")
+        # Sibling of #input-area, not a child: the surface has one cell of
+        # horizontal padding, which would inset the half-row glyph and leave a
+        # full-height gap at the left and right edges.
+        yield BottomHalfRowSpacer(id="input-top-gap")
         with Vertical(id="input-area"):
+            with Horizontal(id="goal-bar"):
+                yield Static("", id="goal-status")
+                yield Button(t("input.goal.placeholder"), id="goal-title")
+                yield Input("", id="goal-title-input")
+                yield Static("0s", id="goal-elapsed")
+                yield Button("Ⅱ", id="goal-toggle")
+                yield Button("×", id="goal-close")
+            # The rule occupies the row that used to separate the Goal bar from
+            # the queue, so the two strips read as one block.
+            yield RowRule(id="goal-pending-rule")
+            # The queue belongs inside the same surface, below the Goal bar.
+            # #pending-shell supplies the one clear row above and below it.
+            with Horizontal(id="pending-shell"):
+                yield Vertical(id="pending-list")
             with Vertical(id="prompt-shell"):
                 yield BottomHalfRowSpacer(id="prompt-top-edge")
                 yield Static("", id="prompt-progress")
@@ -1287,12 +1587,13 @@ class ChatInput(Widget):
             with Horizontal(id="controls-row"):
                 yield Button("+", id="add-reference")
                 # Plan/Build toggle dropdown
-                plan_label, build_label = plan_choices()
+                plan_label, build_label, goal_label = mode_choices()
                 with Container(id="plan-drop"):
                     yield Button(plan_label, id="plan-trigger")
                     with Container(id="plan-options"):
                         yield Button(plan_label, id="plan-opt-plan")
                         yield Button(build_label, id="plan-opt-build")
+                        yield Button(goal_label, id="plan-opt-goal")
 
                 # Approval dropdown
                 with Container(id="approval-drop"):
@@ -1317,6 +1618,14 @@ class ChatInput(Widget):
             self._request_direct_send_for_message(event.button.message_id)
         elif isinstance(event.button, PendingDeleteButton):
             self._remove_pending_message(event.button.message_id)
+        elif btn_id == "goal-title":
+            # Editable while the Goal runs: renaming a Goal is a bar-local edit
+            # that does not touch the running turn.
+            self._start_goal_title_edit()
+        elif btn_id == "goal-toggle":
+            self.post_message(self.GoalToggleRequested())
+        elif btn_id == "goal-close":
+            self.post_message(self.GoalCloseRequested())
         elif btn_id == "add-reference":
             if not self.controls_locked and not self.prompt_active:
                 self.post_message(self.ReferenceRequested())
@@ -1328,6 +1637,10 @@ class ChatInput(Widget):
             if self.controls_locked:
                 return
             self._set_plan_mode(False)
+        elif btn_id == "plan-opt-goal":
+            if self.controls_locked:
+                return
+            self._set_goal_mode(True)
 
         elif btn_id == "plan-trigger":
             if self.controls_locked:
@@ -1408,6 +1721,8 @@ class ChatInput(Widget):
         event.stop()
 
     def _set_plan_mode(self, plan: bool) -> None:
+        was_goal = self.goal_mode
+        self.goal_mode = False
         self.plan_mode = plan
         plan_label, build_label = plan_choices()
         trigger = self.query_one("#plan-trigger", Button)
@@ -1417,7 +1732,19 @@ class ChatInput(Widget):
         trigger.add_class("mode-plan" if plan else "mode-build")
         self._fit_trigger_to_label("plan")
         self._close_all_dropdowns()
+        if was_goal:
+            self.post_message(self.GoalModeChanged(False))
         self.post_message(self.PlanModeChanged(plan))
+
+    def _set_goal_mode(self, enabled: bool, *, notify: bool = True) -> None:
+        self.goal_mode = bool(enabled)
+        self._update_plan_build()
+        self._close_all_dropdowns()
+        if notify:
+            self.post_message(self.GoalModeChanged(enabled))
+
+    def set_goal_mode(self, enabled: bool) -> None:
+        self._set_goal_mode(enabled, notify=False)
 
     def _set_options_width(self, prefix: str, width: int) -> None:
         options = self.query_one(f"#{prefix}-options", Container)
@@ -1561,6 +1888,10 @@ class ChatInput(Widget):
     def watch_plan_mode(self, value: bool) -> None:
         self._update_plan_build()
 
+    def watch_goal_mode(self, value: bool) -> None:
+        self._update_plan_build()
+        self._refresh_goal_bar()
+
     def _update_plan_build(self) -> None:
         try:
             plan_drop = self.query_one("#plan-drop", Container)
@@ -1574,20 +1905,171 @@ class ChatInput(Widget):
                 self._close_all_dropdowns()
                 self._fit_trigger_to_label("plan")
                 return
-            plan_label, build_label = plan_choices()
-            if self.plan_mode:
+            plan_label, build_label, goal_label = mode_choices()
+            trigger.remove_class("mode-plan")
+            trigger.remove_class("mode-build")
+            trigger.remove_class("mode-goal")
+            if self.goal_mode:
+                trigger.label = goal_label
+                trigger.add_class("mode-goal")
+                # Goal is the persistent parent layer; keep approval visible
+                # so Build permissions remain configurable for its execution phase.
+                approval.remove_class("hidden")
+            elif self.plan_mode:
                 trigger.label = plan_label
-                trigger.remove_class("mode-build")
                 trigger.add_class("mode-plan")
                 approval.add_class("hidden")
             else:
                 trigger.label = build_label
-                trigger.remove_class("mode-plan")
                 trigger.add_class("mode-build")
                 approval.remove_class("hidden")
             self._fit_trigger_to_label("plan")
         except Exception:
             pass
+
+    def set_goal_state(self, goal_data: dict | None) -> None:
+        # The bar follows the Goal, not the mode: passing None (or a finished
+        # Goal) hides it. Goal mode itself is left untouched, since selecting the
+        # mode only declares that the next message defines a Goal.
+        self._goal_data = dict(goal_data or {})
+        self._refresh_goal_bar()
+
+    def _start_goal_title_edit(self) -> None:
+        if not self.is_mounted:
+            return
+        title = self.query_one("#goal-title", Button)
+        editor = self.query_one("#goal-title-input", Input)
+        editor.value = str(
+            self._goal_data.get("description") or t("input.goal.placeholder")
+        )
+        title.display = False
+        editor.add_class("visible")
+        editor.focus()
+        editor.action_end()
+
+    def _reset_goal_title_edit(self) -> None:
+        if not self.is_mounted:
+            return
+        self.query_one("#goal-title-input", Input).remove_class("visible")
+        self.query_one("#goal-title", Button).display = True
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "goal-title-input":
+            return
+        description = str(event.value or "").strip()
+        editor = event.input
+        editor.remove_class("visible")
+        self.query_one("#goal-title", Button).display = True
+        if description:
+            self._goal_data["description"] = description
+            self.post_message(self.GoalTitleChanged(description))
+        self._refresh_goal_bar()
+        self._message_input().focus()
+        event.stop()
+
+    def _goal_elapsed_seconds(self) -> float:
+        elapsed = max(0.0, float(self._goal_data.get("elapsed_seconds", 0.0) or 0.0))
+        status = str(self._goal_data.get("status") or "active")
+        started_at = str(self._goal_data.get("run_started_at") or "")
+        if status == "active" and started_at:
+            try:
+                elapsed += max(
+                    0.0,
+                    (datetime.now() - datetime.fromisoformat(started_at)).total_seconds(),
+                )
+            except (TypeError, ValueError):
+                pass
+        return elapsed
+
+    @staticmethod
+    def _format_goal_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds or 0))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h{minutes}m{secs}s"
+        if minutes:
+            return f"{minutes}m{secs}s"
+        return f"{secs}s"
+
+    def _refresh_goal_elapsed(self) -> None:
+        # Tied to the bar, not the mode: an active Goal keeps its elapsed time
+        # ticking even when the underlying mode selector shows Plan or Build.
+        if not self.is_mounted or not self._goal_data.get("description"):
+            return
+        try:
+            self.query_one("#goal-elapsed", Static).update(
+                self._format_goal_elapsed(self._goal_elapsed_seconds())
+            )
+        except Exception:
+            return
+
+    def _goal_bar_preempted(self) -> bool:
+        """Whether another element currently replaces the Goal bar.
+
+        The pending-message queue is not one of them: it renders below the Goal
+        bar inside the same surface, so both can be visible at once.
+        """
+        if self.prompt_active:
+            return True
+        return self._is_command_menu_open()
+
+    def _update_input_top_gap(self, *, goal_visible: bool) -> None:
+        """Give the Goal bar a half-row gap above it; everything else a full row.
+
+        The Goal bar reads as a header for the input block, so it sits tight
+        against the page above. Any other first strip -- the queue on its own, or
+        the bare composer -- keeps #input-area's own full row of top padding.
+        """
+        self.set_class(goal_visible, "half-top-gap")
+
+    def _refresh_goal_bar(self) -> None:
+        if not self.is_mounted:
+            return
+        bar = self.query_one("#goal-bar", Horizontal)
+        # The bar tracks the Goal itself, not the mode. Selecting Goal mode only
+        # means "the next message defines a Goal", so there is nothing to show
+        # until a Goal exists, and a finished or closed Goal hides the bar again.
+        status = str(self._goal_data.get("status") or "")
+        terminal = status in {"completed", "failed", "cancelled"}
+        has_goal = bool(self._goal_data.get("description")) and not terminal
+        show_bar = has_goal and not self._goal_bar_preempted()
+        if not has_goal:
+            self._reset_goal_title_edit()
+        self.set_class(show_bar, "goal-visible")
+        self._update_input_top_gap(goal_visible=show_bar)
+        # The divider between the Goal bar and the queue is driven here too so
+        # that every transition (including hiding the Goal) settles it.
+        pending_visible = self.query_one("#pending-shell", Horizontal).has_class(
+            "visible"
+        )
+        self.set_class(show_bar and pending_visible, "goal-queue")
+        if not show_bar:
+            bar.remove_class("visible")
+            return
+        bar.add_class("visible")
+        paused = status in {"paused", "blocked"}
+        if status == "blocked":
+            status_text = t("input.goal.blocked")
+        elif paused:
+            status_text = t("input.goal.paused")
+        else:
+            status_text = t("input.goal.active")
+        self.query_one("#goal-status", Static).update(status_text)
+        title = self.query_one("#goal-title", Button)
+        # The single cell between the status and the Goal text comes from
+        # #goal-status's right padding alone. Button's own line-pad would add a
+        # second one, and CSS cannot express `line-pad: 0`, so re-assert it here:
+        # this runs on every refresh, so no relabel or language switch can lose it.
+        title.styles.line_pad = 0
+        title.label = str(
+            self._goal_data.get("description") or t("input.goal.placeholder")
+        )
+        toggle = self.query_one("#goal-toggle", Button)
+        toggle.label = "▶" if paused else "Ⅱ"
+        toggle.disabled = False
+        self.query_one("#goal-close", Button).disabled = False
+        self._refresh_goal_elapsed()
 
     def set_model_options(self, options, selected_value="", groups=None):
         self.model_options = [
@@ -1664,6 +2146,10 @@ class ChatInput(Widget):
         if self.controls_locked:
             self._close_all_dropdowns()
             self._hide_command_menu()
+        # The Goal title stays enabled while a turn runs. Textual dims disabled
+        # widgets with text-opacity 0.6, which read as a second, lighter grey,
+        # and renaming a Goal is metadata-only: it never touches the running
+        # turn's history or tools.
 
     def relabel_for_language(self) -> None:
         """Re-resolve every label this widget cached at compose time.
@@ -1686,6 +2172,7 @@ class ChatInput(Widget):
         # trigger without posting PlanModeChanged, which _set_plan_mode would.
         self._set_options_width("plan", plan_options_width())
         self._update_plan_build()
+        self._refresh_goal_bar()
         self._set_approval_level(self.selected_approval_value)
         self._visible_command_suggestions = command_suggestions()
         self._ensure_command_rows()
@@ -1784,6 +2271,7 @@ class ChatInput(Widget):
 
     def _show_command_menu(self) -> None:
         self.query_one("#command-menu-shell", Vertical).add_class("open")
+        self._refresh_goal_bar()
 
     def _hide_command_menu(self) -> None:
         if not self.is_mounted:
@@ -1791,6 +2279,7 @@ class ChatInput(Widget):
         self.query_one("#command-menu-shell", Vertical).remove_class("open")
         menu = self.query_one("#command-menu", VerticalScroll)
         menu.scroll_to(y=0, animate=False)
+        self._refresh_goal_bar()
 
     def _is_command_menu_open(self) -> bool:
         if not self.is_mounted:
@@ -2059,18 +2548,22 @@ class ChatInput(Widget):
     def _update_pending_shell(self) -> None:
         if not self.is_mounted:
             return
-        top_gap = self.query_one("#pending-top-gap", BottomHalfRowSpacer)
         shell = self.query_one("#pending-shell", Horizontal)
         show_shell = bool(self._pending_messages) and not self.prompt_active
         if show_shell:
-            top_gap.add_class("visible")
             shell.add_class("visible")
         else:
-            top_gap.remove_class("visible")
             shell.remove_class("visible")
             self._editing_pending_message_id = None
+        # The divider and its margin swap live in _refresh_goal_bar, which this
+        # method re-enters below, so they settle even when only the queue toggles.
         self._rebuild_pending_list()
         self._update_direct_send_button_state()
+        # The queue sits below the Goal bar in the same surface, so the two can
+        # coexist. Re-resolve the Goal bar from here anyway: the inline prompt
+        # still hides both, and every prompt transition funnels through this call.
+        # _refresh_goal_bar() settles the shared top gap for both strips.
+        self._refresh_goal_bar()
 
     def set_todo_visible(self, visible: bool) -> None:
         self.set_class(bool(visible), "todo-visible")

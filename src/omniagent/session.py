@@ -23,7 +23,7 @@ PINNED_INDEX_FILE = SESSIONS_DIR / "pinned.json"
 PINNED_PROJECT_INDEX_FILE = SESSIONS_DIR / "pinned_projects.json"
 PROJECTS_DIR = SESSIONS_DIR / "projects"
 ORPHAN_SESSIONS_DIR = SESSIONS_DIR / "orphan"
-SESSION_VERSION = "5.1.0"
+SESSION_VERSION = "5.2.0"
 SESSION_TITLE_STATE_MANUAL = "manual"
 SESSION_TITLE_STATE_TEMPORARY = "temporary"
 SESSION_TITLE_STATE_GENERATED = "generated"
@@ -427,6 +427,7 @@ def create_session(project=None, title="", model_name=""):
         "project": project.to_dict() if isinstance(project, ProjectRecord) else None,
         "conversation": [],
         "usage_history": [],
+        "goal": None,
         "history_path": str(paths["history"]),
         "session_path": str(paths["session"]),
     }

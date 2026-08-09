@@ -732,6 +732,15 @@ class SettingsModal(ModalScreen[None]):
         margin: 0;
     }
 
+    /* Fetched provider/model lists can be very large. Keep the picker within
+       the settings viewport while allowing wheel, keyboard, and scrollbar
+       navigation through every option. */
+    .settings-autocomplete-options {
+        max-height: 12;
+        overflow-y: auto;
+        scrollbar-size: 0 0;
+    }
+
     #settings-model-panel {
         width: 100%;
         height: auto;

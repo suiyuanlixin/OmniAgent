@@ -57,6 +57,20 @@ from .config import (
     normalize_reasoning_effort_for_api,
 )
 from .memory import MemoryStore, parse_memory_update_response
+from .goals import (
+    GOAL_PHASE_BUILDING,
+    GOAL_PHASE_PLANNING,
+    GOAL_PHASE_VERIFYING,
+    GOAL_STATUS_ACTIVE,
+    GOAL_STATUS_BLOCKED,
+    GOAL_STATUS_COMPLETED,
+    GOAL_STATUS_FAILED,
+    GOAL_STATUS_PAUSED,
+    GOAL_UPDATE_TOOL_DEFINITION,
+    GOAL_UPDATE_TOOL_NAME,
+    Goal,
+    GoalRunner,
+)
 from .paths import APP_HOME
 from .orchestration import NormalToolCoordinator, NormalTurn
 from .tools import (
@@ -336,6 +350,10 @@ class OmniAgent:
         self.session_episodic_heading = ""
         self.session_memory_generation = 0
         self.conversation_history = []
+        self.goal: Goal | None = None
+        self.goal_runner: GoalRunner | None = None
+        self.goal_updated_this_turn = False
+        self.goal_checkpoint_requested = False
         self.client = None
         self.thinking_mode = thinking_mode
         self.reasoning_effort = normalize_reasoning_effort_for_api(
@@ -388,6 +406,7 @@ class OmniAgent:
         self.agent_round_limit = self.max_agent_rounds
         self.agent_plan_rejected = False
         self.agent_final_check_done = False
+        self.agent_final_check_passed = False
         self.agent_plan_check_signature = None
         self.agent_plan_check_exit_note = ""
         self.agent_context_warning_sent = False
@@ -613,6 +632,7 @@ class OmniAgent:
         changed = self.agent_tools.plan_mode != enabled
         self.agent_tools.set_plan_mode(enabled)
         self.agent_final_check_done = False
+        self.agent_final_check_passed = False
         if changed and notify and self.plan_mode_changed_callback is not None:
             self.plan_mode_changed_callback(enabled)
 
@@ -695,6 +715,31 @@ class OmniAgent:
         if not self.agent_tools.enabled:
             self.agent_mode = False
 
+    def set_goal(self, goal=None, *, on_change=None):
+        if goal is None:
+            self.goal = None
+            self.goal_runner = None
+            return None
+        self.goal = goal if isinstance(goal, Goal) else Goal.from_dict(goal)
+        if self.goal is None:
+            self.goal_runner = None
+            return None
+        self.goal_runner = GoalRunner(
+            self.goal,
+            on_change=on_change,
+            completion_validator=self._validate_goal_completion,
+        )
+        return self.goal
+
+    def get_goal(self):
+        return self.goal
+
+    def clear_goal(self):
+        self.set_goal(None)
+
+    def goal_status(self):
+        return self.goal.to_dict() if self.goal is not None else None
+
     def set_agent_mode(self, enabled):
         self.agent_mode = bool(enabled and self.agent_tools.enabled)
         if not self.agent_mode:
@@ -769,6 +814,7 @@ class OmniAgent:
         changed = self.agent_tools.retry_todo(todo_id, reason)
         if changed:
             self.agent_final_check_done = False
+            self.agent_final_check_passed = False
             self.resume_existing_plan = True
         return changed
 
@@ -776,6 +822,7 @@ class OmniAgent:
         changed = self.agent_tools.unblock_todo(todo_id, reason)
         if changed:
             self.agent_final_check_done = False
+            self.agent_final_check_passed = False
             self.resume_existing_plan = True
         return changed
 
@@ -796,6 +843,10 @@ class OmniAgent:
     ):
         self.agent_tools.set_reference_files(reference_files)
         self.agent_tools.set_reference_folders(reference_folders)
+        self.goal_updated_this_turn = False
+        self.goal_checkpoint_requested = False
+        if self.goal_runner is not None:
+            self.goal_runner.begin_turn(phase=self._goal_phase())
         user_content = self._user_message_content(user_message, media_references)
         self.conversation_history.append({"role": "user", "content": user_content})
         self._record_preference_signal(user_message)
@@ -863,6 +914,22 @@ class OmniAgent:
                 self._compact_agent_history(user_message_index, response)
             if response and not response.get("agent_stopped"):
                 self._auto_compact_context()
+            if self.goal_runner is not None:
+                marker = GoalRunner.parse_marker(
+                    response.get("response", "") if response else ""
+                )
+                if not self.goal_updated_this_turn:
+                    self.goal_runner.observe_response(response, agent=self)
+                if response:
+                    response = dict(response)
+                    response["goal_updated"] = bool(
+                        self.goal_updated_this_turn or marker
+                    )
+                    response["goal_marker"] = bool(marker)
+                    response["response"] = self.goal_runner.strip_marker(
+                        response.get("response", "")
+                    )
+                    response["goal"] = self.goal.to_dict() if self.goal else None
             return response
 
         except KeyboardInterrupt:
@@ -883,7 +950,15 @@ class OmniAgent:
             if self.agent_running:
                 self._separate_after_agent_thinking()
             print_error(f"Request error: {error}")
-            return None
+            if self.goal_runner is not None:
+                self.goal_runner.pause_for_error(error)
+            return {
+                "thinking": "",
+                "response": "",
+                "request_error": True,
+                "error": str(error),
+                "goal": self.goal.to_dict() if self.goal is not None else None,
+            }
         finally:
             self.agent_tools.clear_reference_files()
             self.agent_tools.clear_reference_folders()
@@ -981,6 +1056,7 @@ class OmniAgent:
         self.agent_round_limit = self.max_agent_rounds
         self.agent_plan_rejected = False
         self.agent_final_check_done = False
+        self.agent_final_check_passed = False
         self.agent_plan_check_signature = None
         self.agent_plan_check_exit_note = ""
         self.agent_context_warning_sent = False
@@ -1055,6 +1131,9 @@ class OmniAgent:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                if self._append_goal_checkpoint_if_needed():
+                    final_response = ""
+                    continue
                 final_response = self._agent_response_with_plan_exit_note(
                     final_response
                 )
@@ -1066,6 +1145,7 @@ class OmniAgent:
                     self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
+            tool_uses = self._goal_tool_calls_last(tool_uses)
             if self._agent_tool_budget_exceeded(tool_uses):
                 message = self._agent_tool_budget_message()
                 tool_results = []
@@ -1090,10 +1170,11 @@ class OmniAgent:
                 })
                 self._separate_after_agent_thinking()
                 print_error(message)
-                return {
-                    "thinking": full_thinking,
-                    "response": final_response or message,
-                }
+                return self._agent_boundary_response(
+                    full_thinking,
+                    final_response,
+                    message,
+                )
 
             tool_results = []
             for tool_use in tool_uses:
@@ -1120,7 +1201,7 @@ class OmniAgent:
         message = f"Agent loop stopped after {self.agent_round_limit} tool rounds."
         self._separate_after_agent_thinking()
         print_error(message)
-        return {"thinking": full_thinking, "response": final_response or message}
+        return self._agent_boundary_response(full_thinking, final_response, message)
 
     def _stream_chat_completion_agent_turn(self):
         kwargs = self._chat_completion_kwargs(
@@ -1249,6 +1330,9 @@ class OmniAgent:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                if self._append_goal_checkpoint_if_needed():
+                    final_response = ""
+                    continue
                 final_response = self._agent_response_with_plan_exit_note(
                     final_response
                 )
@@ -1260,6 +1344,7 @@ class OmniAgent:
                     self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
+            tool_calls = self._goal_tool_calls_last(tool_calls)
             if self._agent_tool_budget_exceeded(tool_calls):
                 message = self._agent_tool_budget_message()
                 for tool_call in tool_calls:
@@ -1279,10 +1364,11 @@ class OmniAgent:
                     )
                 self._separate_after_agent_thinking()
                 print_error(message)
-                return {
-                    "thinking": full_thinking,
-                    "response": final_response or message,
-                }
+                return self._agent_boundary_response(
+                    full_thinking,
+                    final_response,
+                    message,
+                )
 
             for tool_call in tool_calls:
                 if self._agent_should_stop():
@@ -1303,7 +1389,7 @@ class OmniAgent:
         message = f"Agent loop stopped after {self.agent_round_limit} tool rounds."
         self._separate_after_agent_thinking()
         print_error(message)
-        return {"thinking": full_thinking, "response": final_response or message}
+        return self._agent_boundary_response(full_thinking, final_response, message)
 
     def _normal_web_search_response(
         self,
@@ -2522,6 +2608,7 @@ class OmniAgent:
                     self.agent_tools.skills_available,
                     self.agent_tools.todos_enabled,
                     extra_definitions=self.agent_tools.plan_tool_definitions()
+                    + self._goal_tool_definitions()
                     + self.agent_tools.subagent_tool_definitions()
                     + self.agent_tools.team_tool_definitions(),
                     plan_mode=self.agent_tools.plan_mode,
@@ -2617,6 +2704,9 @@ class OmniAgent:
                 if self._append_agent_final_check_if_needed():
                     final_response = ""
                     continue
+                if self._append_goal_checkpoint_if_needed():
+                    final_response = ""
+                    continue
                 final_response = self._agent_response_with_plan_exit_note(
                     final_response
                 )
@@ -2628,6 +2718,7 @@ class OmniAgent:
                     self._stream_agent_response_text(final_response, pseudo=True)
                 return {"thinking": full_thinking, "response": final_response}
 
+            tool_calls = self._goal_tool_calls_last(tool_calls)
             if self._agent_tool_budget_exceeded(tool_calls):
                 message = self._agent_tool_budget_message()
                 for tool_call in tool_calls:
@@ -2647,10 +2738,11 @@ class OmniAgent:
 
                 self._separate_after_agent_thinking()
                 print_error(message)
-                return {
-                    "thinking": full_thinking,
-                    "response": final_response or message,
-                }
+                return self._agent_boundary_response(
+                    full_thinking,
+                    final_response,
+                    message,
+                )
 
             for tool_call in tool_calls:
                 if self._agent_should_stop():
@@ -2670,7 +2762,7 @@ class OmniAgent:
         message = f"Agent loop stopped after {self.agent_round_limit} tool rounds."
         self._separate_after_agent_thinking()
         print_error(message)
-        return {"thinking": full_thinking, "response": final_response or message}
+        return self._agent_boundary_response(full_thinking, final_response, message)
 
     def _stream_anthropic_agent_turn(self):
         blocks = []
@@ -2688,6 +2780,7 @@ class OmniAgent:
                 self.agent_tools.skills_available,
                 self.agent_tools.todos_enabled,
                 extra_definitions=self.agent_tools.plan_tool_definitions()
+                + self._goal_tool_definitions()
                 + self.agent_tools.subagent_tool_definitions()
                 + self.agent_tools.team_tool_definitions(),
                 plan_mode=self.agent_tools.plan_mode,
@@ -2788,6 +2881,30 @@ class OmniAgent:
         self._record_context_usage_snapshot(usage_snapshot)
         return blocks, response_streamed
 
+    def _active_goal_requires_continuation(self):
+        return bool(
+            self.goal is not None
+            and self.goal.status == GOAL_STATUS_ACTIVE
+        )
+
+    def _agent_boundary_response(self, thinking, response, message):
+        return {
+            "thinking": thinking,
+            "response": response or message,
+            "goal_continue_required": self._active_goal_requires_continuation(),
+        }
+
+    @staticmethod
+    def _goal_tool_calls_last(tool_calls):
+        calls = list(tool_calls or [])
+        return [
+            call for call in calls
+            if str(call.get("name") or "") != GOAL_UPDATE_TOOL_NAME
+        ] + [
+            call for call in calls
+            if str(call.get("name") or "") == GOAL_UPDATE_TOOL_NAME
+        ]
+
     def _agent_should_stop(self):
         return self.agent_stop_requested
 
@@ -2808,7 +2925,10 @@ class OmniAgent:
         requested_tool_calls = sum(
             1
             for tool_call in list(tool_calls or [])
-            if str(tool_call.get("name") or "") != SUBMIT_PLAN_TOOL_NAME
+            if str(tool_call.get("name") or "") not in {
+                SUBMIT_PLAN_TOOL_NAME,
+                GOAL_UPDATE_TOOL_NAME,
+            }
         )
         return self.agent_tool_calls + requested_tool_calls > self.agent_tool_call_limit
 
@@ -4333,6 +4453,7 @@ class OmniAgent:
         self.agent_final_check_done = True
         check_result = self.agent_tools.final_check()
         verification_passed = self.agent_tools.final_check_passed(check_result)
+        self.agent_final_check_passed = verification_passed
         self.agent_tools.apply_todo_final_verification(
             verification_passed,
             check_result,
@@ -4367,6 +4488,27 @@ class OmniAgent:
         })
         return True
 
+    def _append_goal_checkpoint_if_needed(self):
+        if (
+            self.goal_runner is None
+            or self.goal is None
+            or self.goal.status != GOAL_STATUS_ACTIVE
+            or self.goal_updated_this_turn
+            or self.goal_checkpoint_requested
+        ):
+            return False
+        self.goal_checkpoint_requested = True
+        self.conversation_history.append({
+            "role": "user",
+            "content": (
+                "Before ending this persistent Goal turn, call update_goal with the "
+                "current durable checkpoint. Use active if work should continue automatically, "
+                "blocked if user input or an external condition is required, failed only for an "
+                "unrecoverable failure, or completed only after verified success criteria."
+            ),
+        })
+        return True
+
     def _agent_plan_check_signature(self):
         return (
             self.agent_tools.todo_revision(),
@@ -4393,9 +4535,70 @@ class OmniAgent:
             return note
         return f"{response}\n\n{note}"
 
+    def _validate_goal_completion(self, goal, tool_input):
+        success_criteria = str(
+            tool_input.get("success_criteria") or goal.success_criteria or ""
+        ).strip()
+        verification_report = str(
+            tool_input.get("verification_report") or ""
+        ).strip()
+        if not success_criteria:
+            return "Record explicit success_criteria before completing the Goal."
+        if not verification_report:
+            return "Goal completion requires a verification_report."
+        todo_status = self.agent_tools.todo_status()
+        if todo_status.get("has_incomplete"):
+            return "Goal cannot be completed while todo items remain incomplete."
+        if todo_status.get("has_unverified_completed_criteria"):
+            return (
+                "Goal cannot be completed while todo completion criteria remain unverified."
+            )
+        if self.agent_tools.session_has_changes():
+            if not self.agent_final_check_done:
+                return (
+                    "Goal completion requires the automatic final verification for this run."
+                )
+            if not self.agent_final_check_passed:
+                return "Goal completion requires a passing automatic final verification."
+        if self._has_active_goal_teammates():
+            return (
+                "Goal completion requires all active Team tasks to finish and their "
+                "results to be collected first."
+            )
+        return ""
+
+    def _has_active_goal_teammates(self):
+        with self._team_tasks_lock:
+            return any(
+                str(record.get("status") or "") in ACTIVE_TEAMMATE_STATUSES
+                for record in self._team_tasks.values()
+            )
+
+    def _goal_phase(self):
+        if self.agent_tools.plan_mode:
+            return GOAL_PHASE_PLANNING
+        if self.agent_final_check_done:
+            return GOAL_PHASE_VERIFYING
+        return GOAL_PHASE_BUILDING
+
+    def _execute_goal_update(self, tool_input):
+        if self.goal_runner is None or self.goal is None:
+            return _error_text("No active Goal is available.")
+        try:
+            self.goal_runner.apply_tool_update(
+                tool_input,
+                phase=self._goal_phase(),
+            )
+        except ValueError as error:
+            return _error_text(str(error))
+        self.goal_updated_this_turn = True
+        return json.dumps(self.goal.to_dict(), ensure_ascii=False)
+
     def _execute_agent_tool(self, name, tool_input):
-        if name != SUBMIT_PLAN_TOOL_NAME:
+        if name not in {SUBMIT_PLAN_TOOL_NAME, GOAL_UPDATE_TOOL_NAME}:
             self.agent_tool_calls += 1
+        if name == GOAL_UPDATE_TOOL_NAME:
+            return self._execute_goal_update(tool_input)
         if name == DISPATCH_SUBAGENT_TOOL_NAME:
             self._subagent_dispatch_display = None
             with self._agent_tools_execution_lock:
@@ -4424,6 +4627,7 @@ class OmniAgent:
                     or self.agent_tools.todo_revision() != todo_revision_before
                 ):
                     self.agent_final_check_done = False
+                    self.agent_final_check_passed = False
                 tool_display = self.agent_tools.consume_display_payload()
                 self._last_tool_display = (
                     self._subagent_dispatch_display or tool_display
@@ -4453,6 +4657,7 @@ class OmniAgent:
                     or self.agent_tools.todo_revision() != todo_revision_before
                 ):
                     self.agent_final_check_done = False
+                    self.agent_final_check_passed = False
                 self._last_tool_display = self.agent_tools.consume_display_payload()
         if name == SUBMIT_PLAN_TOOL_NAME:
             decision = self.agent_tools.consume_submitted_plan_approval()
@@ -4769,6 +4974,7 @@ class OmniAgent:
                 self.agent_tools.set_stop_requested_callback(stop_requested_callback)
             try:
                 self.agent_tools.consume_display_payload()
+                change_count_before = self.agent_tools.session_change_count()
                 scope_error = self._write_scope_violation(
                     name, tool_input, actor or {"kind": "delegated", "name": "Worker"}
                 )
@@ -4777,6 +4983,9 @@ class OmniAgent:
                 result = self.agent_tools.execute(
                     name, tool_input, allow_subagent_hint=False
                 )
+                if self.agent_tools.session_change_count() > change_count_before:
+                    self.agent_final_check_done = False
+                    self.agent_final_check_passed = False
                 display = self.agent_tools.consume_display_payload()
                 self.agent_tools.consume_output_separator()
                 return result, display
@@ -6101,6 +6310,12 @@ class OmniAgent:
 
     def _agent_system_prompt(self):
         prompt = AGENT_SYSTEM_PROMPT
+        if (
+            self.goal_runner is not None
+            and self.goal is not None
+            and self.goal.status == GOAL_STATUS_ACTIVE
+        ):
+            prompt += self.goal_runner.prompt_context()
         prompt += "\n\n" + AGENT_TODO_RULES
         if self.agent_tools.has_incomplete_todos():
             prompt += (
@@ -6378,6 +6593,15 @@ class OmniAgent:
             kwargs["tools"] = tools
         return kwargs
 
+    def _goal_tool_definitions(self):
+        if (
+            self.goal_runner is None
+            or self.goal is None
+            or self.goal.status != GOAL_STATUS_ACTIVE
+        ):
+            return []
+        return [GOAL_UPDATE_TOOL_DEFINITION]
+
     def _chat_tool_schemas(self):
         include_web_search = self.agent_tools.web_search_available
         include_skills = self.agent_tools.skills_available
@@ -6385,6 +6609,7 @@ class OmniAgent:
         plan_mode = self.agent_tools.plan_mode
         extra_definitions = (
             self.agent_tools.plan_tool_definitions()
+            + self._goal_tool_definitions()
             + self.agent_tools.subagent_tool_definitions()
             + self.agent_tools.team_tool_definitions()
         )
@@ -6832,6 +7057,7 @@ class OmniAgent:
         self.session_episodic_heading = ""
         self.session_memory_generation += 1
         self.clear_todos()
+        self.clear_goal()
         self._clear_context_usage()
 
     @staticmethod

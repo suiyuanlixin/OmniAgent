@@ -118,6 +118,7 @@ _TOOL_LABEL_KEYS = {
     "list_dir": "chat.tool.list_dir",
     "list_skills": "chat.tool.list_skills",
     "update_todo": "chat.tool.update_todo",
+    "update_goal": "chat.tool.update_goal",
     "ask_user": "chat.tool.ask_user",
     "submit_plan": "chat.tool.submit_plan",
     "web_fetch": "chat.tool.web_fetch",
@@ -974,6 +975,8 @@ class ChatView(Widget):
         self._subagent_transcript_indices: dict[str, int] = {}
         self._team_blocks: dict[str, TeamRunBlock] = {}
         self._team_transcript_indices: dict[str, int] = {}
+        self._goal_block: GoalBlock | None = None
+        self._goal_transcript_index: int | None = None
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
@@ -1230,6 +1233,8 @@ class ChatView(Widget):
         self._subagent_transcript_indices.clear()
         self._team_blocks.clear()
         self._team_transcript_indices.clear()
+        self._goal_block = None
+        self._goal_transcript_index = None
 
     def clear_message_selection(self) -> None:
         widgets = [
@@ -1474,6 +1479,30 @@ class ChatView(Widget):
         self._questions_block.add_error(error)
         self._append_tool_error_transcript(tool_name, summary, error)
         self.call_after_refresh(self._scroll_end)
+
+    def add_goal_entry(self, goal: dict) -> None:
+        goal = dict(goal or {})
+        self._activate_aux_output("goal")
+        block = self._goal_block
+        if block is None or block not in self.query_one("#chat-log", VerticalScroll).children:
+            block = GoalBlock(goal)
+            self.query_one("#chat-log", VerticalScroll).mount(block)
+            self._goal_block = block
+            self._append_transcript_entry({"kind": "goal", "goal": deepcopy(goal)})
+            self._goal_transcript_index = len(self._transcript) - 1
+        else:
+            block.set_goal(goal)
+            self._update_transcript_entry(self._goal_transcript_index, goal=deepcopy(goal))
+        self.call_after_refresh(self._scroll_end)
+
+    def clear_goal_entry(self) -> None:
+        block = self._goal_block
+        if block is not None:
+            block.remove()
+        if self._goal_transcript_index is not None and self._goal_transcript_index < len(self._transcript):
+            self._transcript.pop(self._goal_transcript_index)
+        self._goal_block = None
+        self._goal_transcript_index = None
 
     def add_todo_entry(
         self, items: list[dict] | None, summary: dict | None = None
@@ -1954,6 +1983,9 @@ class ChatView(Widget):
                 str(entry.get("question") or ""),
                 str(entry.get("answer") or ""),
             )
+            return
+        if kind == "goal":
+            self.add_goal_entry(dict(entry.get("goal") or {}))
             return
         if kind == "todo":
             self.add_todo_entry(
@@ -3440,6 +3472,80 @@ class ToolErrorBlock(Vertical):
             self._content_widget.remove_class("hidden")
         else:
             self._content_widget.add_class("hidden")
+
+
+class GoalBlock(Vertical):
+    def __init__(self, goal: dict):
+        super().__init__()
+        self.goal = dict(goal or {})
+        self.expanded = False
+        self._header: Static | None = None
+        self._body: Static | None = None
+        self._details: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        self._header = Static("", classes="todos-toggle", markup=True)
+        self._body = Static("", classes="todos-summary", markup=True)
+        self._details = Static("", classes="todos-summary hidden", markup=True)
+        yield self._header
+        yield self._body
+        yield self._details
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def on_click(self, event: events.Click) -> None:
+        self.expanded = not self.expanded
+        self._refresh()
+        event.stop()
+
+    def set_goal(self, goal: dict) -> None:
+        self.goal = dict(goal or {})
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if self._header is None or self._body is None or self._details is None:
+            return
+        goal_id = _escape_markup(self.goal.get("id") or "goal")
+        description = _escape_markup(self.goal.get("description") or "")
+        raw_status = str(self.goal.get("status") or "active").strip().lower()
+        raw_phase = str(self.goal.get("phase") or "planning").strip().lower()
+        status = _escape_markup(t(f"chat.goal.status.{raw_status}"))
+        phase = _escape_markup(t(f"chat.goal.phase.{raw_phase}"))
+        current = _escape_markup(self.goal.get("current_step") or "-")
+        progress = _escape_markup(self.goal.get("progress") or "-")
+        reason = _escape_markup(self.goal.get("last_error") or "")
+        header = _escape_markup(t("chat.goal.header"))
+        marker = "▾" if self.expanded else "▸"
+        self._header.update(
+            f"{marker} [white]{header}[/white] [bold]{status}[/bold] [gray]{goal_id}[/gray]"
+        )
+        body = (
+            f"[bold]{description}[/bold]\n"
+            f"{_escape_markup(t('chat.goal.phase'))}: {phase}  "
+            f"{_escape_markup(t('chat.goal.step'))}: {current}\n"
+            f"{_escape_markup(t('chat.goal.progress'))}: {progress}"
+        )
+        if reason:
+            body += f"\n{_escape_markup(t('chat.goal.reason'))}: [{STATUS_WARNING}]{reason}[/]"
+        self._body.update(body)
+
+        criteria = _escape_markup(self.goal.get("success_criteria") or "-")
+        plan = _escape_markup(self.goal.get("plan") or "-")
+        verification = _escape_markup(self.goal.get("verification_report") or "-")
+        iteration = _escape_markup(self.goal.get("iteration") or 0)
+        updated = _escape_markup(self.goal.get("updated_at") or "-")
+        self._details.update(
+            f"{_escape_markup(t('chat.goal.criteria'))}: {criteria}\n"
+            f"{_escape_markup(t('chat.goal.plan'))}: {plan}\n"
+            f"{_escape_markup(t('chat.goal.verification'))}: {verification}\n"
+            f"{_escape_markup(t('chat.goal.iteration'))}: {iteration}  "
+            f"{_escape_markup(t('chat.goal.updated'))}: {updated}"
+        )
+        if self.expanded:
+            self._details.remove_class("hidden")
+        else:
+            self._details.add_class("hidden")
 
 
 class TodosBlock(Vertical):

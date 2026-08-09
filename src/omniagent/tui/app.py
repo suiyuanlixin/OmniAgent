@@ -50,6 +50,14 @@ from ..i18n import (
 from ..installer import PROVIDERS, install_registry_skill
 from ..memory import MemoryStore
 from ..main import attach_external_file_references_with_media
+from ..goals import (
+    Goal,
+    GOAL_STATUS_ACTIVE,
+    GOAL_STATUS_BLOCKED,
+    GOAL_STATUS_FAILED,
+    GOAL_STATUS_PAUSED,
+    goal_from_record,
+)
 from ..references import resolve_references
 from ..search import (
     WEB_SEARCH_PROVIDERS,
@@ -475,6 +483,7 @@ class AgentTUIApp(App):
         self.todo_items: list[dict] = []
         self._stream_kind: str | None = None
         self._worker_lock = threading.Lock()
+        self._session_record_lock = threading.RLock()
         self._message_started_at: float | None = None
         self._thinking_started_at: float | None = None
         self._thinking_elapsed_timer = None
@@ -686,6 +695,24 @@ class AgentTUIApp(App):
         if not is_command:
             self.start_chat()
             project = self._selected_project()
+            goal_mode = bool(self.query_one("#chat-input", ChatInput).goal_mode)
+            if goal_mode:
+                goal = self.chat.get_goal()
+                if goal is None or goal.terminal:
+                    # A finished Goal must not hand its leftover todo list to the
+                    # next one: _agent_response() would treat those items as an
+                    # unfinished plan and resume them under the new Goal.
+                    if goal is not None and goal.terminal:
+                        self.chat.clear_todos()
+                    goal = Goal.create(
+                        content,
+                        session_id=str((self.current_session_record or {}).get("id") or ""),
+                        workspace_dir=str(self.chat.agent_tools.workspace_dir or ""),
+                    )
+                    self.chat.set_goal(goal, on_change=self._on_goal_change)
+                elif goal.status in {GOAL_STATUS_PAUSED, GOAL_STATUS_BLOCKED}:
+                    goal.update(status=GOAL_STATUS_ACTIVE, last_error="")
+                self._on_goal_change(goal)
             base_dir = project.path if project is not None else None
             chat_view.add_message("user", content, base_dir)
         chat_view.reset_turn_summaries()
@@ -786,6 +813,98 @@ class AgentTUIApp(App):
         if self.chat is not None:
             self.chat.set_plan_mode(event.enabled)
         self._apply_config_to_controls()
+
+    def on_chat_input_goal_mode_changed(self, event: ChatInput.GoalModeChanged) -> None:
+        self.query_one("#chat-input", ChatInput).set_goal_mode(event.enabled)
+        if self.chat is None:
+            return
+        goal = self.chat.get_goal()
+        if goal is None or goal.terminal:
+            return
+        if event.enabled:
+            if self.chat_busy:
+                self.add_status_message("[!]", t("input.goal.stopping"))
+                self.query_one("#chat-input", ChatInput).set_goal_mode(False)
+                return
+            should_resume = goal.status in {GOAL_STATUS_PAUSED, GOAL_STATUS_BLOCKED}
+            goal.update(status=GOAL_STATUS_ACTIVE, last_error="")
+            self._on_goal_change(goal)
+            if should_resume:
+                self._dispatch_goal_resume()
+            return
+        goal.update(status=GOAL_STATUS_PAUSED, last_error=t("input.goal.paused_mode"))
+        self._on_goal_change(goal)
+
+    def on_chat_input_goal_title_changed(
+        self, event: ChatInput.GoalTitleChanged
+    ) -> None:
+        try:
+            self._ensure_ready_for_message()
+        except Exception as error:
+            self.add_error_message(t("app.toast.chat_init_failed", error=error))
+            return
+        goal = self.chat.get_goal() if self.chat is not None else None
+        if goal is None or goal.terminal:
+            goal = Goal.create(
+                event.description,
+                session_id=str((self.current_session_record or {}).get("id") or ""),
+                workspace_dir=str(self.chat.agent_tools.workspace_dir or ""),
+            )
+            self.chat.set_goal(goal, on_change=self._on_goal_change)
+        else:
+            goal.update(description=event.description)
+        self._on_goal_change(goal)
+
+    def on_chat_input_goal_toggle_requested(
+        self, event: ChatInput.GoalToggleRequested
+    ) -> None:
+        if self.chat is None or self.chat.get_goal() is None:
+            return
+        goal = self.chat.get_goal()
+        if goal.terminal:
+            return
+        if goal.status == GOAL_STATUS_ACTIVE:
+            goal.update(status=GOAL_STATUS_PAUSED, last_error=t("input.goal.paused_user"))
+            self.chat.request_agent_stop()
+            self._on_goal_change(goal)
+            return
+        if self.chat_busy:
+            self.add_status_message("[!]", t("input.goal.stopping"))
+            return
+        goal.update(status=GOAL_STATUS_ACTIVE, last_error="")
+        self._on_goal_change(goal)
+        self._dispatch_goal_resume()
+
+    def on_chat_input_goal_close_requested(
+        self, event: ChatInput.GoalCloseRequested
+    ) -> None:
+        if self.chat is None or self.chat.get_goal() is None:
+            return
+        goal = self.chat.get_goal()
+        if not goal.terminal:
+            goal.update(status="cancelled", last_error=t("input.goal.closed_user"))
+            self.chat.request_agent_stop()
+            self._on_goal_change(goal)
+        # Closing ends this single Goal and hides the Goal bar. The mode itself is
+        # left alone: it only decides whether the next message defines a new Goal.
+        self._discard_current_goal()
+        self.query_one("#chat-input", ChatInput).set_goal_state(None)
+        self._persist_current_session()
+
+    def _discard_current_goal(self) -> None:
+        """Detach the current Goal from the session so it cannot be resumed."""
+        if self.chat is not None:
+            self.chat.clear_goal()
+            # The discarded Goal's todo list must not be inherited by the next
+            # Goal: _agent_response() resumes any incomplete plan it finds.
+            self.chat.clear_todos()
+        session_path = str(
+            (self.current_session_record or {}).get("session_path") or ""
+        ).strip()
+        if session_path:
+            self._patch_session_record(session_path, goal=None)
+        if self.current_session_record is not None:
+            self.current_session_record["goal"] = None
 
     def on_chat_input_approval_changed(self, event: ChatInput.ApprovalChanged) -> None:
         save_config_field("agent_approval_mode", event.value)
@@ -1866,6 +1985,15 @@ class AgentTUIApp(App):
         )
         chat_input.set_project_selected(bool(self.current_project_name))
         chat_input.plan_mode = bool(self.config.agent_plan_enable)
+        goal = self.chat.get_goal() if self.chat is not None else None
+        chat_input.set_goal_state(goal.to_dict() if goal is not None else None)
+        # Preserve an in-progress UI selection while config changes are being
+        # applied; this prevents Goal from flashing back to Plan before its
+        # GoalModeChanged event is handled.
+        goal_mode = chat_input.goal_mode
+        if goal is not None:
+            goal_mode = not goal.terminal
+        chat_input.set_goal_mode(goal_mode)
         chat_input.set_selected_approval(self.config.agent_approval_mode)
         chat_input.set_selected_thinking(self._thinking_value_from_config())
 
@@ -4425,7 +4553,132 @@ class AgentTUIApp(App):
             plan_mode_changed_callback=self._on_agent_plan_mode_changed,
         )
         chat.set_usage_history(session_record.get("usage_history") or [])
+        goal = goal_from_record(session_record)
+        if goal is not None:
+            chat.set_goal(goal, on_change=self._on_goal_change)
         return chat
+
+    def _patch_session_record(self, session_path: str, **changes) -> dict | None:
+        session_path = str(session_path or "").strip()
+        if not session_path:
+            return None
+        with self._session_record_lock:
+            record = load_session(session_path)
+            if not record:
+                current_path = str(
+                    (self.current_session_record or {}).get("session_path") or ""
+                ).strip()
+                if current_path != session_path:
+                    return None
+                record = dict(self.current_session_record or {})
+            record.update(changes)
+            saved = save_session_record(record)
+            current_path = str(
+                (self.current_session_record or {}).get("session_path") or ""
+            ).strip()
+            if current_path == session_path:
+                self.current_session_record = saved
+            return saved
+
+    def _on_goal_change(self, goal: Goal) -> None:
+        session_path = str((self.current_session_record or {}).get("session_path") or "").strip()
+        if not session_path:
+            return
+        self._patch_session_record(session_path, goal=goal.to_dict())
+        self._call_ui(self._sync_goal_record, goal.to_dict())
+
+    def _sync_goal_record(self, goal_data: dict) -> None:
+        if self.current_session_record is not None:
+            self.current_session_record["goal"] = dict(goal_data or {})
+        try:
+            self.query_one("#chat-input", ChatInput).set_goal_state(goal_data or {})
+            self.query_one("#messages-view", ChatView).add_goal_entry(goal_data or {})
+        except NoMatches:
+            return
+
+    def _run_goal_loop(
+        self,
+        first_text: str,
+        *,
+        media_references=None,
+        reference_files=None,
+        reference_folders=None,
+    ):
+        if self.chat is None:
+            raise RuntimeError("Chat is not initialized.")
+        if self.chat.get_goal() is None:
+            return self.chat.send_message(
+                first_text,
+                stream_callback_thinking=self.append_stream_thinking,
+                stream_callback_response=self.append_stream_response,
+                media_references=media_references,
+                reference_files=reference_files,
+                reference_folders=reference_folders,
+            )
+        # Pin the Goal identity for this loop. Closing a Goal mid-run and
+        # starting a new one must not let this loop keep driving the new Goal.
+        loop_goal_id = str(self.chat.get_goal().id or "")
+        response = self.chat.send_message(
+            first_text,
+            stream_callback_thinking=self.append_stream_thinking,
+            stream_callback_response=self.append_stream_response,
+            media_references=media_references,
+            reference_files=reference_files,
+            reference_folders=reference_folders,
+        )
+        while (
+            response
+            and (response.get("goal_updated") or response.get("goal_continue_required"))
+            and not response.get("agent_stopped")
+            and self._goal_loop_still_owns(loop_goal_id)
+        ):
+            response = self.chat.send_message(
+                "Continue the persistent Goal from the saved checkpoint. The prior Agent "
+                "turn reached its normal execution boundary. Continue from the existing "
+                "history without repeating verified work, and record a structured Goal "
+                "checkpoint before ending this turn.",
+                stream_callback_thinking=self.append_stream_thinking,
+                stream_callback_response=self.append_stream_response,
+            )
+        return response
+
+    def _goal_loop_still_owns(self, loop_goal_id: str) -> bool:
+        """Whether automatic continuation may run another turn for this loop.
+
+        The id is pinned when the loop starts so that closing a Goal (or
+        starting a different one) cannot be silently taken over by an
+        already-running loop.
+        """
+        if self.chat is None:
+            return False
+        goal = self.chat.get_goal()
+        if goal is None or goal.status != GOAL_STATUS_ACTIVE:
+            return False
+        return str(goal.id) == str(loop_goal_id)
+
+    def _dispatch_goal_resume(self) -> None:
+        if self.chat is None or self.chat_busy:
+            return
+        self._invalidate_input_suggestion()
+        self._set_controls_locked(True)
+        self.chat_busy = True
+        self.query_one("#chat-input", ChatInput).set_chat_busy(True)
+        self._suppress_stream_output = False
+        self._message_started_at = perf_counter()
+        self._thinking_started_at = None
+        threading.Thread(target=self._process_goal_resume, daemon=True).start()
+
+    def _process_goal_resume(self) -> None:
+        try:
+            response = self._run_goal_loop(
+                "Continue the persistent Goal from its saved checkpoint. "
+                "Do not repeat verified work."
+            )
+            if response and not response.get("agent_stopped"):
+                self.chat.update_session_episodic_memory()
+            self._call_ui(self._finish_response, response, "")
+        except Exception as error:
+            self._call_ui(self._finish_with_error, error)
 
     def _process_user_message(self, user_text: str) -> None:
         try:
@@ -4444,10 +4697,8 @@ class AgentTUIApp(App):
                     self.config.file_inline_chars,
                 )
             )
-            response = self.chat.send_message(
+            response = self._run_goal_loop(
                 enriched_text,
-                stream_callback_thinking=self.append_stream_thinking,
-                stream_callback_response=self.append_stream_response,
                 media_references=media_references,
                 reference_files=reference_files,
                 reference_folders=reference_folders,
@@ -4478,7 +4729,6 @@ class AgentTUIApp(App):
         if base == "/agent":
             self._call_ui(self._finish_open_settings_page_command, "agent_mode")
             return
-
         should_continue = process_command(
             command_text, self.chat or self._build_chat_for_command()
         )
@@ -4542,7 +4792,12 @@ class AgentTUIApp(App):
         self._set_input_enabled(True)
         self._set_controls_locked(False)
         self._sync_prompt_actions()
-        self._display_response(response)
+        if response and response.get("request_error"):
+            self.add_error_message(
+                t("app.toast.message_failed", error=response.get("error") or "")
+            )
+        else:
+            self._display_response(response)
         self._maybe_show_changed_files()
         self._persist_current_session()
         self._message_started_at = None
@@ -4562,6 +4817,15 @@ class AgentTUIApp(App):
         self.query_one("#messages-view", ChatView).add_changed_files_entry(summary)
 
     def _finish_with_error(self, error: Exception) -> None:
+        if self.chat is not None and self.chat.get_goal() is not None:
+            goal = self.chat.get_goal()
+            if not goal.terminal:
+                goal.update(
+                    status=GOAL_STATUS_PAUSED,
+                    progress=t("input.goal.paused_error"),
+                    last_error=str(error),
+                )
+                self._on_goal_change(goal)
         self._pause_thinking_elapsed_timer()
         self._finish_thought_stream_widget(
             self._elapsed_since_thinking(),
@@ -4773,41 +5037,48 @@ class AgentTUIApp(App):
             self._persist_current_session(refresh_sidebar=False)
             return
 
-        record = load_session(session_path)
-        if not record:
-            return
-        usage_history = [
-            dict(item)
-            for item in list(record.get("usage_history") or [])
-            if isinstance(item, dict)
-        ]
-        entry_id = str(entry.get("id") or "")
-        if entry_id and any(
-            str(item.get("id") or "") == entry_id for item in usage_history
-        ):
-            return
-        usage_history.append(dict(entry))
-        record["usage_history"] = usage_history
-        save_session_record(record)
+        with self._session_record_lock:
+            record = load_session(session_path)
+            if not record:
+                return
+            usage_history = [
+                dict(item)
+                for item in list(record.get("usage_history") or [])
+                if isinstance(item, dict)
+            ]
+            entry_id = str(entry.get("id") or "")
+            if entry_id and any(
+                str(item.get("id") or "") == entry_id for item in usage_history
+            ):
+                return
+            usage_history.append(dict(entry))
+            record["usage_history"] = usage_history
+            save_session_record(record)
 
     def _persist_current_session(self, refresh_sidebar: bool = True) -> None:
         if self.current_session_record is None or self.chat is None:
             return
         history = list(self.chat.get_history() or [])
-        record = dict(self.current_session_record)
         view = self.query_one("#messages-view", ChatView)
-        record["conversation"] = history
-        record["usage_history"] = self.chat.get_usage_history()
-        record["ui_transcript"] = view.get_transcript()
-        record["model_name"] = self.config.current_model
+        session_path = str(
+            self.current_session_record.get("session_path") or ""
+        ).strip()
         project = self._selected_project()
-        record["project"] = project.to_dict() if project is not None else None
-        if (
-            not str(record.get("title") or "").strip()
-            or record.get("title") == "New Chat"
-        ):
-            record["title"] = self._session_title_from_history(history)
-        self.current_session_record = save_session_record(record)
+        changes = {
+            "conversation": history,
+            "usage_history": self.chat.get_usage_history(),
+            "ui_transcript": view.get_transcript(),
+            "model_name": self.config.current_model,
+            "project": project.to_dict() if project is not None else None,
+        }
+        goal = self.chat.get_goal()
+        changes["goal"] = goal.to_dict() if goal is not None else None
+        current_title = str(self.current_session_record.get("title") or "").strip()
+        if not current_title or current_title == "New Chat":
+            changes["title"] = self._session_title_from_history(history)
+        saved = self._patch_session_record(session_path, **changes)
+        if saved is not None:
+            self.current_session_record = saved
         if refresh_sidebar:
             self._refresh_project_views()
 
@@ -4819,14 +5090,23 @@ class AgentTUIApp(App):
     def _update_new_session_title_from_text(self, text: str) -> None:
         if self.current_session_record is None:
             return
-        record = dict(self.current_session_record)
-        if str(record.get("title") or "").strip() not in {"", "New Chat"}:
+        if str(self.current_session_record.get("title") or "").strip() not in {
+            "",
+            "New Chat",
+        }:
             return
-        record["title"] = self._session_title_from_text(text)
-        record["title_state"] = SESSION_TITLE_STATE_TEMPORARY
-        record["title_seed_text"] = str(text or "")
-        record["title_summary_pending"] = True
-        self.current_session_record = save_session_record(record)
+        session_path = str(
+            self.current_session_record.get("session_path") or ""
+        ).strip()
+        saved = self._patch_session_record(
+            session_path,
+            title=self._session_title_from_text(text),
+            title_state=SESSION_TITLE_STATE_TEMPORARY,
+            title_seed_text=str(text or ""),
+            title_summary_pending=True,
+        )
+        if saved is not None:
+            self.current_session_record = saved
         self._refresh_project_views()
 
     def _maybe_schedule_session_title_summary(self) -> None:
@@ -4882,30 +5162,31 @@ class AgentTUIApp(App):
         generated_title: str,
         expected_title: str,
     ) -> None:
-        record = load_session(session_path)
-        if not record:
-            return
-        if (
-            str(record.get("title_state") or "").strip()
-            != SESSION_TITLE_STATE_TEMPORARY
-        ):
-            return
-        if str(record.get("title") or "").strip() != str(expected_title or "").strip():
-            return
-        title = self._session_title_from_text(generated_title)
-        if title == "New Chat":
-            return
-        record["title"] = title
-        record["title_state"] = SESSION_TITLE_STATE_GENERATED
-        record.pop("title_seed_text", None)
-        record["title_summary_pending"] = False
-        updated = save_session_record(record)
-        if (
-            self.current_session_record is not None
-            and str(self.current_session_record.get("session_path") or "").strip()
-            == str(session_path or "").strip()
-        ):
-            self.current_session_record = updated
+        with self._session_record_lock:
+            record = load_session(session_path)
+            if not record:
+                return
+            if (
+                str(record.get("title_state") or "").strip()
+                != SESSION_TITLE_STATE_TEMPORARY
+            ):
+                return
+            if str(record.get("title") or "").strip() != str(expected_title or "").strip():
+                return
+            title = self._session_title_from_text(generated_title)
+            if title == "New Chat":
+                return
+            record["title"] = title
+            record["title_state"] = SESSION_TITLE_STATE_GENERATED
+            record.pop("title_seed_text", None)
+            record["title_summary_pending"] = False
+            updated = save_session_record(record)
+            if (
+                self.current_session_record is not None
+                and str(self.current_session_record.get("session_path") or "").strip()
+                == str(session_path or "").strip()
+            ):
+                self.current_session_record = updated
         self._refresh_project_views()
 
     def _session_title_from_history(self, history: list[dict]) -> str:
@@ -5338,8 +5619,38 @@ class AgentTUIApp(App):
         text = re.sub(r"<\s*/?\s*think\s*>", "", text, flags=re.IGNORECASE)
         return text
 
+    def _pause_restored_active_goal(self, record: dict) -> dict:
+        goal = goal_from_record(record)
+        if goal is None or goal.status != GOAL_STATUS_ACTIVE:
+            return record
+        goal.update(
+            status=GOAL_STATUS_PAUSED,
+            last_error=t("input.goal.paused_recovery"),
+        )
+        goal_data = goal.to_dict()
+        updated = dict(record)
+        updated["goal"] = goal_data
+        transcript = []
+        for item in list(updated.get("ui_transcript") or []):
+            entry = dict(item) if isinstance(item, dict) else item
+            if isinstance(entry, dict) and str(entry.get("kind") or "") == "goal":
+                entry["goal"] = dict(goal_data)
+            transcript.append(entry)
+        changes = {"goal": goal_data}
+        if "ui_transcript" in updated:
+            updated["ui_transcript"] = transcript
+            changes["ui_transcript"] = transcript
+        session_path = str(updated.get("session_path") or "").strip()
+        if session_path:
+            saved = self._patch_session_record(session_path, **changes)
+            if saved is not None:
+                return saved
+        return updated
+
     def _load_session_record(self, record: dict) -> None:
         self._invalidate_input_suggestion()
+        self.current_session_record = record
+        record = self._pause_restored_active_goal(record)
         self.current_session_record = record
         project = self._project_from_session(record)
         self._set_current_project(project.name if project is not None else "")

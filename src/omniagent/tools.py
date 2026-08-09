@@ -133,6 +133,7 @@ REFERENCE_ONLY_TOOLS = frozenset({
 
 PLAN_MODE_ALLOWED_TOOLS = frozenset({
     "update_todo",
+    "update_goal",
     "ask_user",
     SUBMIT_PLAN_TOOL_NAME,
     "dispatch_subagent",
