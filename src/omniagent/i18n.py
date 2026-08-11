@@ -432,6 +432,63 @@ _add(
     "请求失败，请检查模型配置和网络连接。",
 )
 
+# --- app.py: message actions (copy / revert / edit / fork) -------------------
+_add("app.toast.message_copied", "Message copied.", "已复制消息。")
+_add(
+    "app.toast.message_action_busy",
+    "Wait for the current response to finish first.",
+    "请先等待当前回复结束。",
+)
+_add(
+    "app.toast.message_checkpoint_missing",
+    "No checkpoint for this message. Only the conversation can be rolled back.",
+    "该消息没有检查点，只能回退对话记录。",
+)
+_add(
+    "app.revert.confirm_title",
+    "Revert to before this message?",
+    "回退到这条消息之前？",
+)
+_add(
+    "app.revert.confirm_detail",
+    "Removes {count} messages after this point and restores the project files to "
+    "their state before it was sent. This cannot be undone.",
+    "将删除此处之后的 {count} 条消息，并把项目文件还原到发送前的状态。此操作不可撤销。",
+)
+_add(
+    "app.edit.confirm_title",
+    "Revert and edit this message?",
+    "回退并编辑这条消息？",
+)
+_add(
+    "app.edit.confirm_detail",
+    "Removes {count} messages after this point, restores the project files to their "
+    "state before it was sent, and puts the original text back in the input box.",
+    "将删除此处之后的 {count} 条消息，把项目文件还原到发送前的状态，并把原文放回输入框。",
+)
+_add("app.toast.reverted", "Reverted to before this message.", "已回退到这条消息之前。")
+_add(
+    "app.toast.reverted_conversation_only",
+    "Conversation rolled back. Files were left unchanged: {error}",
+    "已回退对话记录，文件未改动：{error}",
+)
+_add(
+    "app.toast.revert_failed",
+    "Revert failed: {error}",
+    "回退失败：{error}",
+)
+_add(
+    "app.toast.forked",
+    "Forked to a new chat at this message.",
+    "已在这条消息处复刻出新对话。",
+)
+_add(
+    "app.toast.fork_failed",
+    "Fork failed: {error}",
+    "复刻失败：{error}",
+)
+_add("app.fork.title_suffix", " (fork #{n})", " (复刻 #{n})")
+
 # --- app.py: toasts (model / skills) ----------------------------------------
 _add(
     "app.toast.model_rename_failed",
@@ -737,6 +794,13 @@ _add("chat.goal.status.cancelled", "Cancelled", "\u5df2\u53d6\u6d88")
 _add("chat.goal.phase.planning", "Planning", "\u89c4\u5212")
 _add("chat.goal.phase.building", "Building", "\u6784\u5efa")
 _add("chat.goal.phase.verifying", "Verifying", "\u9a8c\u8bc1")
+# --- chat_view.py: user message action bar -----------------------------------
+# Right-clicking a sent message reveals this row beneath it.
+_add("chat.action.copy", "Copy", "复制")
+_add("chat.action.revert", "Revert", "回退")
+_add("chat.action.edit", "Edit", "编辑")
+_add("chat.action.fork", "Fork", "复刻")
+
 _add("chat.tool_call_failed", "Tool call failed.", "工具调用失败。")
 _add("chat.status.failed", "failed", "失败")
 _add("chat.status.rejected", "rejected", "已拒绝")

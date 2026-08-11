@@ -85,11 +85,13 @@ from ..session import (
     rename_project,
     rename_session,
     save_session_record,
+    session_snapshot_dir,
     session_todo_dir,
     unarchive_session,
     unpin_project,
     unpin_session,
 )
+from ..snapshot import SnapshotStore
 from ..skills import APP_SKILLS_DIR, SkillRegistry
 from .data import PROJECT_LOGO, reasoning_label, reasoning_levels_for_api
 from .runtime import clear_bridge, render_console_text, set_bridge
@@ -100,6 +102,7 @@ from .widgets.chat_view import (
     MarkdownMessageStatic,
     SelectableMessageStatic,
 )
+from .widgets.confirm_modal import ConfirmModal
 from .widgets.memory_modal import MemoryModal
 from .widgets.project_modal import ProjectModal
 from .widgets.project_picker import ProjectPicker
@@ -495,6 +498,9 @@ class AgentTUIApp(App):
         self._interrupt_send_payload: tuple[str, str] | None = None
         self._settings_model_limit_key = "total"
         self._settings_model_profile_key = ""
+        # Code-state checkpoints for the loaded session, keyed by user message
+        # index. Rebuilt whenever a session is loaded or reset.
+        self._snapshot_store: SnapshotStore | None = None
 
     @property
     def config(self):
@@ -714,6 +720,11 @@ class AgentTUIApp(App):
                     goal.update(status=GOAL_STATUS_ACTIVE, last_error="")
                 self._on_goal_change(goal)
             base_dir = project.path if project is not None else None
+            # Capture the pre-message code state before the row is rendered, so
+            # the checkpoint's indices line up with "just before this message".
+            # This runs synchronously on purpose: the agent must not get a
+            # chance to touch files before the snapshot is taken.
+            self._capture_message_checkpoint(chat_view, content, display_content)
             chat_view.add_message("user", content, base_dir)
         chat_view.reset_turn_summaries()
         self._set_controls_locked(True)
@@ -929,6 +940,220 @@ class AgentTUIApp(App):
         if self._conversation_started():
             return
         self.push_screen(ProjectModal(), callback=self._handle_project_modal_result)
+
+    # ------------------------------------------------------------------
+    # User-message actions: copy / revert / edit / fork
+    # ------------------------------------------------------------------
+
+    def on_chat_view_message_action_requested(
+        self, event: ChatView.MessageActionRequested
+    ) -> None:
+        action = str(event.action or "").strip().lower()
+        message_index = int(event.message_index)
+        if action == "copy":
+            self._copy_user_message(message_index)
+            return
+        # Revert / edit / fork all rewrite session state, so they must not race
+        # a response that is still streaming into the same transcript.
+        if self.chat_busy:
+            self.add_status_message("[!]", t("app.toast.message_action_busy"))
+            return
+        if action == "revert":
+            self._confirm_revert_to_message(message_index, resume_edit=False)
+        elif action == "edit":
+            self._confirm_revert_to_message(message_index, resume_edit=True)
+        elif action == "fork":
+            self._fork_session_at_message(message_index)
+
+    def _copy_user_message(self, message_index: int) -> None:
+        chat_view = self.query_one("#messages-view", ChatView)
+        content = chat_view.user_message_content(message_index)
+        if not content:
+            return
+        self.copy_to_clipboard(content)
+        self.add_status_message("[✓]", t("app.toast.message_copied"))
+
+    def _confirm_revert_to_message(
+        self, message_index: int, *, resume_edit: bool
+    ) -> None:
+        chat_view = self.query_one("#messages-view", ChatView)
+        if not chat_view.user_message_content(message_index):
+            return
+        dropped = max(0, len(chat_view.messages) - message_index)
+        store = self._ensure_snapshot_store()
+        checkpoint = (
+            store.get_by_message_index(message_index) if store is not None else None
+        )
+        if checkpoint is None or not checkpoint.commit_sha:
+            # Be explicit that files will be left alone rather than silently
+            # rolling back only half of what the label promises.
+            self.add_status_message("[!]", t("app.toast.message_checkpoint_missing"))
+        title_key = "app.edit.confirm_title" if resume_edit else "app.revert.confirm_title"
+        detail_key = (
+            "app.edit.confirm_detail" if resume_edit else "app.revert.confirm_detail"
+        )
+        self.push_screen(
+            ConfirmModal(t(title_key), t(detail_key, count=dropped)),
+            callback=lambda confirmed, index=message_index, edit=resume_edit: (
+                self._revert_to_message(index, resume_edit=edit)
+                if confirmed
+                else None
+            ),
+        )
+
+    def _revert_to_message(self, message_index: int, *, resume_edit: bool) -> None:
+        if self.chat_busy:
+            self.add_status_message("[!]", t("app.toast.message_action_busy"))
+            return
+        chat_view = self.query_one("#messages-view", ChatView)
+        original_text = chat_view.user_message_content(message_index)
+        if not original_text:
+            return
+        store = self._ensure_snapshot_store()
+        checkpoint = (
+            store.get_by_message_index(message_index) if store is not None else None
+        )
+
+        restore_error: str | None = None
+        if checkpoint is not None and checkpoint.commit_sha and store is not None:
+            restore_error = store.restore(checkpoint)
+
+        # Roll the conversation back even when the file restore failed: a
+        # partially reverted state is still better reported than hidden, and the
+        # toast below says which half happened.
+        history_len = (
+            checkpoint.history_len
+            if checkpoint is not None
+            else self._history_len_for_user_message(message_index)
+        )
+        try:
+            self._apply_conversation_rollback(chat_view, message_index, history_len)
+        except Exception as error:
+            self.add_status_message("[✗]", t("app.toast.revert_failed", error=error))
+            return
+
+        if store is not None:
+            store.drop_from(message_index)
+
+        if resume_edit:
+            self.query_one("#chat-input", ChatInput).restore_draft(original_text)
+
+        if restore_error:
+            self.add_status_message(
+                "[!]",
+                t("app.toast.reverted_conversation_only", error=restore_error),
+            )
+        else:
+            self.add_status_message("[✓]", t("app.toast.reverted"))
+
+    def _apply_conversation_rollback(
+        self, chat_view: ChatView, message_index: int, history_len: int
+    ) -> None:
+        """Trim the view, the model history and the persisted session record."""
+        chat_view.truncate_to_message(message_index)
+        if self.chat is not None:
+            history = list(self.chat.get_history() or [])
+            trimmed = history[: max(0, int(history_len))]
+            self.chat.set_history(trimmed, preserve_todos=True)
+            todo_status = self.chat.get_todo_status()
+            self.todo_items = list(todo_status.get("active_items") or [])
+            self._set_todo_panel_items(self.todo_items)
+        self._persist_current_session()
+        if not chat_view.messages:
+            # Nothing left to show: fall back to the welcome layout so the empty
+            # transcript doesn't leave a blank chat pane behind.
+            self._show_welcome_layout()
+
+    def _history_len_for_user_message(self, message_index: int) -> int:
+        """Fallback history length when no checkpoint recorded one.
+
+        Counts user turns in the model history and cuts before the Nth one.
+        ``message_index`` indexes ``ChatView.messages``, which also holds
+        assistant/status rows, so N must count only the user rows that precede
+        the target (mirrors ``ChatView.transcript_prefix_for_message``).
+        """
+        if self.chat is None:
+            return 0
+        chat_view = self.query_one("#messages-view", ChatView)
+        index = int(message_index)
+        target = sum(
+            1
+            for (role, _content, _timestamp) in chat_view.messages[:index]
+            if role == "user"
+        )
+        history = list(self.chat.get_history() or [])
+        seen = 0
+        for position, message in enumerate(history):
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "") != "user":
+                continue
+            if seen == target:
+                return position
+            seen += 1
+        return len(history)
+
+    def _show_welcome_layout(self) -> None:
+        """Return to the pre-conversation layout without discarding the session."""
+        self.query_one("#messages-wrap", Container).remove_class("visible")
+        self.query_one("#input-wrapper", Vertical).add_class("welcome")
+        self.query_one("#project-title", Static).remove_class("hidden")
+        self.query_one("#info-bar-shell", Vertical).remove_class("stretch")
+        self.query_one("#project-picker", ProjectPicker).remove_class("hidden")
+        self.query_one("#interrupt-hint", Horizontal).remove_class("visible")
+        chat_input = self.query_one("#chat-input", ChatInput)
+        chat_input.chat_active = False
+        chat_input.remove_class("stretch")
+        self._sync_prompt_actions()
+
+    def _fork_session_at_message(self, message_index: int) -> None:
+        """Duplicate the current chat into a new session, leaving the original alone.
+
+        Mirrors opencode's fork: the new chat is a full copy of the conversation
+        (the message under the cursor and everything after it included), sharing
+        the same working tree, and the user continues from the copy. The
+        original chat stays in the sidebar so both branches evolve independently.
+
+        ``message_index`` only positions the copy in the UI — it is not a
+        truncation point; the whole conversation is duplicated either way.
+        """
+        if self.current_session_record is None:
+            return
+        try:
+            source = dict(self.current_session_record)
+            chat_view = self.query_one("#messages-view", ChatView)
+            project = self._project_from_session(source)
+            source_path = str(source.get("session_path") or "")
+            # Number the branch so the sidebar can tell forks apart: pick the
+            # next ordinal among this source chat's existing forks (opencode
+            # uses a similar "(fork #N)" suffix).
+            fork_count = 0
+            for row in list_sessions(project):
+                if str(row.get("forked_from") or "") == source_path:
+                    fork_count += 1
+            base_title = str(source.get("title") or "New Chat")
+            record = create_session(
+                project=project,
+                title=base_title + t("app.fork.title_suffix", n=fork_count + 1),
+                model_name=str(source.get("model_name") or self.config.current_model),
+            )
+            record["conversation"] = [
+                dict(message)
+                for message in list(self.chat.get_history() or [])
+                if isinstance(message, dict)
+            ]
+            record["ui_transcript"] = chat_view.get_transcript()
+            record["usage_history"] = []
+            record["goal"] = None
+            record["forked_from"] = source_path
+            record = save_session_record(record)
+        except Exception as error:
+            self.add_status_message("[✗]", t("app.toast.fork_failed", error=error))
+            return
+
+        self._load_session_record(record)
+        self._refresh_project_views()
+        self.add_status_message("[✓]", t("app.toast.forked"))
 
     def on_sidebar_session_selected(self, event: Sidebar.SessionSelected) -> None:
         if self.chat_busy:
@@ -4422,6 +4647,7 @@ class AgentTUIApp(App):
         self._stream_kind = None
         self._suppress_stream_output = False
         self._interrupt_send_payload = None
+        self._snapshot_store = None
         self._set_input_enabled(True)
         self._set_context_label(0, self.config.context_window_tokens)
         self._set_controls_locked(False)
@@ -4479,6 +4705,44 @@ class AgentTUIApp(App):
             )
         if self.chat is None:
             self.chat = self._build_chat(self.current_session_record)
+        self._ensure_snapshot_store()
+
+    def _capture_message_checkpoint(
+        self, chat_view: ChatView, content: str, display_content: str
+    ) -> None:
+        """Snapshot conversation + code state just before a user message is added."""
+        store = self._ensure_snapshot_store()
+        if store is None:
+            return
+        try:
+            store.capture(
+                message_index=len(chat_view.messages),
+                transcript_len=len(chat_view.get_transcript()),
+                history_len=len(self.chat.get_history() or []) if self.chat else 0,
+                user_text=str(content or ""),
+                display_text=str(display_content or content or ""),
+            )
+        except Exception as error:
+            # A failed snapshot must never block sending the message; revert
+            # then degrades to conversation-only for this turn.
+            self.log(f"checkpoint capture failed: {error}")
+
+    def _ensure_snapshot_store(self) -> SnapshotStore | None:
+        """Snapshot store for the loaded session, created on first use."""
+        if self._snapshot_store is not None:
+            return self._snapshot_store
+        record = self.current_session_record
+        if record is None:
+            return None
+        snapshot_dir = session_snapshot_dir(record.get("session_path"))
+        if snapshot_dir is None:
+            return None
+        project = self._project_from_session(record)
+        self._snapshot_store = SnapshotStore(
+            snapshot_dir,
+            workspace_dir=project.path if project is not None else None,
+        )
+        return self._snapshot_store
 
     def _build_chat(
         self,
@@ -5649,6 +5913,7 @@ class AgentTUIApp(App):
 
     def _load_session_record(self, record: dict) -> None:
         self._invalidate_input_suggestion()
+        self._snapshot_store = None
         self.current_session_record = record
         record = self._pause_restored_active_goal(record)
         self.current_session_record = record

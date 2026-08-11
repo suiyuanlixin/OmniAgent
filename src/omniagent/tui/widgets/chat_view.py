@@ -50,6 +50,7 @@ from ..theme import (
 )
 from ..widgets.chat_input import HalfRowSpacer, BottomHalfRowSpacer
 from ..widgets.todos_panel import TodoLine
+from textual.message import Message
 
 
 def _patch_rich_markdown_tables() -> None:
@@ -284,6 +285,62 @@ class ChatView(Widget):
     .message-spacer {
         width: 100%;
         height: 1;
+    }
+
+    /* ------------------------------------------------------------------
+       User-message action bar (shown after right-click)
+    ------------------------------------------------------------------ */
+    .message-action-row {
+        width: 100%;
+        height: 1;
+        align-horizontal: right;
+        background: $PAGE_BACKGROUND;
+    }
+
+    .message-action-bar {
+        width: auto;
+        height: 1;
+        background: $PAGE_BACKGROUND;
+    }
+
+    .message-action-item {
+        width: auto;
+        height: 1;
+        min-width: 1;
+        padding: 0 1;
+        margin: 0;
+        border: none;
+        background: transparent;
+        color: $TEXT_MUTED;
+        text-align: left;
+        content-align: left middle;
+    }
+    /* The rightmost label sits flush with the bubble edge: its trailing pad
+       cell would otherwise read as an indent against the right margin. */
+    .message-action-item.message-action-item-last {
+        padding: 0 0 0 1;
+    }
+
+    .message-action-item:hover {
+        background: transparent;
+        color: $TEXT_PRIMARY;
+    }
+
+    .message-action-item.-active {
+        background: transparent;
+        color: $TEXT_PRIMARY;
+    }
+
+    .message-action-separator {
+        width: 1;
+        height: 1;
+        min-width: 1;
+        padding: 0;
+        margin: 0;
+        background: transparent;
+        color: $SURFACE_BACKGROUND;
+        text-align: center;
+        content-align: center middle;
     }
 
     ThoughtBlock {
@@ -964,6 +1021,9 @@ class ChatView(Widget):
         self._thought_stream_content = ""
         self._thought_stream_transcript_index: int | None = None
         self._overflow_replay_checkpoint: tuple[int, int, int] | None = None
+        # Suppresses per-entry scroll scheduling while a transcript is being
+        # replayed, so load_transcript can scroll once at the very end.
+        self._loading_transcript = False
         self._explored_block: ExploredBlock | None = None
         self._edited_block: EditedBlock | None = None
         self._write_block: WrittenBlock | None = None
@@ -977,6 +1037,11 @@ class ChatView(Widget):
         self._team_transcript_indices: dict[str, int] = {}
         self._goal_block: GoalBlock | None = None
         self._goal_transcript_index: int | None = None
+        # Map from message_index (index in self.messages) to the Horizontal row
+        # widget, used to locate a row for the action bar.
+        self._user_message_rows: dict[int, Widget] = {}
+        # The currently visible action-bar row widget, if any.
+        self._active_action_row: Widget | None = None
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
@@ -1008,8 +1073,13 @@ class ChatView(Widget):
         if spacing_before:
             row.add_class("message-row-team-incoming")
         self.query_one("#chat-log", VerticalScroll).mount(row)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
         self.messages.append((role, content, datetime.now().isoformat()))
+        # Tag user message rows so right-click can locate them later.
+        if role == "user":
+            msg_index = len(self.messages) - 1
+            row.data_message_index = msg_index  # type: ignore[attr-defined]
+            self._user_message_rows[msg_index] = row
         transcript_entry = {
             "kind": "message",
             "role": str(role or ""),
@@ -1043,7 +1113,7 @@ class ChatView(Widget):
             assistant_markdown_enabled=self._assistant_markdown_enabled,
         )
         self.query_one("#chat-log", VerticalScroll).mount(row)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
         self.messages.append(("plan", content, datetime.now().isoformat()))
         self._append_transcript_entry({
             "kind": "plan",
@@ -1063,7 +1133,7 @@ class ChatView(Widget):
             assistant_markdown_enabled=self._assistant_markdown_enabled,
         )
         self.query_one("#chat-log", VerticalScroll).mount(row)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
         self._append_transcript_entry({
             "kind": "message",
             "role": "status",
@@ -1081,7 +1151,7 @@ class ChatView(Widget):
                 assistant_markdown_enabled=self._assistant_markdown_enabled,
             )
             self.query_one("#chat-log", VerticalScroll).mount(row)
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
             self._stream_target = content_widget
             self._stream_row = row
             self._stream_role = role
@@ -1108,7 +1178,7 @@ class ChatView(Widget):
             self._stream_transcript_index,
             content=self._stream_content,
         )
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def begin_overflow_replay_scope(self) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
@@ -1186,7 +1256,7 @@ class ChatView(Widget):
             for key, index in self._team_transcript_indices.items()
             if key in self._team_blocks and index < transcript_count
         }
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def remove_last_messages(self, count: int = 1) -> None:
         count = max(1, int(count or 1))
@@ -1235,6 +1305,176 @@ class ChatView(Widget):
         self._team_transcript_indices.clear()
         self._goal_block = None
         self._goal_transcript_index = None
+        self._user_message_rows.clear()
+        self._active_action_row = None
+
+    # ------------------------------------------------------------------
+    # User-message action bar (copy / revert / edit / fork)
+    # ------------------------------------------------------------------
+
+    class MessageActionRequested(Message):
+        """A user picked an action from a message's action bar."""
+
+        def __init__(self, message_index: int, action: str) -> None:
+            super().__init__()
+            self.message_index = int(message_index)
+            self.action = str(action or "")
+
+    def toggle_action_bar(self, message_index: int) -> None:
+        """Show the action bar under a user message, or hide it if already shown."""
+        row = self._user_message_rows.get(int(message_index))
+        if row is None or not row.is_mounted:
+            return
+        existing = self._active_action_row
+        # Right-clicking the same message again collapses the bar.
+        if existing is not None and existing.is_mounted:
+            same_message = (
+                getattr(existing, "data_message_index", None) == int(message_index)
+            )
+            existing.remove()
+            self._active_action_row = None
+            if same_message:
+                return
+        action_row = _build_message_action_bar(int(message_index))
+        log = self.query_one("#chat-log", VerticalScroll)
+        log.mount(action_row, after=row)
+        self._active_action_row = action_row
+        self.call_after_refresh(
+            action_row.scroll_visible, animate=False, force=True
+        )
+
+    def close_action_bar(self) -> None:
+        row = self._active_action_row
+        self._active_action_row = None
+        if row is not None and row.is_mounted:
+            row.remove()
+
+    def on_click(self, event: events.Click) -> None:
+        control = event.control
+        if control is None:
+            return
+        if not control.has_class("message-action-item"):
+            return
+        message_index = getattr(control, "data_message_index", None)
+        action = str(getattr(control, "data_action", "") or "")
+        if message_index is None or not action:
+            return
+        event.stop()
+        self.close_action_bar()
+        self.post_message(self.MessageActionRequested(int(message_index), action))
+
+    def user_message_content(self, message_index: int) -> str:
+        """Raw text of the user message at *message_index* ("" if not found)."""
+        index = int(message_index)
+        if 0 <= index < len(self.messages):
+            role, content, _timestamp = self.messages[index]
+            if role == "user":
+                return str(content or "")
+        return ""
+
+    def user_message_indices(self) -> list[int]:
+        return [
+            index
+            for index, (role, _content, _ts) in enumerate(self.messages)
+            if role == "user"
+        ]
+
+    def truncate_to_message(self, message_index: int) -> None:
+        """Drop the message at *message_index* and everything rendered after it.
+
+        The user row itself is removed too, so the caller can re-send or edit the
+        text as if it had never been submitted.
+        """
+        index = int(message_index)
+        row = self._user_message_rows.get(index)
+        log = self.query_one("#chat-log", VerticalScroll)
+        children = list(log.children)
+        cut_at = None
+        if row is not None and row in children:
+            cut_at = children.index(row)
+            # The blank spacer mounted just before a user row belongs to it.
+            if (
+                cut_at > 0
+                and isinstance(children[cut_at - 1], Static)
+                and children[cut_at - 1].has_class("message-spacer")
+            ):
+                cut_at -= 1
+        if cut_at is not None:
+            for child in children[cut_at:]:
+                child.remove()
+        self._active_action_row = None
+        del self.messages[index:]
+        self._user_message_rows = {
+            key: value
+            for key, value in self._user_message_rows.items()
+            if key < index
+        }
+        self._truncate_transcript_to_user_message(index)
+        self._reset_message_stream()
+        self._thought_stream_target = None
+        self._thought_stream_content = ""
+        self._thought_stream_transcript_index = None
+        self._active_output_kind = None
+        self._clear_auxiliary_group_refs()
+        self._compaction_blocks.clear()
+        self._compaction_transcript_indices.clear()
+        self._subagent_blocks.clear()
+        self._subagent_transcript_indices.clear()
+        self._team_blocks.clear()
+        self._team_transcript_indices.clear()
+
+    def _truncate_transcript_to_user_message(self, message_index: int) -> None:
+        """Trim ``_transcript`` so it ends just before user message *message_index*.
+
+        ``messages`` and ``_transcript`` are separate sequences: the transcript
+        also carries tool cards, thoughts and status rows. Counting user
+        message entries is what maps one to the other.
+        """
+        target = int(message_index)
+        seen_users = 0
+        cut_index = None
+        for position, entry in enumerate(self._transcript):
+            if not isinstance(entry, dict):
+                continue
+            if (
+                str(entry.get("kind") or "") == "message"
+                and str(entry.get("role") or "") == "user"
+            ):
+                if seen_users == target:
+                    cut_index = position
+                    break
+                seen_users += 1
+        if cut_index is not None:
+            del self._transcript[cut_index:]
+
+    def transcript_prefix_for_message(self, message_index: int) -> list[dict]:
+        """A copy of the transcript up to (excluding) user message *message_index*.
+
+        ``message_index`` is an index into ``self.messages``, which also holds
+        assistant/status rows, so the cut point is the Nth *user* row where N
+        counts only the user messages that precede the target. Using the raw
+        index here would skip past the target whenever any non-user message
+        sits between two user messages, leaking the target and everything after
+        it into the prefix.
+        """
+        index = int(message_index)
+        target = sum(
+            1 for (role, _content, _timestamp) in self.messages[:index] if role == "user"
+        )
+        seen_users = 0
+        cut_index = len(self._transcript)
+        for position, entry in enumerate(self._transcript):
+            if not isinstance(entry, dict):
+                continue
+            if (
+                str(entry.get("kind") or "") == "message"
+                and str(entry.get("role") or "") == "user"
+            ):
+                if seen_users == target:
+                    cut_index = position
+                    break
+                seen_users += 1
+        return deepcopy(self._transcript[:cut_index])
 
     def clear_message_selection(self) -> None:
         widgets = [
@@ -1248,6 +1488,12 @@ class ChatView(Widget):
     def _scroll_end(self) -> None:
         self.query_one("#chat-log", VerticalScroll).scroll_end(animate=False)
 
+    def _request_scroll_end(self) -> None:
+        """Schedule a scroll-to-bottom, skipped while a transcript is loading."""
+        if self._loading_transcript:
+            return
+        self.call_after_refresh(self._scroll_end)
+
     def add_thought(self, content: str, elapsed_seconds: float = 0.0) -> None:
         self._activate_aux_output("thought")
         content = clean_thinking_text(content)
@@ -1257,7 +1503,7 @@ class ChatView(Widget):
             markdown_enabled=self._assistant_markdown_enabled,
         )
         self.query_one("#chat-log", VerticalScroll).mount(block)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
         self._append_transcript_entry({
             "kind": "thought",
             "content": content,
@@ -1274,7 +1520,7 @@ class ChatView(Widget):
             markdown_enabled=self._assistant_markdown_enabled,
         )
         self.query_one("#chat-log", VerticalScroll).mount(block)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
         self._thought_stream_target = block
         self._thought_stream_content = ""
         self._append_transcript_entry({
@@ -1294,7 +1540,7 @@ class ChatView(Widget):
                 self._thought_stream_transcript_index,
                 content=cleaned_content,
             )
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
 
     def finish_thought_stream(self, elapsed_seconds: float = 0.0) -> None:
         if self._thought_stream_target is None:
@@ -1338,7 +1584,7 @@ class ChatView(Widget):
         self._thought_stream_target = None
         self._thought_stream_content = ""
         self._thought_stream_transcript_index = None
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_explored_entry(
         self, tool_name: str, description: str, error: str = ""
@@ -1347,7 +1593,7 @@ class ChatView(Widget):
         if self._explored_block is None:
             block = ExploredBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
             self._explored_block = block
         self._explored_block.add_entry(tool_name, description, error=error)
         transcript_entry = {
@@ -1358,7 +1604,7 @@ class ChatView(Widget):
         if error:
             transcript_entry["error"] = str(error)
         self._append_transcript_entry(transcript_entry)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def reset_explored(self) -> None:
         self._explored_block = None
@@ -1375,7 +1621,7 @@ class ChatView(Widget):
         if self._edited_block is None:
             block = EditedBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
             self._edited_block = block
         self._edited_block.add_entry(
             file_path, additions, deletions, diff, status=status
@@ -1388,7 +1634,7 @@ class ChatView(Widget):
             "diff": str(diff or ""),
             "status": str(status or ""),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_write_entry(
         self,
@@ -1402,7 +1648,7 @@ class ChatView(Widget):
         if self._write_block is None:
             block = WrittenBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
             self._write_block = block
         self._write_block.add_entry(
             file_path, additions, deletions, diff, status=status
@@ -1415,7 +1661,7 @@ class ChatView(Widget):
             "diff": str(diff or ""),
             "status": str(status or ""),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def reset_edited(self) -> None:
         self._edited_block = None
@@ -1429,7 +1675,7 @@ class ChatView(Widget):
         if self._shell_block is None:
             block = ShellBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
             self._shell_block = block
         self._shell_block.add_entry(command, output, status=status)
         self._append_transcript_entry({
@@ -1438,7 +1684,7 @@ class ChatView(Widget):
             "output": str(output or ""),
             "status": str(status or ""),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_changed_files_entry(self, files: list[dict]) -> None:
         if not files:
@@ -1450,14 +1696,14 @@ class ChatView(Widget):
             "kind": "changed_files",
             "files": [dict(file_info or {}) for file_info in list(files or [])],
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_question_entry(self, question: str, answer: str) -> None:
         self._activate_aux_output("questions")
         if self._questions_block is None:
             block = QuestionsBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
             self._questions_block = block
         self._questions_block.add_entry(question, answer)
         self._append_transcript_entry({
@@ -1465,7 +1711,7 @@ class ChatView(Widget):
             "question": str(question or ""),
             "answer": str(answer or ""),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def _add_question_error_entry(
         self, tool_name: str, summary: str, error: str
@@ -1474,11 +1720,11 @@ class ChatView(Widget):
         if self._questions_block is None:
             block = QuestionsBlock()
             self.query_one("#chat-log", VerticalScroll).mount(block)
-            self.call_after_refresh(self._scroll_end)
+            self._request_scroll_end()
             self._questions_block = block
         self._questions_block.add_error(error)
         self._append_tool_error_transcript(tool_name, summary, error)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_goal_entry(self, goal: dict) -> None:
         goal = dict(goal or {})
@@ -1493,7 +1739,7 @@ class ChatView(Widget):
         else:
             block.set_goal(goal)
             self._update_transcript_entry(self._goal_transcript_index, goal=deepcopy(goal))
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def clear_goal_entry(self) -> None:
         block = self._goal_block
@@ -1515,7 +1761,7 @@ class ChatView(Widget):
             "items": [dict(item or {}) for item in list(items or [])],
             "summary": dict(summary or {}),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def _add_todo_error_entry(
         self, tool_name: str, summary: str, error: str
@@ -1524,7 +1770,7 @@ class ChatView(Widget):
         block = TodosBlock([], {}, error=error)
         self.query_one("#chat-log", VerticalScroll).mount(block)
         self._append_tool_error_transcript(tool_name, summary, error)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def _append_tool_error_transcript(
         self, tool_name: str, summary: str, error: str
@@ -1591,7 +1837,7 @@ class ChatView(Widget):
         block = ToolErrorBlock(tool_name, summary, error)
         self.query_one("#chat-log", VerticalScroll).mount(block)
         self._append_tool_error_transcript(tool_name, summary, error)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_subagent_entry(self, agent_type: str, transcript: list[dict]) -> None:
         self._activate_aux_output("subagent")
@@ -1602,7 +1848,7 @@ class ChatView(Widget):
             "agent_type": str(agent_type or ""),
             "transcript": deepcopy(list(transcript or [])),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def start_subagent_entry(self, entry_id: str, agent_type: str) -> None:
         self._activate_aux_output("subagent")
@@ -1616,7 +1862,7 @@ class ChatView(Widget):
             "transcript": [],
         })
         self._subagent_transcript_indices[entry_id] = len(self._transcript) - 1
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def append_subagent_event(self, entry_id: str, event: dict) -> None:
         entry_id = str(entry_id)
@@ -1630,7 +1876,7 @@ class ChatView(Widget):
                 transcript_index,
                 transcript=deepcopy(block.persistent_transcript()),
             )
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_team_entry(
         self,
@@ -1663,7 +1909,7 @@ class ChatView(Widget):
             "result": str(result or ""),
             "transcript": deepcopy(list(transcript or [])),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def start_team_entry(
         self,
@@ -1698,7 +1944,7 @@ class ChatView(Widget):
             "transcript": [],
         })
         self._team_transcript_indices[entry_id] = len(self._transcript) - 1
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def append_team_event(self, entry_id: str, event: dict) -> None:
         entry_id = str(entry_id)
@@ -1712,7 +1958,7 @@ class ChatView(Widget):
                 transcript_index,
                 transcript=deepcopy(block.persistent_transcript()),
             )
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def update_team_entry_status(self, entry_id: str, status: str) -> bool:
         entry_id = str(entry_id)
@@ -1726,7 +1972,7 @@ class ChatView(Widget):
                 transcript_index,
                 status=block.status,
             )
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
         return True
 
     def finish_team_entry(self, entry_id: str, status: str, result: str = "") -> bool:
@@ -1743,7 +1989,7 @@ class ChatView(Widget):
                 result=str(result or ""),
                 transcript=deepcopy(block.persistent_transcript()),
             )
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
         return True
 
     def add_team_action_entry(
@@ -1765,7 +2011,7 @@ class ChatView(Widget):
             "status": str(status or "success"),
             "metadata": deepcopy(dict(metadata or {})),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def start_compaction_entry(
         self,
@@ -1787,7 +2033,7 @@ class ChatView(Widget):
             "details": str(details or ""),
         })
         self._compaction_transcript_indices[entry_id] = len(self._transcript) - 1
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def finish_compaction_entry(
         self,
@@ -1811,7 +2057,7 @@ class ChatView(Widget):
                 mode=str(mode or "auto"),
                 details=str(details or ""),
             )
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     @staticmethod
     def _normalize_compaction_details(details: str) -> str:
@@ -1902,13 +2148,23 @@ class ChatView(Widget):
         return deepcopy(self._transcript)
 
     def load_transcript(self, transcript: list[dict], reference_base_dir=None) -> None:
-        self.clear()
-        for entry in list(transcript or []):
-            self._replay_transcript_entry(entry, reference_base_dir)
+        # Repaint is suspended while every entry is mounted, so a long
+        # transcript renders once instead of once per entry. Scroll scheduling
+        # is also suppressed during the loop (_request_scroll_end) and applied
+        # once at the end.
+        self._loading_transcript = True
+        try:
+            with self.app.batch_update():
+                self.clear()
+                for entry in list(transcript or []):
+                    self._replay_transcript_entry(entry, reference_base_dir)
+        finally:
+            self._loading_transcript = False
         self._reset_message_stream()
         self._thought_stream_target = None
         self._thought_stream_content = ""
         self._thought_stream_transcript_index = None
+        self._request_scroll_end()
 
     def set_markdown_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -1929,7 +2185,7 @@ class ChatView(Widget):
                 str(entry.get("description") or ""),
             )
         self.load_transcript(transcript)
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def _append_transcript_entry(self, entry: dict) -> None:
         self._transcript.append(deepcopy(entry))
@@ -2105,7 +2361,7 @@ class ChatView(Widget):
             "url": str(url or ""),
             "status": str(status or ""),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def add_web_search_entry(self, content: str, status: str = "") -> None:
         self._activate_aux_output("web_search")
@@ -2128,7 +2384,7 @@ class ChatView(Widget):
             "content": str(content or ""),
             "status": str(status or ""),
         })
-        self.call_after_refresh(self._scroll_end)
+        self._request_scroll_end()
 
     def reset_turn_summaries(self) -> None:
         self._explored_block = None
@@ -2319,6 +2575,47 @@ def _build_message_widgets(
     return Horizontal(bubble, classes=row_classes), content_widget
 
 
+_MESSAGE_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("copy", "chat.action.copy"),
+    ("revert", "chat.action.revert"),
+    ("edit", "chat.action.edit"),
+    ("fork", "chat.action.fork"),
+)
+# Thin vertical rule between adjacent labels. One cell wide, drawn in the
+# bubble edge colour so it reads as a divider rather than as text.
+_MESSAGE_ACTION_SEPARATOR = "│"
+
+
+def _build_message_action_bar(message_index: int) -> Horizontal:
+    """One right-aligned row of action labels for a sent user message.
+
+    Labels are resolved at build time, so a language switch relabels them the
+    next time the bar is opened.
+    """
+    items: list[Static] = []
+    last_position = len(_MESSAGE_ACTIONS) - 1
+    for position, (action, label_key) in enumerate(_MESSAGE_ACTIONS):
+        if position:
+            items.append(
+                Static(
+                    _MESSAGE_ACTION_SEPARATOR,
+                    classes="message-action-separator",
+                    markup=False,
+                )
+            )
+        classes = "message-action-item"
+        if position == last_position:
+            classes += " message-action-item-last"
+        item = Static(t(label_key), classes=classes, markup=False)
+        item.data_action = action  # type: ignore[attr-defined]
+        item.data_message_index = int(message_index)  # type: ignore[attr-defined]
+        items.append(item)
+    bar = Horizontal(*items, classes="message-action-bar")
+    row = Horizontal(bar, classes="message-action-row")
+    row.data_message_index = int(message_index)  # type: ignore[attr-defined]
+    return row
+
+
 def _reference_message_content(content: str, base_dir=None):
     source = str(content or "")
     references = resolve_references(source, base_dir)
@@ -2407,6 +2704,11 @@ class SelectableMessageStatic(Static, can_focus=True):
         self.clear_selection(refresh=False)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
+        # button == 3 is right-click: show the action bar instead of starting selection.
+        if event.button == 3:
+            self._request_action_bar(event)
+            event.stop()
+            return
         try:
             self.screen.set_focus(self, scroll_visible=False)
         except Exception:
@@ -2418,6 +2720,32 @@ class SelectableMessageStatic(Static, can_focus=True):
         self.capture_mouse()
         self.refresh()
         event.stop()
+
+    def _request_action_bar(self, event: events.MouseDown) -> None:
+        """Find our parent user-message row and ask ChatView to toggle the action bar."""
+        # Walk up to find a widget that has data_message_index set by ChatView.
+        widget: Widget | None = self
+        while widget is not None:
+            msg_index = getattr(widget, "data_message_index", None)
+            if msg_index is not None:
+                break
+            widget = getattr(widget, "parent", None)
+        if msg_index is None:
+            return
+        try:
+            chat_view = self.app.query_one("#messages-view")
+        except Exception:
+            chat_view = None
+        if chat_view is None:
+            # Fall back: walk up to ChatView
+            w: Widget | None = self.parent
+            while w is not None:
+                if isinstance(w, ChatView):
+                    chat_view = w
+                    break
+                w = getattr(w, "parent", None)
+        if chat_view is not None:
+            chat_view.toggle_action_bar(int(msg_index))  # type: ignore[attr-defined]
 
     def on_mouse_move(self, event: events.MouseMove) -> None:
         if not self._drag_selecting:

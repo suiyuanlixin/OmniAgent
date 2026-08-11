@@ -2901,6 +2901,17 @@ class ChatInput(Widget):
             self._clear_suggested_input_state()
         self._update_pending_shell()
 
+    def restore_draft(self, text: str) -> None:
+        """Put *text* back into the message input box (used by revert / edit / fork)."""
+        if not self._ensure_ui_thread(self.restore_draft, text):
+            return
+        msg_input = self._message_input()
+        msg_input.load_text(str(text or ""))
+        lines = str(text or "").split("\n")
+        msg_input.move_cursor((len(lines) - 1, len(lines[-1])))
+        self.call_after_refresh(self._update_input_height)
+        self.call_after_refresh(msg_input.focus)
+
     def has_pending_messages(self) -> bool:
         return bool(self._pending_messages)
 

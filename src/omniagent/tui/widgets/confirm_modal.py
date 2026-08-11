@@ -5,9 +5,9 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
-from ...i18n import t
+from ...i18n import display_width, t
 from ..theme import render_css
-from ..widgets.chat_input import HalfRowSpacer
+from ..widgets.chat_input import BottomHalfRowSpacer, HalfRowSpacer
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -35,7 +35,7 @@ class ConfirmModal(ModalScreen[bool]):
         width: 100%;
         height: auto;
         background: $SURFACE_BACKGROUND;
-        padding: 0 2 1 2;
+        padding: 0 2 0 2;
     }
 
     #confirm-title {
@@ -51,12 +51,14 @@ class ConfirmModal(ModalScreen[bool]):
 
     #confirm-actions {
         width: 100%;
+        height: auto;
         align-horizontal: right;
         margin-top: 1;
     }
 
     #confirm-actions Button {
         width: auto;
+        min-width: 0;
         margin-left: 1;
         border: none;
         background: transparent;
@@ -72,7 +74,7 @@ class ConfirmModal(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Container(id="confirm-wrap"):
-            yield HalfRowSpacer(id="confirm-top")
+            yield BottomHalfRowSpacer(id="confirm-top")
             with Vertical(id="confirm-dialog"):
                 yield Static(self.title, id="confirm-title")
                 if self.detail:
@@ -81,6 +83,21 @@ class ConfirmModal(ModalScreen[bool]):
                     yield Button(t("common.cancel"), id="confirm-cancel")
                     yield Button(t("modal.ok"), id="confirm-ok")
             yield HalfRowSpacer(id="confirm-bottom")
+
+    def on_mount(self) -> None:
+        # Textual's default Button min-width is 16, which ignores content width.
+        # Override here after compose so we can compute exact label cell widths.
+        cancel_lbl = t("common.cancel")
+        ok_lbl = t("modal.ok")
+        # line-pad adds 2 cells of horizontal padding inside the button label.
+        LINE_PAD = 2
+        cancel_w = display_width(cancel_lbl) + LINE_PAD
+        ok_w = display_width(ok_lbl) + LINE_PAD
+        self.query_one("#confirm-cancel", Button).styles.width = max(cancel_w, 4)
+        self.query_one("#confirm-cancel", Button).styles.min_width = max(cancel_w, 4)
+        self.query_one("#confirm-ok", Button).styles.width = max(ok_w, 4)
+        self.query_one("#confirm-ok", Button).styles.min_width = max(ok_w, 4)
+        self.query_one("#confirm-ok", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm-ok")

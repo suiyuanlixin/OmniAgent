@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .persistence import atomic_write_json, atomic_write_text
 from .paths import APP_HOME
-
+from .snapshot import remove_snapshot_dir
 from .ui import (
     clean_display_text,
     print_error,
@@ -400,6 +400,15 @@ def session_todo_dir(session_path):
     return path.parent / f"{path.stem}.todos"
 
 
+def session_snapshot_dir(session_path):
+    """Directory holding the shadow git repo used for code-state rollback."""
+    value = str(session_path or "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    return path.parent / f"{path.stem}.snapshots"
+
+
 def _session_title_from_history(conversation_history):
     for message in conversation_history or []:
         if str(message.get("role") or "") != "user":
@@ -600,6 +609,7 @@ def delete_session(session_path):
     normalized = normalize_session_path(path)
     history_path = path.with_suffix(".history.jsonl")
     todo_dir = session_todo_dir(path)
+    snapshot_dir = session_snapshot_dir(path)
     if path.exists():
         try:
             path.unlink()
@@ -622,6 +632,10 @@ def delete_session(session_path):
             shutil.rmtree(resolved_todo_dir)
         except OSError as error:
             raise ValueError(f"Failed to delete session todos: {error}") from error
+    if snapshot_dir is not None:
+        # Remove the shadow-git checkpoint repo alongside the session; its
+        # read-only object files need special handling on Windows.
+        remove_snapshot_dir(snapshot_dir)
     if normalized:
         unpin_session(normalized)
     return True
