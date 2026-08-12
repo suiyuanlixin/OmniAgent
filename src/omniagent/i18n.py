@@ -886,6 +886,7 @@ _add(
 
 # --- widgets: modals and pickers --------------------------------------------
 _add("modal.ok", "OK", "确定")
+_add("model_config.error_title", "Model configuration error", "模型配置错误")
 _add("modal.add", "Add", "添加")
 _add("modal.choose_one", "Choose one", "请选择")
 _add("modal.input.title", "Input", "输入")

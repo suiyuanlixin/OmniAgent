@@ -5,7 +5,7 @@ OmniAgent 是一个运行在终端中的本地 AI Agent 工作台，适合聊天
 ## 主要功能
 
 - Textual TUI 界面，支持会话管理、Markdown、Thinking、工具调用和 Todo 展示。
-- 支持 GLM、Anthropic、OpenAI 兼容接口、Gemini 和 Ollama。
+- 支持 Zai Chat Completions、Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、Gemini Interactions 和 Ollama Chat。
 - 支持多个 Provider 与模型档案，可在界面中切换和编辑。
 - 支持 Plan / Build 两种 Agent 模式，并为文件修改和命令执行提供审批保护。
 - 支持持久 Goal：Goal 位于 Plan / Build 之上，可跨消息和重启恢复，并显示规划、构建、验证阶段。
@@ -75,17 +75,18 @@ Goal 状态会保存在会话记录中。应用重启后，仍可从最近一次
 
 OmniAgent 使用“Provider → 模型档案”的方式管理模型。支持的 `api_type`：
 
-- `glm`
-- `anthropic`
-- `openai`
-- `gemini`
-- `ollama`
+- `ollama_chat`：Ollama Chat
+- `openai_chat_completions`：OpenAI Chat Completions 及兼容接口
+- `openai_responses`：OpenAI Responses
+- `anthropic_messages`：Anthropic Messages
+- `gemini_interactions`：Gemini Interactions
+- `zai_chat_completions`：Zai Chat Completions
 
 大多数配置都可以在 Settings 中完成：
 
 - **Provider**：服务提供方名称，仅用于分类和展示。
-- **API Type**：接口协议类型。
-- **Base URL**：OpenAI 兼容接口、Anthropic、Gemini 或 Ollama 的服务地址。
+- **API Type**：接口协议类型；下拉选项与 `api_type` 一一对应。`gemini_interactions` 使用 Google 官方推荐的 Gemini Interactions API。
+- **Base URL**：对应接口的自定义服务地址；Zai Chat Completions 不使用该字段，Gemini Interactions 留空时使用 Google 官方端点。
 - **Model**：实际发送给服务端的模型名，可从服务端获取列表或手动填写。
 - **API Key**：服务密钥。
 - **Thinking / Reasoning effort**：推理内容与推理强度。

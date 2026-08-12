@@ -10,11 +10,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from ...config import (
-    API_TYPE_ANTHROPIC,
-    API_TYPE_GEMINI,
-    API_TYPE_GLM,
-    API_TYPE_OLLAMA,
-    API_TYPE_OPENAI,
+    API_TYPE_OLLAMA_CHAT,
     DEFAULT_EXTRA_MODALITY_LIMITS,
     DEFAULT_MULTIMODAL_LIMIT,
     SUPPORTED_EXTRA_MODALITIES,
@@ -26,7 +22,11 @@ from ...config import (
     normalize_reasoning_effort_for_api,
 )
 from ...i18n import display_width, t
-from ...model_discovery import fetch_available_models
+from ...modelapi import (
+    get_provider as get_model_provider,
+    provider_choices as model_backend_choices,
+)
+from ...models import fetch_available_models
 from ..data import reasoning_levels_for_api
 from ..theme import render_css
 from ..widgets.chat_input import HalfRowSpacer
@@ -2836,7 +2836,7 @@ class SettingsModal(ModalScreen[None]):
         self._add_model_draft = {
             "provider": "",
             "name": "",
-            "api_type": API_TYPE_OLLAMA,
+            "api_type": API_TYPE_OLLAMA_CHAT,
             "base_url": "",
             "model": "",
             "api_key": "",
@@ -2877,13 +2877,27 @@ class SettingsModal(ModalScreen[None]):
             self._add_model_draft = {}
         previous_value = str(self._add_model_draft.get(key) or "")
         if key == "api_type":
-            value = str(value or API_TYPE_OLLAMA)
+            value = str(value or API_TYPE_OLLAMA_CHAT)
             current_effort = self._add_model_draft.get("reasoning_effort") or "medium"
             self._add_model_draft["reasoning_effort"] = (
                 normalize_reasoning_effort_for_api(value, current_effort)
             )
-            if value == API_TYPE_GLM:
+            provider = get_model_provider(value)
+            if not provider.supports_base_url or value == "gemini_interactions":
                 self._add_model_draft.pop("base_url", None)
+            selected_modalities = parse_extra_modalities_input(
+                str(self._add_model_draft.get("extra_modalities") or "none")
+            )
+            supported_modalities = set(provider.supported_modalities)
+            self._add_model_draft["extra_modalities"] = (
+                ",".join(
+                    modality
+                    for modality in SUPPORTED_EXTRA_MODALITIES
+                    if modality in selected_modalities
+                    and modality in supported_modalities
+                )
+                or "none"
+            )
         self._add_model_draft[key] = value
         if key in {"api_type", "base_url", "api_key"} and str(value) != previous_value:
             self._model_fetch_request_id += 1
@@ -2942,7 +2956,7 @@ class SettingsModal(ModalScreen[None]):
             return None
         return (
             self._selected_model_name,
-            str(getattr(profile, "api_type", API_TYPE_OLLAMA) or API_TYPE_OLLAMA),
+            str(getattr(profile, "api_type", API_TYPE_OLLAMA_CHAT) or API_TYPE_OLLAMA_CHAT),
             str(getattr(profile, "base_url", "") or "").strip(),
             str(getattr(profile, "api_key", "") or "").strip(),
         )
@@ -3022,7 +3036,7 @@ class SettingsModal(ModalScreen[None]):
         _selected_name, api_type, base_url, api_key = signature
         if signature != self._model_list_fetch_signature:
             self._model_list_available_names = []
-        if api_type != API_TYPE_OLLAMA and not api_key:
+        if get_model_provider(api_type).requires_api_key and not api_key:
             self.app_ref.add_status_message(
                 "[!]", t("settings.fetch_models_api_key_required")
             )
@@ -3107,10 +3121,10 @@ class SettingsModal(ModalScreen[None]):
         if self._model_fetching:
             return
         draft = dict(self._add_model_draft or {})
-        api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
+        api_type = str(draft.get("api_type") or API_TYPE_OLLAMA_CHAT)
         base_url = str(draft.get("base_url") or "").strip()
         api_key = str(draft.get("api_key") or "").strip()
-        if api_type != API_TYPE_OLLAMA and not api_key:
+        if get_model_provider(api_type).requires_api_key and not api_key:
             self.app_ref.add_status_message(
                 "[!]", t("settings.fetch_models_api_key_required")
             )
@@ -3169,14 +3183,8 @@ class SettingsModal(ModalScreen[None]):
     def _add_model_rows(self) -> list[dict]:
         draft = dict(self._add_model_draft or {})
         bool_choices = [(t("common.true"), "true"), (t("common.false"), "false")]
-        api_type_choices = [
-            ("Ollama", API_TYPE_OLLAMA),
-            ("OpenAI", API_TYPE_OPENAI),
-            ("Anthropic", API_TYPE_ANTHROPIC),
-            ("Gemini", API_TYPE_GEMINI),
-            ("GLM", API_TYPE_GLM),
-        ]
-        draft_api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
+        api_type_choices = list(model_backend_choices())
+        draft_api_type = str(draft.get("api_type") or API_TYPE_OLLAMA_CHAT)
         reasoning_choices = reasoning_levels_for_api(draft_api_type, title_case=True)
         thinking_enabled = self._is_toggle_enabled(
             str(draft.get("thinking_mode") or "false")
@@ -3208,7 +3216,7 @@ class SettingsModal(ModalScreen[None]):
             {
                 "name": t("app.model.api_type"),
                 "field_key": "api_type",
-                "value": str(draft.get("api_type") or API_TYPE_OLLAMA),
+                "value": str(draft.get("api_type") or API_TYPE_OLLAMA_CHAT),
                 "keywords": "api_type",
                 "edit_type": "select",
                 "options": api_type_choices,
@@ -3285,9 +3293,10 @@ class SettingsModal(ModalScreen[None]):
                 "keywords": "extra_modalities modalities audio image video",
                 "edit_type": "modalities",
                 "options": [
-                    (t("app.model.modality.audio"), "audio"),
-                    (t("app.model.modality.image"), "image"),
-                    (t("app.model.modality.video"), "video"),
+                    (t(f"app.model.modality.{modality}"), modality)
+                    for modality in get_model_provider(
+                        draft_api_type
+                    ).supported_modalities
                 ],
                 "on_change": lambda v: self._set_add_model_field(
                     "extra_modalities", str(v)
@@ -3312,8 +3321,10 @@ class SettingsModal(ModalScreen[None]):
                 ),
             },
         ]
-        if draft_api_type == API_TYPE_GLM:
+        if not get_model_provider(draft_api_type).supports_base_url:
             rows = [row for row in rows if row.get("field_key") != "base_url"]
+        if not get_model_provider(draft_api_type).supports_temperature:
+            rows = [row for row in rows if row.get("field_key") != "temperature"]
         selected_modalities = parse_extra_modalities_input(
             str(draft.get("extra_modalities") or "none"), required=True
         )
@@ -3429,7 +3440,7 @@ class SettingsModal(ModalScreen[None]):
         max_tokens = str(draft.get("max_tokens") or "").strip()
         context_tokens = str(draft.get("context_window_tokens") or "").strip()
         temperature = str(draft.get("temperature") or "").strip()
-        api_type = str(draft.get("api_type") or API_TYPE_OLLAMA)
+        api_type = str(draft.get("api_type") or API_TYPE_OLLAMA_CHAT)
         payload = {
             "provider": provider,
             "api_type": api_type,
@@ -3441,7 +3452,7 @@ class SettingsModal(ModalScreen[None]):
             "reasoning_effort": draft.get("reasoning_effort"),
             "extra_modalities": extra_modalities_config,
         }
-        if api_type != API_TYPE_GLM:
+        if get_model_provider(api_type).supports_base_url:
             payload["base_url"] = str(draft.get("base_url") or "")
         if extra_modalities_config:
             payload["multimodal_limit"] = multimodal_limit

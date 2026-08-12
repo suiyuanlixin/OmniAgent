@@ -40,16 +40,14 @@ from .ui import (
     tool_result_is_error,
 )
 from .config import (
-    API_TYPE_ANTHROPIC,
-    API_TYPE_GEMINI,
-    API_TYPE_GLM,
-    API_TYPE_OLLAMA,
-    API_TYPE_OPENAI,
+    API_TYPE_ANTHROPIC_MESSAGES,
+    API_TYPE_GEMINI_INTERACTIONS,
+    API_TYPE_ZAI_CHAT_COMPLETIONS,
+    API_TYPE_OLLAMA_CHAT,
     AUTO_MODEL_SELECTION,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     DEFAULT_MAX_AGENT_ROUNDS,
     DEFAULT_MAX_AGENT_TOOL_CALLS,
-    GEMINI_OPENAI_BASE_URL,
     SUPPORTED_API_TYPES,
     normalize_api_type,
     normalize_extra_modalities,
@@ -57,6 +55,10 @@ from .config import (
     normalize_reasoning_effort_for_api,
 )
 from .memory import MemoryStore, parse_memory_update_response
+from .modelapi import (
+    create_client as create_model_client,
+    get_provider as get_model_provider,
+)
 from .goals import (
     GOAL_PHASE_BUILDING,
     GOAL_PHASE_PLANNING,
@@ -299,7 +301,7 @@ class OmniAgent:
         self,
         model,
         api_key,
-        api_type=API_TYPE_GLM,
+        api_type=API_TYPE_ZAI_CHAT_COMPLETIONS,
         base_url="",
         max_tokens=4096,
         context_window_tokens=DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -464,12 +466,9 @@ class OmniAgent:
         if api_type not in SUPPORTED_API_TYPES:
             raise ValueError(f"Unsupported API type: {api_type}")
 
-        if api_type == API_TYPE_GLM:
-            base_url = ""
-        elif api_type == API_TYPE_GEMINI:
-            base_url = (base_url or "").strip() or GEMINI_OPENAI_BASE_URL
-        else:
-            base_url = (base_url or "").strip()
+        base_url = get_model_provider(api_type).normalize_base_url(
+            str(base_url or "")
+        )
         client = self._create_client(api_type, api_key, base_url)
         previous_client = self.client
 
@@ -539,55 +538,7 @@ class OmniAgent:
         )
 
     def _create_client(self, api_type, api_key, base_url):
-        if api_type == API_TYPE_ANTHROPIC:
-            try:
-                import anthropic
-            except ImportError as error:
-                raise RuntimeError(
-                    "Anthropic SDK is not installed. Run: pip install anthropic"
-                ) from error
-
-            kwargs = {"api_key": api_key}
-            if base_url:
-                kwargs["base_url"] = base_url
-            return anthropic.Anthropic(**kwargs)
-
-        if api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
-            try:
-                from openai import OpenAI
-            except ImportError as error:
-                raise RuntimeError(
-                    "OpenAI SDK is not installed. Run: pip install openai"
-                ) from error
-
-            kwargs = {"api_key": api_key}
-            if base_url:
-                kwargs["base_url"] = base_url
-            return OpenAI(**kwargs)
-
-        if api_type == API_TYPE_OLLAMA:
-            try:
-                from ollama import Client
-            except ImportError as error:
-                raise RuntimeError(
-                    "Ollama SDK is not installed. Run: pip install ollama"
-                ) from error
-
-            kwargs = {}
-            if base_url:
-                kwargs["host"] = base_url
-            if api_key:
-                kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
-            return Client(**kwargs)
-
-        try:
-            from zai import ZhipuAiClient
-        except ImportError as error:
-            raise RuntimeError(
-                "ZhipuAI SDK is not installed. Run: pip install zai-sdk"
-            ) from error
-
-        return ZhipuAiClient(api_key=api_key)
+        return create_model_client(api_type, api_key, base_url)
 
     def set_max_tokens(self, max_tokens):
         self.max_tokens = max_tokens
@@ -910,7 +861,9 @@ class OmniAgent:
                     self._restore_history(original_history)
             elif response.get("agent_stopped"):
                 self._restore_history(original_history)
-            elif self.agent_mode:
+            elif self.agent_mode and not get_model_provider(
+                self.api_type
+            ).requires_native_history:
                 self._compact_agent_history(user_message_index, response)
             if response and not response.get("agent_stopped"):
                 self._auto_compact_context()
@@ -984,7 +937,7 @@ class OmniAgent:
                 stream_callback_response,
                 self.model,
             )
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -994,7 +947,7 @@ class OmniAgent:
                 **self._anthropic_request_options(),
             )
             return self._parse_anthropic_response(response)
-        if self.api_type == API_TYPE_OLLAMA:
+        if self.api_type == API_TYPE_OLLAMA_CHAT:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(messages=self.conversation_history)
             )
@@ -1075,9 +1028,9 @@ class OmniAgent:
             self.agent_tool_calls,
         )
         try:
-            if self.api_type == API_TYPE_ANTHROPIC:
+            if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
                 return self._finalize_agent_response(self._anthropic_agent_response())
-            if self.api_type == API_TYPE_OLLAMA:
+            if self.api_type == API_TYPE_OLLAMA_CHAT:
                 return self._finalize_agent_response(self._ollama_agent_response())
             return self._finalize_agent_response(self._chat_completion_agent_response())
         except KeyboardInterrupt:
@@ -1396,12 +1349,12 @@ class OmniAgent:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             return self._anthropic_normal_web_search_response(
                 stream_callback_thinking,
                 stream_callback_response,
             )
-        if self.api_type == API_TYPE_OLLAMA:
+        if self.api_type == API_TYPE_OLLAMA_CHAT:
             return self._ollama_normal_web_search_response(
                 stream_callback_thinking,
                 stream_callback_response,
@@ -1872,6 +1825,7 @@ class OmniAgent:
                     "type": "function",
                     "name": "",
                     "arguments": "",
+                    "thought_signature": "",
                 },
             )
 
@@ -1881,21 +1835,35 @@ class OmniAgent:
             call_type = self._get_field(call, "type", "") or ""
             if call_type:
                 part["type"] = call_type
+            thought_signature = self._get_field(call, "thought_signature", "") or ""
+            if thought_signature:
+                part["thought_signature"] = thought_signature
 
             function = self._get_field(call, "function", {}) or {}
             name = self._get_field(function, "name", "") or ""
+            complete_call = bool(self._get_field(call, "complete", False)) or (
+                bool(thought_signature) and bool(name)
+            )
             if name:
-                if not part["name"] or name.startswith(part["name"]):
+                if complete_call:
+                    part["name"] = name
+                elif not part["name"] or name.startswith(part["name"]):
                     part["name"] = name
                 elif name != part["name"]:
                     part["name"] += name
 
             arguments = self._get_field(function, "arguments", None)
             if isinstance(arguments, str):
-                part["arguments"] += arguments
+                if complete_call:
+                    part["arguments"] = arguments
+                else:
+                    part["arguments"] += arguments
             elif arguments:
                 serialized = json.dumps(arguments, ensure_ascii=False)
-                part["arguments"] = part["arguments"] or serialized
+                if complete_call:
+                    part["arguments"] = serialized
+                else:
+                    part["arguments"] = part["arguments"] or serialized
 
     def _chat_stream_tool_calls(self, tool_call_parts):
         assistant_tool_calls = []
@@ -1913,6 +1881,8 @@ class OmniAgent:
                     "arguments": arguments,
                 },
             }
+            if part.get("thought_signature"):
+                assistant_tool_call["thought_signature"] = part["thought_signature"]
             assistant_tool_calls.append(assistant_tool_call)
             tool_calls.append({
                 "id": call_id,
@@ -3650,7 +3620,7 @@ class OmniAgent:
         ]
         temperature = min(float(self.temperature), 0.2)
 
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             response = self.client.messages.create(
                 model=compact_model,
                 max_tokens=COMPACTION_MAX_TOKENS,
@@ -3661,7 +3631,7 @@ class OmniAgent:
             self._record_compaction_usage(response, compact_model)
             return self._anthropic_response_text(response)
 
-        if self.api_type == API_TYPE_OLLAMA:
+        if self.api_type == API_TYPE_OLLAMA_CHAT:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
                     model=compact_model,
@@ -3863,7 +3833,7 @@ class OmniAgent:
         ]
         temperature = min(float(self.temperature), 0.2)
 
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             response = self.client.messages.create(
                 model=memory_model,
                 max_tokens=MEMORY_UPDATE_MAX_TOKENS,
@@ -3879,7 +3849,7 @@ class OmniAgent:
             )
             return self._anthropic_response_text(response)
 
-        if self.api_type == API_TYPE_OLLAMA:
+        if self.api_type == API_TYPE_OLLAMA_CHAT:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
                     model=memory_model,
@@ -3998,7 +3968,7 @@ class OmniAgent:
         ]
         temperature = min(float(self.temperature), 0.2)
 
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             response = self.client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
@@ -4014,7 +3984,7 @@ class OmniAgent:
             )
             return self._anthropic_response_text(response)
 
-        if self.api_type == API_TYPE_OLLAMA:
+        if self.api_type == API_TYPE_OLLAMA_CHAT:
             response = self.client.chat(
                 **self._ollama_chat_kwargs(
                     model=model,
@@ -5500,7 +5470,7 @@ class OmniAgent:
         initial_thinking="",
         thinking_started=False,
     ):
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             return self._stream_anthropic_response(
                 callback_thinking,
                 callback_response,
@@ -5508,7 +5478,7 @@ class OmniAgent:
                 initial_thinking,
                 thinking_started,
             )
-        if self.api_type == API_TYPE_OLLAMA:
+        if self.api_type == API_TYPE_OLLAMA_CHAT:
             return self._stream_ollama_response(
                 callback_thinking,
                 callback_response,
@@ -6003,6 +5973,14 @@ class OmniAgent:
         reasoning_details = self._get_field(message, "reasoning_details", None)
         if reasoning_details:
             assistant_message["reasoning_details"] = self._plain_data(reasoning_details)
+        response_items = self._get_field(message, "response_items", None)
+        if response_items:
+            assistant_message["response_items"] = self._plain_data(response_items)
+        interaction_steps = self._get_field(message, "interaction_steps", None)
+        if interaction_steps:
+            assistant_message["interaction_steps"] = self._plain_data(
+                interaction_steps
+            )
 
         tool_calls = []
         if raw_tool_calls:
@@ -6024,6 +6002,9 @@ class OmniAgent:
                         else json.dumps(arguments),
                     },
                 }
+                thought_signature = self._get_field(call, "thought_signature", None)
+                if thought_signature:
+                    assistant_tool_call["thought_signature"] = thought_signature
                 assistant_tool_calls.append(assistant_tool_call)
                 tool_calls.append({
                     "id": call_id,
@@ -6095,7 +6076,7 @@ class OmniAgent:
         ]
         if not supported_media:
             return text
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             return self._anthropic_user_media_content(text, supported_media)
         return self._openai_user_media_content(text, supported_media)
 
@@ -6103,7 +6084,7 @@ class OmniAgent:
         return str(kind or "").strip().lower() in set(self.extra_modalities)
 
     def _supports_structured_media_input(self):
-        return self.api_type != API_TYPE_OLLAMA
+        return self.api_type != API_TYPE_OLLAMA_CHAT
 
     def _openai_user_media_content(self, text, media_references):
         content = [{"type": "text", "text": text}]
@@ -6541,7 +6522,7 @@ class OmniAgent:
             reasoning_effort = self._chat_completion_reasoning_effort(model)
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort
-        if self.api_type == API_TYPE_GLM and include_reasoning:
+        if self.api_type == API_TYPE_ZAI_CHAT_COMPLETIONS and include_reasoning:
             kwargs["thinking"] = {
                 "type": (
                     "enabled"
@@ -6549,7 +6530,7 @@ class OmniAgent:
                     else "disabled"
                 )
             }
-        elif include_reasoning and self.api_type == API_TYPE_GEMINI:
+        elif include_reasoning and self.api_type == API_TYPE_GEMINI_INTERACTIONS:
             if self.thinking_mode and not self._reasoning_disabled_by_effort():
                 self._merge_extra_body(
                     kwargs,
@@ -6602,36 +6583,31 @@ class OmniAgent:
             return []
         return [GOAL_UPDATE_TOOL_DEFINITION]
 
+    def _provider_tool_schema_builder(self):
+        style = get_model_provider(self.api_type).tool_schema_style
+        return {
+            "anthropic": anthropic_tool_schemas,
+            "ollama": ollama_tool_schemas,
+            "openai": openai_tool_schemas,
+            "glm": glm_tool_schemas,
+        }.get(style, glm_tool_schemas)
+
     def _chat_tool_schemas(self):
         include_web_search = self.agent_tools.web_search_available
         include_skills = self.agent_tools.skills_available
         include_plan = self.agent_tools.todos_enabled
-        plan_mode = self.agent_tools.plan_mode
         extra_definitions = (
             self.agent_tools.plan_tool_definitions()
             + self._goal_tool_definitions()
             + self.agent_tools.subagent_tool_definitions()
             + self.agent_tools.team_tool_definitions()
         )
-        if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
-            return openai_tool_schemas(
-                include_web_search,
-                include_skills,
-                include_plan,
-                extra_definitions=extra_definitions,
-                plan_mode=plan_mode,
-                web_search_definition=(
-                    self.agent_tools.web_search_tool_definition()
-                    if include_web_search
-                    else None
-                ),
-            )
-        return glm_tool_schemas(
+        return self._provider_tool_schema_builder()(
             include_web_search,
             include_skills,
             include_plan,
             extra_definitions=extra_definitions,
-            plan_mode=plan_mode,
+            plan_mode=self.agent_tools.plan_mode,
             web_search_definition=(
                 self.agent_tools.web_search_tool_definition()
                 if include_web_search
@@ -6648,46 +6624,7 @@ class OmniAgent:
         include_skills = self.agent_tools.skills_available and bool(
             {"list_skills", "read_skill"} & set(effective_spec.tool_names)
         )
-        if self.api_type == API_TYPE_ANTHROPIC:
-            return anthropic_tool_schemas(
-                include_web_search,
-                include_skills,
-                False,
-                only_tools=effective_spec.tool_names,
-                exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
-                web_search_definition=(
-                    self.agent_tools.web_search_tool_definition()
-                    if include_web_search
-                    else None
-                ),
-            )
-        if self.api_type == API_TYPE_OLLAMA:
-            return ollama_tool_schemas(
-                include_web_search,
-                include_skills,
-                False,
-                only_tools=effective_spec.tool_names,
-                exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
-                web_search_definition=(
-                    self.agent_tools.web_search_tool_definition()
-                    if include_web_search
-                    else None
-                ),
-            )
-        if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
-            return openai_tool_schemas(
-                include_web_search,
-                include_skills,
-                False,
-                only_tools=effective_spec.tool_names,
-                exclude_tools=FORBIDDEN_SUBAGENT_TOOL_NAMES,
-                web_search_definition=(
-                    self.agent_tools.web_search_tool_definition()
-                    if include_web_search
-                    else None
-                ),
-            )
-        return glm_tool_schemas(
+        return self._provider_tool_schema_builder()(
             include_web_search,
             include_skills,
             False,
@@ -6710,7 +6647,6 @@ class OmniAgent:
 
     def _teammate_tool_schemas(self, spec):
         tool_names = tuple(spec.tool_names) + (TEAMMATE_REPORT_TOOL_NAME,)
-        report_definition = [teammate_report_tool_definition()]
         include_web_search = (
             self.agent_tools.web_search_available and "web_search" in spec.tool_names
         )
@@ -6725,53 +6661,11 @@ class OmniAgent:
             "broadcast",
             "shutdown_teammate",
         }
-        if self.api_type == API_TYPE_ANTHROPIC:
-            return anthropic_tool_schemas(
-                include_web_search,
-                include_skills,
-                False,
-                extra_definitions=report_definition,
-                only_tools=tool_names,
-                exclude_tools=excluded,
-                web_search_definition=(
-                    self.agent_tools.web_search_tool_definition()
-                    if include_web_search
-                    else None
-                ),
-            )
-        if self.api_type == API_TYPE_OLLAMA:
-            return ollama_tool_schemas(
-                include_web_search,
-                include_skills,
-                False,
-                extra_definitions=report_definition,
-                only_tools=tool_names,
-                exclude_tools=excluded,
-                web_search_definition=(
-                    self.agent_tools.web_search_tool_definition()
-                    if include_web_search
-                    else None
-                ),
-            )
-        if self.api_type in {API_TYPE_OPENAI, API_TYPE_GEMINI}:
-            return openai_tool_schemas(
-                include_web_search,
-                include_skills,
-                False,
-                extra_definitions=report_definition,
-                only_tools=tool_names,
-                exclude_tools=excluded,
-                web_search_definition=(
-                    self.agent_tools.web_search_tool_definition()
-                    if include_web_search
-                    else None
-                ),
-            )
-        return glm_tool_schemas(
+        return self._provider_tool_schema_builder()(
             include_web_search,
             include_skills,
             False,
-            extra_definitions=report_definition,
+            extra_definitions=[teammate_report_tool_definition()],
             only_tools=tool_names,
             exclude_tools=excluded,
             web_search_definition=(
@@ -6801,7 +6695,7 @@ class OmniAgent:
         if self.agent_tools.web_search_available:
             definitions.append(self.agent_tools.web_search_tool_definition())
 
-        if self.api_type == API_TYPE_ANTHROPIC:
+        if get_model_provider(self.api_type).tool_schema_style == "anthropic":
             return definitions
 
         return [
@@ -6844,6 +6738,12 @@ class OmniAgent:
         message = {"role": "assistant", "content": content}
         if thinking:
             message["thinking"] = thinking
+        response_items = getattr(self.client, "last_response_items", None)
+        if response_items:
+            message["response_items"] = self._plain_data(response_items)
+        interaction_steps = getattr(self.client, "last_interaction_steps", None)
+        if interaction_steps:
+            message["interaction_steps"] = self._plain_data(interaction_steps)
         return message
 
     @staticmethod

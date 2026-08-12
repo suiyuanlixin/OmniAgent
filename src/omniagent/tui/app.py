@@ -19,11 +19,6 @@ from textual.widgets import Button, Label, Static, TextArea
 from ..chat import OmniAgent, USER_PROMPT_FILE, USER_PROMPT_TEMPLATE
 from ..commands import COMMANDS, process_command
 from ..config import (
-    API_TYPE_ANTHROPIC,
-    API_TYPE_GEMINI,
-    API_TYPE_GLM,
-    API_TYPE_OLLAMA,
-    API_TYPE_OPENAI,
     AUTO_MODEL_SELECTION,
     DEFAULT_EXTRA_MODALITY_LIMITS,
     SUPPORTED_EXTRA_MODALITIES,
@@ -40,6 +35,10 @@ from ..config import (
     save_config_field,
     save_config_fields,
     save_model_profile_field,
+)
+from ..modelapi import (
+    get_provider as get_model_provider,
+    provider_choices as model_backend_choices,
 )
 from ..i18n import (
     display_width,
@@ -103,6 +102,7 @@ from .widgets.chat_view import (
     SelectableMessageStatic,
 )
 from .widgets.confirm_modal import ConfirmModal
+from .widgets.alert_modal import AlertModal
 from .widgets.memory_modal import MemoryModal
 from .widgets.project_modal import ProjectModal
 from .widgets.project_picker import ProjectPicker
@@ -607,6 +607,7 @@ class AgentTUIApp(App):
             0.1, self._refresh_thought_elapsed, pause=True
         )
         self._reload_config()
+        self._show_model_config_errors()
         self._refresh_project_views()
         self._apply_config_to_controls()
         self._set_current_project("")
@@ -2181,6 +2182,14 @@ class AgentTUIApp(App):
         self.config = load_config()
         set_language(self.config.language)
 
+    def _show_model_config_errors(self) -> None:
+        errors = list(getattr(self.config, "model_config_errors", None) or [])
+        if not errors:
+            return
+        self.push_screen(
+            AlertModal(t("model_config.error_title"), "\n".join(errors))
+        )
+
     def _apply_config_to_controls(self) -> None:
         try:
             chat_view = self.query_one("#messages-view", ChatView)
@@ -2826,13 +2835,7 @@ class AgentTUIApp(App):
                 "value": active_model.api_type,
                 "keywords": "api_type 类型",
                 "edit_type": "select",
-                "options": [
-                    ("Ollama", API_TYPE_OLLAMA),
-                    ("OpenAI", API_TYPE_OPENAI),
-                    ("Anthropic", API_TYPE_ANTHROPIC),
-                    ("Gemini", API_TYPE_GEMINI),
-                    ("GLM", API_TYPE_GLM),
-                ],
+                "options": list(model_backend_choices()),
                 "on_change": lambda v: self._on_setting_model_api_type_changed(v),
             },
             {
@@ -2901,9 +2904,10 @@ class AgentTUIApp(App):
                 "keywords": "extra_modalities modalities audio image video 模态",
                 "edit_type": "modalities",
                 "options": [
-                    (t("app.model.modality.audio"), "audio"),
-                    (t("app.model.modality.image"), "image"),
-                    (t("app.model.modality.video"), "video"),
+                    (t(f"app.model.modality.{modality}"), modality)
+                    for modality in get_model_provider(
+                        active_model.api_type
+                    ).supported_modalities
                 ],
                 "on_change": lambda v: self._on_setting_model_extra_modalities_changed(
                     v
@@ -2926,8 +2930,10 @@ class AgentTUIApp(App):
                 "on_change": lambda v: self._on_setting_model_context_changed(v),
             },
         ]
-        if active_model.api_type == API_TYPE_GLM:
+        if not get_model_provider(active_model.api_type).supports_base_url:
             rows = [row for row in rows if row.get("row_id") != "base_url"]
+        if not get_model_provider(active_model.api_type).supports_temperature:
+            rows = [row for row in rows if row.get("row_id") != "temperature"]
         if active_model.extra_modalities:
             limit_options = [
                 (t(f"app.model.modality.{modality}"), modality)

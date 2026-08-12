@@ -5,6 +5,18 @@ from pathlib import Path
 
 from .persistence import atomic_write_text
 from .paths import APP_HOME
+from .modelapi import (
+    API_TYPE_ANTHROPIC_MESSAGES,
+    API_TYPE_GEMINI_INTERACTIONS,
+    API_TYPE_ZAI_CHAT_COMPLETIONS,
+    API_TYPE_OLLAMA_CHAT,
+    API_TYPE_OPENAI_CHAT_COMPLETIONS,
+    API_TYPE_OPENAI_RESPONSES,
+    SUPPORTED_API_TYPES,
+    get_provider as get_model_provider,
+    normalize_api_type as normalize_model_api_type,
+    normalize_base_url as normalize_model_base_url,
+)
 from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, normalize_language
 
 from .websearch import (
@@ -20,13 +32,7 @@ from .websearch import (
 )
 
 CONFIG_FILE = APP_HOME / "config.json"
-API_TYPE_GLM = "glm"
-API_TYPE_ANTHROPIC = "anthropic"
-API_TYPE_OPENAI = "openai"
-API_TYPE_GEMINI = "gemini"
-API_TYPE_OLLAMA = "ollama"
-GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-DEFAULT_API_TYPE = API_TYPE_GLM
+DEFAULT_API_TYPE = API_TYPE_ZAI_CHAT_COMPLETIONS
 DEFAULT_BASE_URL = ""
 DEFAULT_MODEL = "glm-4.7"
 DEFAULT_MODEL_ALIAS = "Default"
@@ -77,18 +83,8 @@ AGENT_APPROVAL_MODES = {
 }
 REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 REASONING_EFFORTS_BY_API = {
-    API_TYPE_OPENAI: ("low", "medium", "high", "xhigh", "max"),
-    API_TYPE_ANTHROPIC: ("low", "medium", "high", "xhigh", "max"),
-    API_TYPE_GLM: ("low", "medium", "high", "xhigh", "max"),
-    API_TYPE_GEMINI: ("minimal", "low", "medium", "high"),
-    API_TYPE_OLLAMA: ("low", "medium", "high"),
-}
-SUPPORTED_API_TYPES = {
-    API_TYPE_GLM,
-    API_TYPE_ANTHROPIC,
-    API_TYPE_OPENAI,
-    API_TYPE_GEMINI,
-    API_TYPE_OLLAMA,
+    api_type: get_model_provider(api_type).reasoning_efforts
+    for api_type in SUPPORTED_API_TYPES
 }
 MODEL_FIELD_KEYS = {
     "api_type",
@@ -158,12 +154,12 @@ class ModelConfig:
             "thinking_mode": self.thinking_mode,
             "reasoning_effort": self.reasoning_effort,
             "extra_modalities": dict(self.extra_modalities),
-            "context_window_tokens": self.context_window_tokens,
         }
-        if self.api_type == API_TYPE_GLM:
-            data.pop("base_url", None)
         if self.extra_modalities:
             data["multimodal_limit"] = self.multimodal_limit
+        data["context_window_tokens"] = self.context_window_tokens
+        if not get_model_provider(self.api_type).supports_base_url:
+            data.pop("base_url", None)
         return data
 
 
@@ -192,6 +188,7 @@ class AppConfig:
         default_factory=default_provider_configs
     )
     web_search_max_results: int = DEFAULT_WEB_SEARCH_MAX_RESULTS
+    model_config_errors: list[str] = field(default_factory=list)
 
     def web_search_provider_config(self, provider=None):
         provider_name = parse_web_search_provider(provider or self.web_search_provider)
@@ -367,7 +364,7 @@ class AppConfig:
 
 
 def normalize_api_type(api_type):
-    return str(api_type or DEFAULT_API_TYPE).strip().lower()
+    return normalize_model_api_type(api_type)
 
 
 def normalize_provider(provider):
@@ -432,16 +429,11 @@ def _config_optional_model_key(value, model_list, field_name):
 
 
 def requires_api_key(api_type):
-    return normalize_api_type(api_type) != API_TYPE_OLLAMA
+    return get_model_provider(normalize_api_type(api_type)).requires_api_key
 
 
 def _normalize_base_url(api_type, base_url):
-    api_type = normalize_api_type(api_type)
-    if api_type == API_TYPE_GLM:
-        return ""
-    if api_type == API_TYPE_GEMINI:
-        return str(base_url or "").strip() or GEMINI_OPENAI_BASE_URL
-    return str(base_url or "").strip()
+    return normalize_model_base_url(normalize_api_type(api_type), base_url)
 
 
 def normalize_optional_model_selection(value):
@@ -517,9 +509,7 @@ def format_extra_modalities(extra_modalities):
 
 def supported_reasoning_efforts(api_type):
     normalized = normalize_api_type(api_type)
-    return REASONING_EFFORTS_BY_API.get(
-        normalized, REASONING_EFFORTS_BY_API[DEFAULT_API_TYPE]
-    )
+    return REASONING_EFFORTS_BY_API[normalized]
 
 
 def normalize_reasoning_effort_for_api(api_type, effort):
@@ -529,13 +519,18 @@ def normalize_reasoning_effort_for_api(api_type, effort):
     if parsed in supported_reasoning_efforts(api_type):
         return parsed
     normalized = normalize_api_type(api_type)
-    if normalized in {API_TYPE_OPENAI, API_TYPE_ANTHROPIC, API_TYPE_GLM}:
+    if normalized in {
+        API_TYPE_OPENAI_CHAT_COMPLETIONS,
+        API_TYPE_OPENAI_RESPONSES,
+        API_TYPE_ANTHROPIC_MESSAGES,
+        API_TYPE_ZAI_CHAT_COMPLETIONS,
+    }:
         if parsed == "minimal":
             return "low"
-    elif normalized == API_TYPE_GEMINI:
+    elif normalized == API_TYPE_GEMINI_INTERACTIONS:
         if parsed in {"xhigh", "max"}:
             return "high"
-    elif normalized == API_TYPE_OLLAMA:
+    elif normalized == API_TYPE_OLLAMA_CHAT:
         if parsed == "minimal":
             return "low"
         if parsed in {"xhigh", "max"}:
@@ -709,9 +704,11 @@ def _sanitize_model_config(data, *, provider, profile_name):
     profile_name = str(profile_name or "").strip()
     if not profile_name:
         raise ValueError("Model profile name cannot be empty.")
-    api_type = normalize_api_type(data.get("api_type", DEFAULT_API_TYPE))
-    if api_type not in SUPPORTED_API_TYPES:
-        api_type = DEFAULT_API_TYPE
+    if "api_type" not in data:
+        raise ValueError(
+            f"Model config {provider}.{profile_name} requires api_type."
+        )
+    api_type = normalize_api_type(data["api_type"])
     base_url = _normalize_base_url(api_type, data.get("base_url", DEFAULT_BASE_URL))
     model_name = str(data.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     try:
@@ -747,6 +744,13 @@ def _sanitize_model_config(data, *, provider, profile_name):
     if "extra_modalities" not in data:
         raise ValueError("Model config requires extra_modalities.")
     extra_modalities = parse_extra_modalities_config(data.get("extra_modalities"))
+    supported_modalities = set(get_model_provider(api_type).supported_modalities)
+    unsupported_modalities = set(extra_modalities) - supported_modalities
+    if unsupported_modalities:
+        raise ValueError(
+            f"{api_type} does not support extra modalities: "
+            + ", ".join(sorted(unsupported_modalities))
+        )
     if extra_modalities:
         if "multimodal_limit" not in data:
             raise ValueError(
@@ -787,32 +791,52 @@ def _sanitize_config(data):
     if not isinstance(raw_models, dict):
         raise ValueError("model_list must be an object grouped by Provider.")
     model_list = {}
+    model_config_errors = []
     for provider, provider_models in raw_models.items():
-        provider = normalize_provider(provider)
+        try:
+            provider = normalize_provider(provider)
+        except ValueError as error:
+            model_config_errors.append(f"model_list: {error}")
+            continue
         if not isinstance(provider_models, dict):
-            raise ValueError(f"model_list.{provider} must be an object.")
+            model_config_errors.append(
+                f"model_list.{provider} must be an object."
+            )
+            continue
         for profile_name, profile_data in provider_models.items():
             profile_name = str(profile_name or "").strip()
             if not profile_name:
-                raise ValueError(f"model_list.{provider} contains an empty model name.")
+                model_config_errors.append(
+                    f"model_list.{provider} contains an empty model name."
+                )
+                continue
             if not isinstance(profile_data, dict):
-                raise ValueError(
+                model_config_errors.append(
                     f"model_list.{provider}.{profile_name} must be an object."
                 )
-            profile = _sanitize_model_config(
-                profile_data,
-                provider=provider,
-                profile_name=profile_name,
-            )
+                continue
+            try:
+                profile = _sanitize_model_config(
+                    profile_data,
+                    provider=provider,
+                    profile_name=profile_name,
+                )
+            except ValueError as error:
+                model_config_errors.append(
+                    f"model_list.{provider}.{profile_name}: {error}"
+                )
+                continue
             key = model_profile_key(provider, profile_name)
             model_list[key] = profile
 
     raw_current_model = data.get("current_model")
     current_model = _model_reference_key(raw_current_model, model_list)
     if raw_current_model is not None and model_list and not current_model:
-        raise ValueError(
-            "current_model must contain provider and model_name for an existing model."
+        model_config_errors.append(
+            "current_model references an invalid or missing model profile; "
+            "selecting the first available model."
         )
+        current_model = next(iter(model_list.keys()), "")
     if not current_model:
         current_model = next(iter(model_list.keys()), "")
 
@@ -895,6 +919,7 @@ def _sanitize_config(data):
     return AppConfig(
         current_model=current_model,
         model_list=model_list,
+        model_config_errors=model_config_errors,
         max_agent_rounds=max_agent_rounds,
         max_agent_tool_calls=max_agent_tool_calls,
         file_inline_chars=file_inline_chars,
@@ -955,12 +980,21 @@ def _load_existing_config():
         _persist_config(config)
         return config
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        current_text = path.read_text(encoding="utf-8")
+        raw = json.loads(current_text)
     except (OSError, json.JSONDecodeError):
         config = _default_config()
         _persist_config(config)
         return config
     config = _sanitize_config(raw)
+    if not config.model_config_errors and _config_needs_rewrite(
+        raw, config, current_text
+    ):
+        _persist_config(config)
+    return config
+
+
+def _config_needs_rewrite(raw, config, current_text):
     web_search = raw.get("web_search") if isinstance(raw, dict) else None
     if not isinstance(web_search, dict) or (
         "providers" not in web_search
@@ -969,8 +1003,9 @@ def _load_existing_config():
         or "search_depth" in web_search
         or "topic" in web_search
     ):
-        _persist_config(config)
-    return config
+        return True
+    canonical = json.dumps(config.to_dict(), indent=4, ensure_ascii=False) + "\n"
+    return canonical != current_text
 
 
 def load_config():
@@ -1073,13 +1108,29 @@ def save_config_fields(fields, model_name=None):
             if active_model is None:
                 raise ValueError("No model profile selected.")
             if key == "api_type":
+                previous_api_type = active_model.api_type
                 active_model.api_type = normalize_api_type(value)
-                active_model.base_url = _normalize_base_url(
-                    active_model.api_type, active_model.base_url
-                )
+                next_provider = get_model_provider(active_model.api_type)
+                if not next_provider.supports_base_url or (
+                    active_model.api_type == API_TYPE_GEMINI_INTERACTIONS
+                    and previous_api_type != API_TYPE_GEMINI_INTERACTIONS
+                ):
+                    active_model.base_url = ""
+                else:
+                    active_model.base_url = _normalize_base_url(
+                        active_model.api_type, active_model.base_url
+                    )
                 active_model.reasoning_effort = normalize_reasoning_effort_for_api(
                     active_model.api_type, active_model.reasoning_effort
                 )
+                supported_modalities = set(next_provider.supported_modalities)
+                active_model.extra_modalities = {
+                    modality: limit
+                    for modality, limit in active_model.extra_modalities.items()
+                    if modality in supported_modalities
+                }
+                if not active_model.extra_modalities:
+                    active_model.multimodal_limit = None
             elif key == "base_url":
                 active_model.base_url = _normalize_base_url(
                     active_model.api_type, value

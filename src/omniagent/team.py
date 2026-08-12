@@ -1118,7 +1118,7 @@ class TeamRunner(SubagentRunner):
         tool_schemas: list[dict[str, Any]],
         execute_tool: Callable[[str, dict[str, Any]], str],
         team_store: TeamStore | None = None,
-        api_type: str = "anthropic",
+        api_type: str = "anthropic_messages",
         max_tool_calls: int | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
         stop_event: Any = None,

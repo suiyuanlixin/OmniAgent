@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from rich.markup import escape as escape_markup
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
@@ -7,23 +8,23 @@ from textual.widgets import Button, Static
 
 from ...i18n import display_width, t
 from ..theme import render_css
-from ..widgets.chat_input import BottomHalfRowSpacer, HalfRowSpacer
+from .chat_input import BottomHalfRowSpacer, HalfRowSpacer
 
 
-class ConfirmModal(ModalScreen[bool]):
+class AlertModal(ModalScreen[None]):
     def __init__(self, title: str, detail: str = ""):
         super().__init__()
-        self.title = str(title or "") or t("common.confirm")
+        self.title = str(title or "") or t("model_config.error_title")
         self.detail = str(detail or "").strip()
 
     DEFAULT_CSS = render_css(
         """
-    ConfirmModal {
+    AlertModal {
         align: center middle;
         background: $OVERLAY_BACKGROUND;
     }
 
-    #confirm-wrap {
+    #alert-wrap {
         width: 100%;
         min-width: 48;
         max-width: 86;
@@ -31,32 +32,32 @@ class ConfirmModal(ModalScreen[bool]):
         background: transparent;
     }
 
-    #confirm-dialog {
+    #alert-dialog {
         width: 100%;
         height: auto;
         background: $SURFACE_BACKGROUND;
         padding: 0 1 0 2;
     }
 
-    #confirm-title {
+    #alert-title {
         width: 100%;
         text-style: bold;
     }
 
-    #confirm-detail {
+    #alert-detail {
         width: 100%;
         color: $TEXT_MUTED;
         margin-top: 1;
     }
 
-    #confirm-actions {
+    #alert-actions {
         width: 100%;
         height: auto;
         align-horizontal: right;
         margin-top: 1;
     }
 
-    #confirm-actions Button {
+    #alert-actions Button {
         width: auto;
         min-width: 0;
         margin-left: 1;
@@ -65,9 +66,9 @@ class ConfirmModal(ModalScreen[bool]):
         background-tint: transparent;
         tint: transparent;
     }
-    #confirm-actions Button:hover,
-    #confirm-actions Button:focus,
-    #confirm-actions Button.-active {
+    #alert-actions Button:hover,
+    #alert-actions Button:focus,
+    #alert-actions Button.-active {
         background: transparent;
         background-tint: transparent;
         border: none;
@@ -80,43 +81,35 @@ class ConfirmModal(ModalScreen[bool]):
     )
 
     BINDINGS = [
-        ("escape", "dismiss_result(False)", "Cancel"),
+        ("escape", "dismiss_modal", "Close"),
         ("ctrl+c", "quit_attempt", "Quit"),
         ("ctrl+q", "quit_app", "Quit"),
     ]
 
     def compose(self) -> ComposeResult:
-        with Container(id="confirm-wrap"):
-            yield BottomHalfRowSpacer(id="confirm-top")
-            with Vertical(id="confirm-dialog"):
-                yield Static(self.title, id="confirm-title")
+        with Container(id="alert-wrap"):
+            yield BottomHalfRowSpacer(id="alert-top")
+            with Vertical(id="alert-dialog"):
+                yield Static(escape_markup(self.title), id="alert-title")
                 if self.detail:
-                    yield Static(self.detail, id="confirm-detail")
-                with Horizontal(id="confirm-actions"):
-                    yield Button(t("common.cancel"), id="confirm-cancel")
-                    yield Button(t("modal.ok"), id="confirm-ok")
-            yield HalfRowSpacer(id="confirm-bottom")
+                    yield Static(escape_markup(self.detail), id="alert-detail")
+                with Horizontal(id="alert-actions"):
+                    yield Button(t("modal.ok"), id="alert-ok")
+            yield HalfRowSpacer(id="alert-bottom")
 
     def on_mount(self) -> None:
-        # Textual's default Button min-width is 16, which ignores content width.
-        # Override here after compose so we can compute exact label cell widths.
-        cancel_lbl = t("common.cancel")
         ok_lbl = t("modal.ok")
-        # line-pad adds 2 cells of horizontal padding inside the button label.
         LINE_PAD = 2
-        cancel_w = display_width(cancel_lbl) + LINE_PAD
         ok_w = display_width(ok_lbl) + LINE_PAD
-        self.query_one("#confirm-cancel", Button).styles.width = max(cancel_w, 4)
-        self.query_one("#confirm-cancel", Button).styles.min_width = max(cancel_w, 4)
-        self.query_one("#confirm-ok", Button).styles.width = max(ok_w, 4)
-        self.query_one("#confirm-ok", Button).styles.min_width = max(ok_w, 4)
-        self.query_one("#confirm-ok", Button).focus()
+        self.query_one("#alert-ok", Button).styles.width = max(ok_w, 4)
+        self.query_one("#alert-ok", Button).styles.min_width = max(ok_w, 4)
+        self.query_one("#alert-ok", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "confirm-ok")
+        self.dismiss(None)
 
-    def action_dismiss_result(self, result: bool = False) -> None:
-        self.dismiss(bool(result))
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
 
     def action_quit_app(self) -> None:
         if self.app is not None:

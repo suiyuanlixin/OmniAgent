@@ -14,8 +14,8 @@ from .ui import (
 
 
 DISPATCH_SUBAGENT_TOOL_NAME = "dispatch_subagent"
-API_TYPE_ANTHROPIC = "anthropic"
-API_TYPE_OLLAMA = "ollama"
+API_TYPE_ANTHROPIC_MESSAGES = "anthropic_messages"
+API_TYPE_OLLAMA_CHAT = "ollama_chat"
 FORBIDDEN_SUBAGENT_TOOL_NAMES = {
     DISPATCH_SUBAGENT_TOOL_NAME,
     "update_todo",
@@ -436,11 +436,11 @@ class SubagentRunner:
             if self.parent.thinking_mode:
                 self._stream_event("thought_start", "")
             try:
-                if self.parent.api_type == API_TYPE_ANTHROPIC:
+                if self.parent.api_type == API_TYPE_ANTHROPIC_MESSAGES:
                     assistant_message, _thinking, text, tool_calls = (
                         self._anthropic_turn(history)
                     )
-                elif self.parent.api_type == API_TYPE_OLLAMA:
+                elif self.parent.api_type == API_TYPE_OLLAMA_CHAT:
                     assistant_message, _thinking, text, tool_calls = self._ollama_turn(
                         history
                     )
@@ -832,7 +832,7 @@ class SubagentRunner:
         history: list[dict[str, Any]],
         tool_calls: list[dict[str, Any]],
     ) -> None:
-        if self.parent.api_type == API_TYPE_ANTHROPIC:
+        if self.parent.api_type == API_TYPE_ANTHROPIC_MESSAGES:
             results = []
             for tool_call in tool_calls:
                 result = self._run_tool_call(
@@ -855,7 +855,7 @@ class SubagentRunner:
                 tool_call.get("name", ""),
                 tool_call.get("arguments", {}),
             )
-            if self.parent.api_type == API_TYPE_OLLAMA:
+            if self.parent.api_type == API_TYPE_OLLAMA_CHAT:
                 history.append(
                     self.parent._ollama_tool_result_message(
                         tool_call.get("name", ""), result
