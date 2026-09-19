@@ -257,6 +257,14 @@ def print_warn(content):
     print_message("[!]", content)
 
 
+def print_request_cancelled():
+    bridge = get_bridge()
+    if bridge is not None and hasattr(bridge, "notify_request_cancelled"):
+        bridge.notify_request_cancelled()
+    else:
+        print_warn(t("app.toast.request_cancelled"))
+
+
 def print_info(content):
     print_message("[-]", content)
 

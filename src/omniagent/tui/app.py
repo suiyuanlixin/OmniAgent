@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.markup import escape as escape_markup
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -94,7 +95,7 @@ from ..snapshot import SnapshotStore
 from ..skills import APP_SKILLS_DIR, SkillRegistry
 from .data import PROJECT_LOGO, reasoning_label, reasoning_levels_for_api
 from .runtime import clear_bridge, render_console_text, set_bridge
-from .theme import render_css
+from .theme import TEXT_MUTED, TEXT_PRIMARY, render_css
 from .widgets.chat_input import ChatInput, HalfRowSpacer
 from .widgets.chat_view import (
     ChatView,
@@ -344,14 +345,9 @@ class AgentTUIApp(App):
     #interrupt-hint.visible {
         display: block;
     }
-    #interrupt-key {
-        width: auto;
-        color: $TEXT_PRIMARY;
-    }
-    #interrupt-text {
+    #interrupt-label {
         width: auto;
         color: $TEXT_MUTED;
-        margin-left: 1;
     }
     #prompt-dismiss {
         display: none;
@@ -481,6 +477,11 @@ class AgentTUIApp(App):
         set_language(self._config_cache.language)
         self.chat: OmniAgent | None = None
         self.chat_busy = False
+        self._request_canceling = False
+        self._cancelled_chat_runs: set[int] = set()
+        self._chat_run_id = 0
+        self._active_chat_run_id = 0
+        self._cancel_notice_run_id: int | None = None
         self.current_session_record: dict | None = None
         self.current_project_name = ""
         self.todo_items: list[dict] = []
@@ -562,6 +563,17 @@ class AgentTUIApp(App):
         groups.sort(key=lambda g: str(g.get("title") or "").lower())
         return groups
 
+    @staticmethod
+    def _interrupt_hint_label() -> Text:
+        # Keep the hint in one widget: separate key/text widget boundaries are
+        # compositor cuts even underneath an overlay, and bisect the first CJK
+        # glyph of the Build menu item when the menu overlaps this info bar.
+        return Text.assemble(
+            (t("app.info.interrupt_key"), TEXT_PRIMARY),
+            " ",
+            (t("app.info.interrupt_text"), TEXT_MUTED),
+        )
+
     def compose(self) -> ComposeResult:
         with Vertical(id="left-edge", classes="sidebar-hidden"):
             yield Static("=", id="sidebar-toggle")
@@ -586,10 +598,7 @@ class AgentTUIApp(App):
                         with Horizontal(id="info-bar"):
                             yield ProjectPicker(id="project-picker")
                             with Horizontal(id="interrupt-hint"):
-                                yield Label("esc", id="interrupt-key")
-                                yield Label(
-                                    t("app.info.interrupt_text"), id="interrupt-text"
-                                )
+                                yield Label(self._interrupt_hint_label(), id="interrupt-label")
                             yield Button(
                                 t("app.info.dismiss"), id="prompt-dismiss"
                             )
@@ -661,8 +670,11 @@ class AgentTUIApp(App):
 
     def on_chat_input_send(self, event: ChatInput.Send) -> None:
         is_command = str(event.content or "").startswith("/")
-        if self.chat_busy:
-            if is_command and self.chat is not None:
+        if self.chat_busy or self._request_canceling:
+            if (
+                self.chat_busy and not self._request_canceling
+                and is_command and self.chat is not None
+            ):
                 self._interrupt_send_payload = (event.content, event.display_content)
                 self._interrupt_active_response()
                 return
@@ -676,6 +688,12 @@ class AgentTUIApp(App):
     def on_chat_input_direct_send_requested(
         self, event: ChatInput.DirectSendRequested
     ) -> None:
+        if self._request_canceling:
+            self.query_one("#chat-input", ChatInput).enqueue_pending_message(
+                event.content,
+                event.display_content,
+            )
+            return
         if self.chat_busy and self.chat is not None:
             self._interrupt_send_payload = (event.content, event.display_content)
             self._interrupt_active_response()
@@ -742,9 +760,12 @@ class AgentTUIApp(App):
         if new_session:
             self._update_new_session_title_from_text(display_content)
             self._maybe_schedule_session_title_summary()
+        self._chat_run_id += 1
+        run_id = self._chat_run_id
+        self._active_chat_run_id = run_id
         worker = threading.Thread(
             target=self._process_user_message,
-            args=(content,),
+            args=(content, run_id),
             daemon=True,
         )
         worker.start()
@@ -1428,13 +1449,8 @@ class AgentTUIApp(App):
             self._thinking_started_at = perf_counter()
         self._resume_thinking_elapsed_timer()
 
-    def append_stream_thinking(self, content) -> None:
-        if self._suppress_stream_output:
-            return
-        if self._thinking_started_at is None:
-            self._thinking_started_at = perf_counter()
-        self._resume_thinking_elapsed_timer()
-        self._call_ui(self._append_thought_stream_widget, str(content or ""))
+    def append_stream_thinking(self, content, run_id: int | None = None) -> None:
+        self._call_ui(self._append_run_stream, "thought", str(content or ""), run_id)
 
     def finish_thinking_round(self) -> None:
         if self._suppress_stream_output:
@@ -1458,10 +1474,23 @@ class AgentTUIApp(App):
         self._thinking_started_at = None
         self._call_ui(self._start_stream_widget, "assistant", "")
 
-    def append_stream_response(self, content) -> None:
+    def append_stream_response(self, content, run_id: int | None = None) -> None:
+        self._call_ui(self._append_run_stream, "assistant", str(content or ""), run_id)
+
+    def _append_run_stream(self, role, content, run_id) -> None:
+        # Check on the UI thread, not before scheduling: a queued update may
+        # become stale or cancelled before call_from_thread delivers it.
+        if run_id is not None and run_id != self._active_chat_run_id:
+            return
         if self._suppress_stream_output:
             return
-        self._call_ui(self._append_stream_widget, "assistant", str(content or ""), "")
+        if role == "thought":
+            if self._thinking_started_at is None:
+                self._thinking_started_at = perf_counter()
+            self._resume_thinking_elapsed_timer()
+            self._append_thought_stream_widget(content)
+        else:
+            self._append_stream_widget(role, content, "")
 
     def set_todo_items(self, items) -> None:
         self.todo_items = [item for item in items or [] if isinstance(item, dict)]
@@ -2357,9 +2386,24 @@ class AgentTUIApp(App):
         widget = self.query_one("#message-input", TextArea)
         widget.disabled = not enabled
 
+    def notify_request_cancelled(self) -> None:
+        self._call_ui(self._notify_request_cancelled, self._active_chat_run_id)
+
+    def _notify_request_cancelled(self, run_id: int) -> None:
+        if run_id != self._active_chat_run_id or run_id == self._cancel_notice_run_id:
+            return
+        self._cancel_notice_run_id = run_id
+        self.add_status_message("[!]", t("app.toast.request_cancelled"))
+
     def _interrupt_active_response(self) -> bool:
+        if self._request_canceling:
+            return True
         if not (self.chat_busy and self.chat is not None):
             return False
+        run_id = self._active_chat_run_id
+        if run_id:
+            self._cancelled_chat_runs.add(run_id)
+        self._request_canceling = True
         self._suppress_stream_output = True
         self._pause_thinking_elapsed_timer()
         self._call_ui(
@@ -2368,11 +2412,17 @@ class AgentTUIApp(App):
         )
         self._thinking_started_at = None
         self._stream_kind = None
+        self.notify_request_cancelled()
         self.chat.request_agent_stop()
+        # Keep lifecycle guards and model controls locked until the worker has
+        # exited. Input stays editable and new messages queue in the meantime.
+        self._set_input_enabled(True)
+        self._set_controls_locked(True)
+        self._sync_prompt_actions()
         return True
 
     def _maybe_dispatch_pending_message(self) -> None:
-        if self.chat_busy:
+        if self.chat_busy or self._request_canceling:
             return
         chat_input = self.query_one("#chat-input", ChatInput)
         payload = self._interrupt_send_payload
@@ -4607,8 +4657,7 @@ class AgentTUIApp(App):
     def _relabel_info_bar(self) -> None:
         """Refresh the info-bar labels this screen composed directly."""
         try:
-            self.query_one("#interrupt-key", Label).update(t("app.info.interrupt_key"))
-            self.query_one("#interrupt-text", Label).update(t("app.info.interrupt_text"))
+            self.query_one("#interrupt-label", Label).update(self._interrupt_hint_label())
             self.query_one("#prompt-dismiss", Button).label = t("app.info.dismiss")
             self.query_one("#prompt-back", Button).label = t("app.info.back")
         except NoMatches:
@@ -4641,12 +4690,16 @@ class AgentTUIApp(App):
         self._clear_loaded_session_state(refresh_sidebar=True)
 
     def _clear_loaded_session_state(self, refresh_sidebar: bool = True) -> None:
+        self._chat_run_id += 1
+        self._active_chat_run_id = self._chat_run_id
         self._invalidate_input_suggestion()
         self._prompt_request = None
         if self.chat is not None:
             self.chat.shutdown()
         self.chat = None
         self.chat_busy = False
+        self._request_canceling = False
+        self._cancelled_chat_runs.clear()
         self.current_session_record = None
         self.todo_items = []
         self._set_todo_panel_items([])
@@ -4870,47 +4923,55 @@ class AgentTUIApp(App):
         self,
         first_text: str,
         *,
+        run_id: int | None = None,
         media_references=None,
         reference_files=None,
         reference_folders=None,
     ):
-        if self.chat is None:
+        chat = self.chat
+        if chat is None:
             raise RuntimeError("Chat is not initialized.")
-        if self.chat.get_goal() is None:
-            return self.chat.send_message(
-                first_text,
-                stream_callback_thinking=self.append_stream_thinking,
-                stream_callback_response=self.append_stream_response,
-                media_references=media_references,
-                reference_files=reference_files,
-                reference_folders=reference_folders,
+        stopped = {"thinking": "", "response": "", "agent_stopped": True, "cancelled": True}
+
+        def owns_run():
+            return self.chat is chat and (
+                run_id is None or (
+                    run_id == self._active_chat_run_id
+                    and run_id not in self._cancelled_chat_runs
+                )
             )
-        # Pin the Goal identity for this loop. Closing a Goal mid-run and
-        # starting a new one must not let this loop keep driving the new Goal.
-        loop_goal_id = str(self.chat.get_goal().id or "")
-        response = self.chat.send_message(
+
+        if not owns_run():
+            return stopped
+        stream_thinking = lambda content: self.append_stream_thinking(content, run_id)
+        stream_response = lambda content: self.append_stream_response(content, run_id)
+        goal = chat.get_goal()
+        loop_goal_id = str(goal.id or "") if goal else ""
+        response = chat.send_message(
             first_text,
-            stream_callback_thinking=self.append_stream_thinking,
-            stream_callback_response=self.append_stream_response,
+            stream_callback_thinking=stream_thinking,
+            stream_callback_response=stream_response,
             media_references=media_references,
             reference_files=reference_files,
             reference_folders=reference_folders,
         )
         while (
-            response
+            loop_goal_id
+            and owns_run()
+            and response
             and (response.get("goal_updated") or response.get("goal_continue_required"))
             and not response.get("agent_stopped")
             and self._goal_loop_still_owns(loop_goal_id)
         ):
-            response = self.chat.send_message(
+            response = chat.send_message(
                 "Continue the persistent Goal from the saved checkpoint. The prior Agent "
                 "turn reached its normal execution boundary. Continue from the existing "
                 "history without repeating verified work, and record a structured Goal "
                 "checkpoint before ending this turn.",
-                stream_callback_thinking=self.append_stream_thinking,
-                stream_callback_response=self.append_stream_response,
+                stream_callback_thinking=stream_thinking,
+                stream_callback_response=stream_response,
             )
-        return response
+        return response if owns_run() else stopped
 
     def _goal_loop_still_owns(self, loop_goal_id: str) -> bool:
         """Whether automatic continuation may run another turn for this loop.
@@ -4936,24 +4997,32 @@ class AgentTUIApp(App):
         self._suppress_stream_output = False
         self._message_started_at = perf_counter()
         self._thinking_started_at = None
-        threading.Thread(target=self._process_goal_resume, daemon=True).start()
+        self._chat_run_id += 1
+        run_id = self._chat_run_id
+        self._active_chat_run_id = run_id
+        threading.Thread(
+            target=self._process_goal_resume,
+            args=(run_id,),
+            daemon=True,
+        ).start()
 
-    def _process_goal_resume(self) -> None:
+    def _process_goal_resume(self, run_id: int) -> None:
         try:
             response = self._run_goal_loop(
                 "Continue the persistent Goal from its saved checkpoint. "
-                "Do not repeat verified work."
+                "Do not repeat verified work.",
+                run_id=run_id,
             )
             if response and not response.get("agent_stopped"):
                 self.chat.update_session_episodic_memory()
-            self._call_ui(self._finish_response, response, "")
+            self._call_ui(self._finish_response, response, "", run_id)
         except Exception as error:
-            self._call_ui(self._finish_with_error, error)
+            self._call_ui(self._finish_with_error, error, run_id)
 
-    def _process_user_message(self, user_text: str) -> None:
+    def _process_user_message(self, user_text: str, run_id: int) -> None:
         try:
             if user_text.startswith("/"):
-                self._process_command_message(user_text)
+                self._process_command_message(user_text, run_id)
                 return
 
             project = self._selected_project()
@@ -4969,41 +5038,42 @@ class AgentTUIApp(App):
             )
             response = self._run_goal_loop(
                 enriched_text,
+                run_id=run_id,
                 media_references=media_references,
                 reference_files=reference_files,
                 reference_folders=reference_folders,
             )
             if response and not response.get("agent_stopped"):
                 self.chat.update_session_episodic_memory()
-            self._call_ui(self._finish_response, response, user_text)
+            self._call_ui(self._finish_response, response, user_text, run_id)
         except Exception as error:
-            self._call_ui(self._finish_with_error, error)
+            self._call_ui(self._finish_with_error, error, run_id)
 
-    def _process_command_message(self, command_text: str) -> None:
+    def _process_command_message(self, command_text: str, run_id: int | None = None) -> None:
         base = command_text.split(maxsplit=1)[0].lower()
         if base == "/help":
-            self._call_ui(self._finish_open_settings_page_command, "help")
+            self._call_ui(self._finish_command_run, run_id, self._finish_open_settings_page_command, "help")
             return
         if base == "/memory":
-            self._call_ui(self._finish_open_memory_command)
+            self._call_ui(self._finish_command_run, run_id, self._finish_open_memory_command)
             return
         if base == "/team":
-            self._call_ui(self._finish_open_settings_page_command, "team")
+            self._call_ui(self._finish_command_run, run_id, self._finish_open_settings_page_command, "team")
             return
         if base == "/search":
-            self._call_ui(self._finish_open_settings_page_command, "web_search")
+            self._call_ui(self._finish_command_run, run_id, self._finish_open_settings_page_command, "web_search")
             return
         if base == "/skills":
-            self._call_ui(self._finish_open_settings_page_command, "skills")
+            self._call_ui(self._finish_command_run, run_id, self._finish_open_settings_page_command, "skills")
             return
         if base == "/agent":
-            self._call_ui(self._finish_open_settings_page_command, "agent_mode")
+            self._call_ui(self._finish_command_run, run_id, self._finish_open_settings_page_command, "agent_mode")
             return
         should_continue = process_command(
             command_text, self.chat or self._build_chat_for_command()
         )
         self._reload_config()
-        self._call_ui(self._after_command, base, should_continue)
+        self._call_ui(self._finish_command_run, run_id, self._after_command, base, should_continue)
 
     def _build_chat_for_command(self) -> OmniAgent:
         record = self.current_session_record or create_session(
@@ -5051,7 +5121,36 @@ class AgentTUIApp(App):
         self._persist_current_session()
         self._maybe_dispatch_pending_message()
 
-    def _finish_response(self, response, user_text: str = "") -> None:
+    def _finish_cancelled_or_stale_run(self, run_id: int | None) -> bool:
+        if run_id is not None and run_id != self._active_chat_run_id:
+            return True
+        if run_id not in self._cancelled_chat_runs:
+            return False
+        self._cancelled_chat_runs.discard(run_id)
+        self._request_canceling = bool(self._cancelled_chat_runs)
+        if not self._request_canceling:
+            self.chat_busy = False
+            self._suppress_stream_output = False
+            self._message_started_at = None
+            self._thinking_started_at = None
+            self.query_one("#chat-input", ChatInput).set_chat_busy(False)
+            self._set_input_enabled(True)
+            self._set_controls_locked(False)
+            self._sync_prompt_actions()
+            self._maybe_show_changed_files()
+            self._persist_current_session()
+            self._maybe_dispatch_pending_message()
+        return True
+
+    def _finish_command_run(self, run_id, callback, *args) -> None:
+        if not self._finish_cancelled_or_stale_run(run_id):
+            callback(*args)
+
+    def _finish_response(
+        self, response, user_text: str = "", run_id: int | None = None
+    ) -> None:
+        if self._finish_cancelled_or_stale_run(run_id):
+            return
         self._pause_thinking_elapsed_timer()
         self._finish_thought_stream_widget(
             self._elapsed_since_thinking(),
@@ -5086,7 +5185,11 @@ class AgentTUIApp(App):
             return
         self.query_one("#messages-view", ChatView).add_changed_files_entry(summary)
 
-    def _finish_with_error(self, error: Exception) -> None:
+    def _finish_with_error(
+        self, error: Exception, run_id: int | None = None
+    ) -> None:
+        if self._finish_cancelled_or_stale_run(run_id):
+            return
         if self.chat is not None and self.chat.get_goal() is not None:
             goal = self.chat.get_goal()
             if not goal.terminal:

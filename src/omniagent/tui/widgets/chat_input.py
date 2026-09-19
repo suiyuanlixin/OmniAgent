@@ -2168,8 +2168,10 @@ class ChatInput(Widget):
         )
         self._sync_thinking_trigger_label()
         self._sync_approval_trigger_label()
-        # _update_plan_build re-resolves the Plan/Build label and refits the
-        # trigger without posting PlanModeChanged, which _set_plan_mode would.
+        # Mode options are composed once, separately from the dynamic menus.
+        # Refresh them as well as the trigger without changing the selected mode.
+        for value, label in zip(("plan", "build", "goal"), mode_choices()):
+            self.query_one(f"#plan-opt-{value}", Button).label = label
         self._set_options_width("plan", plan_options_width())
         self._update_plan_build()
         self._refresh_goal_bar()
@@ -2608,6 +2610,14 @@ class ChatInput(Widget):
                 self._fit_trigger_to_label(prefix)
             return
 
+        # Values/ids stay stable across language changes, but label widths do
+        # not. Resize even when updating existing buttons rather than mounting.
+        self._set_options_width(
+            prefix,
+            max(display_width(label) for label, _ in normalized)
+            + (OPTION_HORIZONTAL_PADDING * 2)
+            + OPTION_CONTENT_GUTTER,
+        )
         if existing_ids == desired_ids:
             # Option ids derive from values, which are language-independent, so
             # a relabel lands here with the buttons already mounted. Their text

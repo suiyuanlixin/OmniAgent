@@ -1122,6 +1122,7 @@ class TeamRunner(SubagentRunner):
         max_tool_calls: int | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
         stop_event: Any = None,
+        tool_result_budget_tokens: int | None = None,
     ):
         self.team_store = team_store
         self.stop_event = stop_event
@@ -1134,6 +1135,7 @@ class TeamRunner(SubagentRunner):
             or spec.max_turns * DEFAULT_TEAMMATE_TOOL_CALL_FACTOR,
             event_callback=event_callback,
             worker_label=f"Teammate '{spec.name}'",
+            tool_result_budget_tokens=tool_result_budget_tokens,
             before_turn_callback=self._drain_inbox,
             stop_requested=self._stop_requested,
             forbidden_tool_names=set(FORBIDDEN_TEAM_TOOL_NAMES) | set(TEAM_TOOL_NAMES),

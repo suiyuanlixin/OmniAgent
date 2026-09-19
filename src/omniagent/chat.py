@@ -30,6 +30,7 @@ from .ui import (
     print_stream_response_continue,
     print_stream_response_start,
     print_warn,
+    print_request_cancelled,
     rollback_overflow_replay_scope,
     set_todo_panel,
     set_context_usage,
@@ -58,6 +59,13 @@ from .memory import MemoryStore, parse_memory_update_response
 from .modelapi import (
     create_client as create_model_client,
     get_provider as get_model_provider,
+)
+from .runtime import (
+    ManagedRequest,
+    RequestCancelled,
+    RequestController,
+    estimate_history_chars,
+    estimate_history_tokens,
 )
 from .goals import (
     GOAL_PHASE_BUILDING,
@@ -348,6 +356,9 @@ class OmniAgent:
         self._team_tasks_lock = threading.RLock()
         self._team_tasks = {}
         self._shutdown_lock = threading.Lock()
+        self._request_controller = RequestController()
+        self._request_lock = threading.Lock()
+        self._provider_client_needs_recreate = False
         self._shutdown = False
         self.session_episodic_heading = ""
         self.session_memory_generation = 0
@@ -477,6 +488,8 @@ class OmniAgent:
         self.model = model
         self.api_key = api_key
         self.client = client
+        with self._request_lock:
+            self._provider_client_needs_recreate = False
         if max_tokens is not None:
             self.max_tokens = max_tokens
         if temperature is not None:
@@ -528,6 +541,7 @@ class OmniAgent:
                 break
             worker.join(remaining)
 
+        self.cancel_active_request()
         client = self.client
         self.client = None
         if client is not None:
@@ -700,7 +714,81 @@ class OmniAgent:
     def request_agent_stop(self):
         was_running = self.agent_running
         self.agent_stop_requested = True
+        self.cancel_active_request()
         return was_running
+
+    def _cancel_provider_transport(self, request_client=None):
+        with self._request_lock:
+            client = request_client if request_client is not None else self.client
+            if client is not None and self.client is client:
+                self._provider_client_needs_recreate = True
+                self.client = None
+        if client is not None:
+            self._close_client(client)
+
+    def cancel_active_request(self):
+        return bool(self._request_controller.cancel_all())
+
+    def _ensure_provider_client(self):
+        with self._request_lock:
+            if self._shutdown:
+                raise RequestCancelled("Request cancelled during shutdown.")
+            needs_recreate = self._provider_client_needs_recreate
+            client = self.client
+        if not needs_recreate:
+            if client is None:
+                raise RuntimeError("Model client is not initialized.")
+            return client
+        with self._request_lock:
+            if self.client is not None and not self._provider_client_needs_recreate:
+                return self.client
+            if self._shutdown:
+                raise RequestCancelled("Request cancelled during shutdown.")
+            client = self._create_client(self.api_type, self.api_key, self.base_url)
+            self.client = client
+            self._provider_client_needs_recreate = False
+            return client
+
+    def _call_provider(self, call_factory, **kwargs):
+        client = self._ensure_provider_client()
+        token = self._request_controller.begin(
+            lambda: self._cancel_provider_transport(client)
+        )
+        try:
+            request = call_factory(client)(**kwargs)
+        except BaseException as error:
+            cancelled = self._request_controller.is_cancelled(token)
+            self._request_controller.finish(token)
+            if cancelled:
+                raise RequestCancelled("Provider request cancelled.") from error
+            raise
+        if self._request_controller.is_cancelled(token):
+            try:
+                close = getattr(request, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                # A late response may already have an aborted transport.
+                pass
+            finally:
+                self._request_controller.finish(token)
+            raise RequestCancelled("Provider request cancelled.")
+        if not kwargs.get("stream"):
+            self._request_controller.finish(token)
+            return request
+        return ManagedRequest(
+            request,
+            lambda: self._request_controller.finish(token),
+            lambda: self._request_controller.is_cancelled(token),
+        )
+
+    def _finish_provider_request(self, request):
+        close = getattr(request, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     def get_agent_status(self):
         return {
@@ -792,6 +880,7 @@ class OmniAgent:
         reference_files=None,
         reference_folders=None,
     ):
+        self.agent_stop_requested = False
         self.agent_tools.set_reference_files(reference_files)
         self.agent_tools.set_reference_folders(reference_folders)
         self.goal_updated_this_turn = False
@@ -802,7 +891,6 @@ class OmniAgent:
         self.conversation_history.append({"role": "user", "content": user_content})
         self._record_preference_signal(user_message)
         original_history = self._history_snapshot()
-        self.agent_stop_requested = False
         self._message_overflow_replayed = False
         if self.agent_mode and not self.agent_tools.enabled:
             self.agent_mode = False
@@ -885,6 +973,10 @@ class OmniAgent:
                     response["goal"] = self.goal.to_dict() if self.goal else None
             return response
 
+        except RequestCancelled:
+            if whole_turn_replay:
+                self._restore_history(original_history)
+            return self._agent_stopped_response("", "")
         except KeyboardInterrupt:
             if self.agent_running:
                 self.request_agent_stop()
@@ -921,6 +1013,8 @@ class OmniAgent:
         stream_callback_thinking=None,
         stream_callback_response=None,
     ):
+        if self._agent_should_stop():
+            raise RequestCancelled("Provider request cancelled.")
         if self.agent_mode and not self.agent_tools.enabled:
             self.agent_mode = False
 
@@ -938,7 +1032,7 @@ class OmniAgent:
                 self.model,
             )
         if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
-            response = self.client.messages.create(
+            response = self._call_provider(lambda client: client.messages.create,
                 model=self.model,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -946,20 +1040,32 @@ class OmniAgent:
                 messages=self._anthropic_messages(),
                 **self._anthropic_request_options(),
             )
-            return self._parse_anthropic_response(response)
+            try:
+                return self._parse_anthropic_response(response)
+            finally:
+                self._finish_provider_request(response)
         if self.api_type == API_TYPE_OLLAMA_CHAT:
-            response = self.client.chat(
+            response = self._call_provider(lambda client: client.chat,
                 **self._ollama_chat_kwargs(messages=self.conversation_history)
             )
-            return self._parse_ollama_response(response)
+            try:
+                return self._parse_ollama_response(response)
+            finally:
+                self._finish_provider_request(response)
 
-        response = self.client.chat.completions.create(
-            **self._chat_completion_kwargs(messages=self.conversation_history)
+        response = self._call_provider(
+            lambda client: client.chat.completions.create,
+            **self._chat_completion_kwargs(messages=self.conversation_history),
         )
-        return self._parse_response(response)
+        try:
+            return self._parse_response(response)
+        finally:
+            self._finish_provider_request(response)
 
     def _run_model_turn_with_overflow_recovery(self, turn_callable):
         for attempt in range(2):
+            if self._agent_should_stop():
+                raise RequestCancelled("Provider request cancelled.")
             round_history = self._history_snapshot()
             begin_overflow_replay_scope()
             try:
@@ -1002,7 +1108,6 @@ class OmniAgent:
 
     def _agent_response(self):
         self.agent_running = True
-        self.agent_stop_requested = False
         self.agent_tool_calls = 0
         self.agent_tool_call_limit = self.max_agent_tool_calls
         self.agent_round_index = 0
@@ -1164,12 +1269,12 @@ class OmniAgent:
         )
         kwargs["stream_options"] = {"include_usage": True}
         try:
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._call_provider(lambda client: client.chat.completions.create, **kwargs)
         except Exception as error:
             if not _stream_usage_unsupported(error):
                 raise
             kwargs.pop("stream_options", None)
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._call_provider(lambda client: client.chat.completions.create, **kwargs)
 
         field_thinking = ""
         tagged_thinking = ""
@@ -1420,7 +1525,7 @@ class OmniAgent:
 
     def _chat_completion_normal_turn(self):
         response = self._run_model_turn_with_overflow_recovery(
-            lambda: self.client.chat.completions.create(
+            lambda: self._call_provider(lambda client: client.chat.completions.create,
                 **self._chat_completion_kwargs(
                     messages=self.conversation_history,
                     tools=self._normal_web_search_tool_schemas(),
@@ -1454,7 +1559,7 @@ class OmniAgent:
 
     def _ollama_normal_turn(self):
         response = self._run_model_turn_with_overflow_recovery(
-            lambda: self.client.chat(
+            lambda: self._call_provider(lambda client: client.chat,
                 **self._ollama_chat_kwargs(
                     messages=self.conversation_history,
                     tools=self._normal_web_search_tool_schemas(),
@@ -1487,7 +1592,7 @@ class OmniAgent:
 
     def _anthropic_normal_turn(self):
         response = self._run_model_turn_with_overflow_recovery(
-            lambda: self.client.messages.create(
+            lambda: self._call_provider(lambda client: client.messages.create,
                 model=self.model,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -1703,7 +1808,7 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
-            if _is_context_overflow_error(error):
+            if isinstance(error, RequestCancelled) or _is_context_overflow_error(error):
                 raise
             print_error(_format_stream_error_message(error))
             return None
@@ -1723,12 +1828,12 @@ class OmniAgent:
         )
         kwargs["stream_options"] = {"include_usage": True}
         try:
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._call_provider(lambda client: client.chat.completions.create, **kwargs)
         except Exception as error:
             if not _stream_usage_unsupported(error):
                 raise
             kwargs.pop("stream_options", None)
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._call_provider(lambda client: client.chat.completions.create, **kwargs)
 
         field_thinking = ""
         tagged_thinking = ""
@@ -1956,7 +2061,7 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
-            if _is_context_overflow_error(error):
+            if isinstance(error, RequestCancelled) or _is_context_overflow_error(error):
                 raise
             print_error(_format_stream_error_message(error))
             return None
@@ -1969,7 +2074,7 @@ class OmniAgent:
         callback_response=None,
         emit_response=True,
     ):
-        response = self.client.chat(
+        response = self._call_provider(lambda client: client.chat,
             **self._ollama_chat_kwargs(
                 messages=self.conversation_history,
                 tools=self._normal_web_search_tool_schemas(),
@@ -2199,7 +2304,7 @@ class OmniAgent:
                 thinking_streamed["streamed"],
             )
         except Exception as error:
-            if _is_context_overflow_error(error):
+            if isinstance(error, RequestCancelled) or _is_context_overflow_error(error):
                 raise
             print_error(_format_stream_error_message(error))
             return None
@@ -2215,7 +2320,7 @@ class OmniAgent:
         blocks = []
         active_block_index = None
 
-        response = self.client.messages.create(
+        response = self._call_provider(lambda client: client.messages.create,
             model=self.model,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
@@ -2570,7 +2675,7 @@ class OmniAgent:
         )
 
     def _stream_ollama_agent_turn(self):
-        response = self.client.chat(
+        response = self._call_provider(lambda client: client.chat,
             **self._ollama_chat_kwargs(
                 messages=self._ollama_agent_messages(),
                 tools=ollama_tool_schemas(
@@ -2739,7 +2844,7 @@ class OmniAgent:
         active_block_index = None
         response_streamed = False
 
-        response = self.client.messages.create(
+        response = self._call_provider(lambda client: client.messages.create,
             model=self.model,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
@@ -2886,10 +2991,11 @@ class OmniAgent:
             "thinking": thinking,
             "response": response or message,
             "agent_stopped": True,
+            "cancelled": True,
         }
 
     def _print_agent_stopped_by_user(self):
-        print_warn("Agent stopped by user.")
+        print_request_cancelled()
 
     def _agent_tool_budget_exceeded(self, tool_calls):
         requested_tool_calls = sum(
@@ -2967,7 +3073,7 @@ class OmniAgent:
     def _warn_agent_context_if_needed(self):
         if self.agent_context_warning_sent:
             return
-        estimated_chars = _estimate_history_chars(self.conversation_history)
+        estimated_chars = estimate_history_chars(self.conversation_history)
         if estimated_chars < AGENT_CONTEXT_WARN_CHARS:
             return
 
@@ -2987,7 +3093,7 @@ class OmniAgent:
 
         input_tokens, usage_source = self._context_tokens_for_compaction()
         input_budget_tokens = self._compaction_input_budget()
-        estimated_chars = _estimate_history_chars(self.conversation_history)
+        estimated_chars = estimate_history_chars(self.conversation_history)
         if input_tokens < input_budget_tokens:
             return {
                 "compacted": False,
@@ -3008,7 +3114,7 @@ class OmniAgent:
                 "before full context compaction."
             )
             input_tokens, usage_source = self._context_tokens_for_compaction()
-            estimated_chars = _estimate_history_chars(self.conversation_history)
+            estimated_chars = estimate_history_chars(self.conversation_history)
             if input_tokens < input_budget_tokens:
                 return {
                     "compacted": False,
@@ -3210,10 +3316,10 @@ class OmniAgent:
         else:
             messages = [{"role": "system", "content": self._normal_system_prompt()}]
         messages += self._effective_history_messages(self.conversation_history)
-        return _estimate_history_tokens(messages)
+        return estimate_history_tokens(messages)
 
     def _estimate_effective_history_tokens(self, messages):
-        return _estimate_history_tokens(self._effective_history_messages(messages))
+        return estimate_history_tokens(self._effective_history_messages(messages))
 
     def _compaction_recent_token_budget(self, input_budget_tokens):
         input_budget_tokens = max(1, int(input_budget_tokens or 1))
@@ -3356,7 +3462,7 @@ class OmniAgent:
         return {
             "at": _utc_timestamp(),
             "replacement": COMPACTION_TOOL_RESULT_PLACEHOLDER,
-            "estimated_tokens": _estimate_history_tokens([{"content": content}]),
+            "estimated_tokens": estimate_history_tokens([{"content": content}]),
         }
 
     def _soft_prune_old_tool_results(self, input_budget_tokens):
@@ -3417,7 +3523,7 @@ class OmniAgent:
 
     def compact_context(self, manual=False):
         before_messages = len(self.conversation_history)
-        before_chars = _estimate_history_chars(self.conversation_history)
+        before_chars = estimate_history_chars(self.conversation_history)
         before_input_tokens, usage_source = self._context_tokens_for_compaction()
         input_budget_tokens = self._compaction_input_budget()
         compact_model = (
@@ -3530,7 +3636,7 @@ class OmniAgent:
             *recent_messages,
         ]
         removed_tool_results = self._sanitize_orphan_tool_results_in_history()
-        after_chars = _estimate_history_chars(self.conversation_history)
+        after_chars = estimate_history_chars(self.conversation_history)
         after_input_tokens = self._estimate_current_context_tokens()
         self._set_context_input_tokens(after_input_tokens, "estimated_after_compaction")
         finish_compaction_entry(
@@ -3621,7 +3727,7 @@ class OmniAgent:
         temperature = min(float(self.temperature), 0.2)
 
         if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
-            response = self.client.messages.create(
+            response = self._call_provider(lambda client: client.messages.create,
                 model=compact_model,
                 max_tokens=COMPACTION_MAX_TOKENS,
                 temperature=temperature,
@@ -3632,7 +3738,7 @@ class OmniAgent:
             return self._anthropic_response_text(response)
 
         if self.api_type == API_TYPE_OLLAMA_CHAT:
-            response = self.client.chat(
+            response = self._call_provider(lambda client: client.chat,
                 **self._ollama_chat_kwargs(
                     model=compact_model,
                     messages=messages,
@@ -3645,7 +3751,7 @@ class OmniAgent:
             message = self._get_field(response, "message", {})
             return str(self._get_field(message, "content", "") or "")
 
-        response = self.client.chat.completions.create(
+        response = self._call_provider(lambda client: client.chat.completions.create,
             **self._chat_completion_kwargs(
                 model=compact_model,
                 messages=messages,
@@ -3834,7 +3940,7 @@ class OmniAgent:
         temperature = min(float(self.temperature), 0.2)
 
         if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
-            response = self.client.messages.create(
+            response = self._call_provider(lambda client: client.messages.create,
                 model=memory_model,
                 max_tokens=MEMORY_UPDATE_MAX_TOKENS,
                 temperature=temperature,
@@ -3850,7 +3956,7 @@ class OmniAgent:
             return self._anthropic_response_text(response)
 
         if self.api_type == API_TYPE_OLLAMA_CHAT:
-            response = self.client.chat(
+            response = self._call_provider(lambda client: client.chat,
                 **self._ollama_chat_kwargs(
                     model=memory_model,
                     messages=messages,
@@ -3868,7 +3974,7 @@ class OmniAgent:
             message = self._get_field(response, "message", {})
             return str(self._get_field(message, "content", "") or "")
 
-        response = self.client.chat.completions.create(
+        response = self._call_provider(lambda client: client.chat.completions.create,
             **self._chat_completion_kwargs(
                 model=memory_model,
                 messages=messages,
@@ -3969,7 +4075,7 @@ class OmniAgent:
         temperature = min(float(self.temperature), 0.2)
 
         if self.api_type == API_TYPE_ANTHROPIC_MESSAGES:
-            response = self.client.messages.create(
+            response = self._call_provider(lambda client: client.messages.create,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -3985,7 +4091,7 @@ class OmniAgent:
             return self._anthropic_response_text(response)
 
         if self.api_type == API_TYPE_OLLAMA_CHAT:
-            response = self.client.chat(
+            response = self._call_provider(lambda client: client.chat,
                 **self._ollama_chat_kwargs(
                     model=model,
                     messages=messages,
@@ -4003,7 +4109,7 @@ class OmniAgent:
             message = self._get_field(response, "message", {})
             return str(self._get_field(message, "content", "") or "")
 
-        response = self.client.chat.completions.create(
+        response = self._call_provider(lambda client: client.chat.completions.create,
             **self._chat_completion_kwargs(
                 model=model,
                 messages=messages,
@@ -5494,12 +5600,12 @@ class OmniAgent:
             )
             kwargs["stream_options"] = {"include_usage": True}
             try:
-                response = self.client.chat.completions.create(**kwargs)
+                response = self._call_provider(lambda client: client.chat.completions.create, **kwargs)
             except Exception as error:
                 if not _stream_usage_unsupported(error):
                     raise
                 kwargs.pop("stream_options", None)
-                response = self.client.chat.completions.create(**kwargs)
+                response = self._call_provider(lambda client: client.chat.completions.create, **kwargs)
 
             if self.thinking_mode and not thinking_started:
                 print_stream_thinking("")
@@ -5570,7 +5676,7 @@ class OmniAgent:
             }
 
         except Exception as error:
-            if _is_context_overflow_error(error):
+            if isinstance(error, RequestCancelled) or _is_context_overflow_error(error):
                 raise
             print_error(_format_stream_error_message(error))
             return None
@@ -5584,7 +5690,7 @@ class OmniAgent:
         thinking_started=False,
     ):
         try:
-            response = self.client.chat(
+            response = self._call_provider(lambda client: client.chat,
                 **self._ollama_chat_kwargs(
                     messages=self.conversation_history,
                     stream=True,
@@ -5660,7 +5766,7 @@ class OmniAgent:
             }
 
         except Exception as error:
-            if _is_context_overflow_error(error):
+            if isinstance(error, RequestCancelled) or _is_context_overflow_error(error):
                 raise
             print_error(_format_stream_error_message(error))
             return None
@@ -5674,7 +5780,7 @@ class OmniAgent:
         thinking_started=False,
     ):
         try:
-            response = self.client.messages.create(
+            response = self._call_provider(lambda client: client.messages.create,
                 model=self.model,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -5850,7 +5956,7 @@ class OmniAgent:
             }
 
         except Exception as error:
-            if _is_context_overflow_error(error):
+            if isinstance(error, RequestCancelled) or _is_context_overflow_error(error):
                 raise
             print_error(_format_stream_error_message(error))
             return None
@@ -7351,38 +7457,6 @@ def _stream_usage_unsupported(error):
     return "stream_options" in text or "include_usage" in text
 
 
-def _estimate_history_chars(history):
-    total = 0
-    for message in history:
-        try:
-            total += len(json.dumps(message, ensure_ascii=False, default=str))
-        except TypeError:
-            total += len(str(message))
-    return total
-
-
-def _estimate_history_tokens(history):
-    total = 0
-    for message in history:
-        try:
-            serialized = json.dumps(message, ensure_ascii=False, default=str)
-        except TypeError:
-            serialized = str(message)
-        total += _estimate_text_tokens(serialized) + 4
-    return total
-
-
-def _estimate_text_tokens(text):
-    ascii_chars = 0
-    non_ascii_tokens = 0
-    for character in str(text or ""):
-        if character.isspace():
-            continue
-        if ord(character) <= 0x7F:
-            ascii_chars += 1
-        else:
-            non_ascii_tokens += 1
-    return ((ascii_chars + 3) // 4) + non_ascii_tokens
 
 
 def _clean_reasoning_text(content):

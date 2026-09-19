@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from .runtime.context_budget import bound_tool_results
 from .ui import (
     build_tool_error_display,
     tool_display_is_error,
@@ -22,6 +23,7 @@ FORBIDDEN_SUBAGENT_TOOL_NAMES = {
     "ask_user",
 }
 DEFAULT_SUBAGENT_TOOL_CALL_FACTOR = 4
+DEFAULT_WORKER_TOOL_RESULT_BUDGET_TOKENS = 12000
 
 TOOL_OUTPUT_ARTIFACT_PROMPT = (
     "\n\nTool output artifacts:\n"
@@ -376,6 +378,7 @@ class SubagentRunner:
         before_turn_callback: Callable[[], list[str | dict[str, Any]]] | None = None,
         stop_requested: Callable[[], bool] | None = None,
         forbidden_tool_names: set[str] | None = None,
+        tool_result_budget_tokens: int | None = None,
     ):
         self.parent = parent_agent
         self.spec = spec
@@ -386,6 +389,13 @@ class SubagentRunner:
             int(max_tool_calls or spec.max_turns * DEFAULT_SUBAGENT_TOOL_CALL_FACTOR),
         )
         self.tool_calls_used = 0
+        self.tool_result_budget_tokens = max(
+            0,
+            int(
+                DEFAULT_WORKER_TOOL_RESULT_BUDGET_TOKENS
+                if tool_result_budget_tokens is None else tool_result_budget_tokens
+            ),
+        )
         self.allowed_tool_names = set(spec.tool_names)
         self.transcript: list[dict[str, Any]] = []
         self.event_callback = event_callback
@@ -415,6 +425,7 @@ class SubagentRunner:
     def run(self, task: str) -> str:
         history: list[dict[str, Any]] = [{"role": "user", "content": task}]
         visible_response = ""
+        self.tool_calls_used = 0
         self.transcript = []
         self._record_event({"kind": "message", "role": "user", "content": task})
 
@@ -661,7 +672,7 @@ class SubagentRunner:
             tool_parts
         )
         message = self.parent._chat_stream_assistant_message(
-            content, thinking, raw_content=raw_content
+            content, thinking
         )
         if assistant_tool_calls:
             message["tool_calls"] = assistant_tool_calls
@@ -832,43 +843,35 @@ class SubagentRunner:
         history: list[dict[str, Any]],
         tool_calls: list[dict[str, Any]],
     ) -> None:
-        if self.parent.api_type == API_TYPE_ANTHROPIC_MESSAGES:
-            results = []
-            for tool_call in tool_calls:
-                result = self._run_tool_call(
-                    tool_call.get("name", ""),
-                    tool_call.get("input", {}),
-                )
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_call.get("id", ""),
-                    "content": result,
-                    "is_error": tool_result_is_error(
-                        tool_call.get("name", ""), result
-                    ),
-                })
-            history.append({"role": "user", "content": results})
-            return
-
-        for tool_call in tool_calls:
-            result = self._run_tool_call(
-                tool_call.get("name", ""),
-                tool_call.get("arguments", {}),
+        # Execution/events retain full output. Only the model-facing payload is
+        # bounded, with a fresh shared budget for every tool-result batch.
+        full_results = [
+            self._run_tool_call(
+                call.get("name", ""), call.get("input", call.get("arguments", {}))
             )
+            for call in tool_calls
+        ]
+        results = bound_tool_results(full_results, self.tool_result_budget_tokens)
+        if self.parent.api_type == API_TYPE_ANTHROPIC_MESSAGES:
+            history.append({"role": "user", "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call.get("id", ""),
+                    "content": result,
+                    "is_error": tool_result_is_error(call.get("name", ""), full),
+                }
+                for call, full, result in zip(tool_calls, full_results, results)
+            ]})
+            return
+        for call, result in zip(tool_calls, results):
             if self.parent.api_type == API_TYPE_OLLAMA_CHAT:
-                history.append(
-                    self.parent._ollama_tool_result_message(
-                        tool_call.get("name", ""), result
-                    )
-                )
+                history.append(self.parent._ollama_tool_result_message(
+                    call.get("name", ""), result
+                ))
             else:
-                history.append(
-                    self.parent._chat_tool_result_message(
-                        tool_call.get("id", ""),
-                        tool_call.get("name", ""),
-                        result,
-                    )
-                )
+                history.append(self.parent._chat_tool_result_message(
+                    call.get("id", ""), call.get("name", ""), result
+                ))
 
     def _run_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
         self.tool_calls_used += 1

@@ -431,6 +431,11 @@ _add(
     "Request failed. Check the model config and network connection.",
     "请求失败，请检查模型配置和网络连接。",
 )
+_add(
+    "app.toast.request_cancelled",
+    "Current request cancelled.",
+    "当前请求已取消。",
+)
 
 # --- app.py: message actions (copy / revert / edit / fork) -------------------
 _add("app.toast.message_copied", "Message copied.", "已复制消息。")
@@ -710,7 +715,7 @@ _add("sidebar.archive_chats", "Archive chats", "归档全部会话")
 _add("input.placeholder", "Type a message", "输入消息")
 _add("input.mode.plan", "Plan", "规划")
 _add("input.mode.build", "Build", "执行")
-_add("input.mode.goal", "Goal", "Goal")
+_add("input.mode.goal", "Goal", "目标")
 _add("input.goal.active", "Pursuing goal", "\u8fdb\u884c\u4e2d\u7684\u76ee\u6807")
 _add("input.goal.paused", "Paused goal", "\u5df2\u6682\u505c\u7684\u76ee\u6807")
 _add("input.goal.blocked", "Blocked goal", "\u5df2\u963b\u585e\u7684\u76ee\u6807")
